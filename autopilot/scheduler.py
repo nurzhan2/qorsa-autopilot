@@ -12,7 +12,7 @@ import logging
 from sqlalchemy import select, update
 
 from .config import cfg
-from .db import Project, Session, Task, spent_today, utcnow
+from .db import AccessItem, Project, Session, Task, decayed_units, spent_today, utcnow
 
 log = logging.getLogger("sched")
 
@@ -23,8 +23,13 @@ LANES = ("chat", "build", "verify")
 PAID_LANES = ("build", "verify")
 
 # Проект обслуживается в любом статусе, кроме терминального и заблокированного.
-# blocked = ждёт человека, done = сдан. Всё остальное — рабочее.
+# blocked = ждёт человека, done = сдан. Всё остальное — рабочее, включая
+# blocked_access: там нет доступов, но переписываться с клиентом надо именно там.
 DEAD_STATUSES = ("done", "blocked")
+
+# Полоса build требует двух разрешений от людей: галочки менеджера
+# «Готов к работе» и полного чеклиста доступов от клиента.
+GATED_LANE = "build"
 
 # Сколько единиц WFQ списывается в момент выдачи слота. Списываем ДО работы:
 # иначе проект с 40 задачами заберёт все свободные слоты одного тика, ведь
@@ -83,6 +88,8 @@ class Scheduler:
             log.info("бюджет снова в норме — build/verify разморожены")
         self.budget_paused = over_budget
 
+        await self._sync_access()
+
         for lane in LANES:
             if self.budget_paused and lane in PAID_LANES:
                 continue
@@ -128,6 +135,7 @@ class Scheduler:
 
     async def _pick(self, lane: str, exclusive: bool):
         """Проект с минимальным served_units/weight, из него — самая ранняя задача."""
+        blocked = await self._projects_without_access() if lane == GATED_LANE else set()
         async with Session() as s:
             q = (
                 select(Task, Project)
@@ -136,6 +144,9 @@ class Scheduler:
                 .where(Project.status.notin_(DEAD_STATUSES))
                 .order_by(Task.order_idx, Task.id)
             )
+            if lane == GATED_LANE:
+                # галочка менеджера: пока не стоит, проект не выходит из briefing
+                q = q.where(Project.ready_for_work.is_(True))
             rows = (await s.execute(q)).all()
 
         # ВАЖНО: rows — снимок, снятый до этой строки. Пока мы его фильтруем,
@@ -144,12 +155,15 @@ class Scheduler:
         # право на работу выдаёт _claim() одним условным UPDATE.
         best = None
         best_score = None
+        now = utcnow()
         for task, project in rows:
             if task.id in self.inflight:
                 continue
             if exclusive and project.id in self.busy_projects:
                 continue
-            score = project.served_units / weight(project)
+            if project.id in blocked:
+                continue          # чеклист доступов не закрыт
+            score = decayed_units(project.served_units, project.served_at, now) / weight(project)
             if best_score is None or score < best_score:
                 best, best_score = (task, project), score
         return best
@@ -240,16 +254,77 @@ class Scheduler:
             t.updated_at = utcnow()
             await s.commit()
 
+    # ---------- доступы ----------
+
+    async def _projects_without_access(self) -> set[int]:
+        """Проекты, у которых хоть один пункт чеклиста не verified."""
+        async with Session() as s:
+            rows = (await s.execute(
+                select(AccessItem.project_id)
+                .where(AccessItem.status != "verified")
+                .distinct())).scalars().all()
+        return set(rows)
+
+    async def _sync_access(self) -> None:
+        """Держит статус blocked_access в согласии с чеклистом и, не чаще
+        раза в сутки, напоминает клиенту про недостающее — ОДНИМ сообщением."""
+        blocked = await self._projects_without_access()
+
+        async with Session() as s:
+            projects = (await s.execute(
+                select(Project).where(Project.status.notin_(DEAD_STATUSES)))).scalars().all()
+            missing: dict[int, list[AccessItem]] = {}
+            if blocked:
+                items = (await s.execute(
+                    select(AccessItem)
+                    .where(AccessItem.project_id.in_(blocked), AccessItem.status != "verified")
+                    .order_by(AccessItem.id))).scalars().all()
+                for it in items:
+                    missing.setdefault(it.project_id, []).append(it)
+
+        to_remind: list[tuple[Project, list[AccessItem]]] = []
+        for p in projects:
+            waiting = p.id in blocked
+            if waiting and p.status in ("new", "briefing", "active"):
+                await self._set_project_status(p.id, "blocked_access",
+                                               "жду доступы от клиента")
+                log.info("проект %s: %s -> blocked_access", p.id, p.status)
+            elif not waiting and p.status == "blocked_access":
+                await self._set_project_status(p.id, "active", "доступы получены")
+                log.info("проект %s: blocked_access -> active", p.id)
+            if waiting:
+                to_remind.append((p, missing.get(p.id, [])))
+
+        remind = getattr(self.communicator, "remind_access", None)
+        if remind is None:
+            return
+        for project, items in to_remind:
+            try:
+                await remind(project, items)
+            except Exception:
+                log.exception("не смог напомнить про доступы, проект %s", project.id)
+
+    async def _set_project_status(self, project_id: int, status: str, note: str = "") -> None:
+        async with Session() as s:
+            p = await s.get(Project, project_id)
+            if p is None or p.status == status:
+                return
+            p.status = status
+            if note:
+                p.last_action = note
+            p.updated_at = utcnow()
+            await s.commit()
+
     # ---------- статусы проекта ----------
 
     async def _activate(self, project: Project) -> None:
-        """new/briefing -> active в момент выдачи первого build-слота.
+        """new/briefing/blocked_access -> active в момент выдачи первого build-слота.
         Раньше нельзя: пока задач нет, проект действительно ещё брифуется."""
-        if project.status not in ("new", "briefing"):
+        if project.status not in ("new", "briefing", "blocked_access"):
             return
         async with Session() as s:
             p = await s.get(Project, project.id)
-            if p is None or p.status not in ("new", "briefing"):
+            if p is None or p.status not in ("new", "briefing", "blocked_access"):
                 return
             was = p.status
             p.status = "active"
@@ -274,7 +349,12 @@ class Scheduler:
             p.last_action = "все задачи закрыты, жду проверки"
             p.updated_at = utcnow()
             await s.commit()
+            project = p
         log.info("проект %s: active -> review", project_id)
+        # этап закрыт — накопленный отчёт уходит не дожидаясь окна агрегации
+        on_stage = getattr(self.communicator, "on_stage_done", None)
+        if on_stage is not None:
+            await on_stage(project)
 
     # ---------- WFQ ----------
 
@@ -292,6 +372,9 @@ class Scheduler:
             p = await s.get(Project, project_id)
             if p is None:
                 return
-            p.served_units += units
-            p.updated_at = utcnow()
+            now = utcnow()
+            # сперва гасим накопленное до текущего момента, потом добавляем новое
+            p.served_units = decayed_units(p.served_units, p.served_at, now) + units
+            p.served_at = now
+            p.updated_at = now
             await s.commit()

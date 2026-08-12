@@ -58,13 +58,25 @@ class Config:
     # заглушки вместо Claude Code и судьи: гонять планировщик вживую, ничего не тратя
     dry_run = _b("DRY_RUN", False)
 
+    # клиенту уходит не больше одного отчёта о готовности за это окно
+    aggregate_window_min = _i("AGGREGATE_WINDOW_MIN", 60)
+    # период полураспада счётчика WFQ: простоявший проект перестаёт быть должником
+    served_halflife_h = _f("SERVED_HALFLIFE_H", 24)
+    # не чаще раза в сутки напоминаем клиенту про недостающие доступы
+    access_reminder_h = _f("ACCESS_REMINDER_H", 24)
+
+    # хранилище секретов: ключ Fernet и файл ВНЕ репозитория
+    vault_key = os.getenv("VAULT_KEY", "")
+    vault_path = Path(os.getenv("VAULT_PATH") or ROOT / "secrets.enc")
+
     sheet_id = os.getenv("SHEET_ID", "")
     sheet_tab = os.getenv("SHEET_TAB", "Заказы")
     google_creds = os.getenv("GOOGLE_CREDS", str(ROOT / "service_account.json"))
     sheet_sync_sec = _i("SHEET_SYNC_SEC", 60)
 
     tg_token = os.getenv("TG_BOT_TOKEN", "")
-    tg_owner = os.getenv("TG_OWNER_CHAT_ID", "")
+    tg_owner = os.getenv("TG_OWNER_CHAT_ID", "")       # я, техчасть
+    tg_manager = os.getenv("TG_MANAGER_CHAT_ID", "")   # менеджер: деньги, сроки, объём
 
 
 cfg = Config()

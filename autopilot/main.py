@@ -10,6 +10,7 @@ from .db import init_db, recover_orphan_tasks
 from .executor import Executor
 from .scheduler import Scheduler
 from .sheets import SheetSync
+from .vault import install_log_masking
 from .verifier import Verifier
 
 # консоль Windows по умолчанию не cp65001 — без этого весь русский лог превращается в кракозябры
@@ -26,6 +27,10 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("main")
+
+# ставим до того, как что-либо начнёт логироваться: значения секретов не должны
+# попасть в консоль и в файлы ни из нашего кода, ни из вывода Claude Code
+install_log_masking()
 
 
 def build_stack():

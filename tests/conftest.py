@@ -24,7 +24,7 @@ os.environ["LOGS"] = str(_TMP / "logs")
 os.environ["ANTHROPIC_API_KEY"] = ""       # судья в тестах не поднимается
 os.environ["SHEET_ID"] = ""
 
-from autopilot.db import Base, Project, Session, Task, engine  # noqa: E402
+from autopilot.db import AccessItem, Base, Project, Session, Task, engine  # noqa: E402
 
 
 @pytest.fixture
@@ -44,13 +44,24 @@ async def db():
 
 async def make_project(status: str = "active", priority: int = 2,
                        deadline: dt.date | None = None, title: str = "проект",
-                       tg_chat_id: str | None = "chat-1") -> Project:
+                       tg_chat_id: str | None = "chat-1",
+                       ready_for_work: bool = True) -> Project:
     async with Session() as s:
         p = Project(client="клиент", title=title, status=status, priority=priority,
-                    deadline=deadline, tg_chat_id=tg_chat_id)
+                    deadline=deadline, tg_chat_id=tg_chat_id,
+                    ready_for_work=ready_for_work)
         s.add(p)
         await s.commit()
     return p
+
+
+async def make_access(project_id: int, name: str = "FTP", kind: str = "ftp",
+                      status: str = "needed") -> AccessItem:
+    async with Session() as s:
+        item = AccessItem(project_id=project_id, name=name, kind=kind, status=status)
+        s.add(item)
+        await s.commit()
+    return item
 
 
 async def make_tasks(project_id: int, n: int, lane: str = "build",
@@ -68,14 +79,22 @@ async def make_tasks(project_id: int, n: int, lane: str = "build",
 
 
 class FakeCommunicator:
-    """Считает вызовы полосы chat, ничего никуда не шлёт."""
+    """Считает вызовы, ничего никуда не шлёт."""
 
     def __init__(self):
         self.processed: list[int] = []
         self.done: list[int] = []
+        self.stages: list[int] = []
+        self.reminders: list[tuple[int, int]] = []   # (project_id, сколько пунктов)
 
     async def process(self, task, project) -> None:
         self.processed.append(project.id)
 
     async def on_task_done(self, task, project) -> None:
         self.done.append(project.id)
+
+    async def on_stage_done(self, project) -> None:
+        self.stages.append(project.id)
+
+    async def remind_access(self, project, items) -> None:
+        self.reminders.append((project.id, len(items)))

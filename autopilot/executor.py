@@ -4,11 +4,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
+from sqlalchemy import select
+
 from .config import cfg
-from .db import Project, Run, Session, Task, utcnow
+from .db import AccessItem, Project, Run, Session, Task, utcnow
+from .vault import refs_in, to_env_names, vault
 
 log = logging.getLogger("exec")
 
@@ -17,11 +21,13 @@ SYSTEM_RULES = """Ты работаешь автономно, человека �
 - НЕ спрашивай подтверждений, принимай решения сам и фиксируй их в DECISIONS.md
 - После работы обязательно проверь, что проект собирается
 - Не трогай файлы вне текущего каталога
+- Доступы лежат в переменных окружения ($ИМЯ). Бери их оттуда и НИКОГДА
+  не печатай значения, не пиши их в файлы и не коммить
 - В конце выведи короткий отчёт: что сделано, что не сделано, почему
 """
 
 
-def build_prompt(task: Task, project: Project) -> str:
+def _raw_prompt(task: Task, project: Project) -> str:
     parts = [SYSTEM_RULES, f"# Проект\n{project.title} (клиент: {project.client})"]
     if project.brief:
         parts.append("# ТЗ\n" + json.dumps(project.brief, ensure_ascii=False, indent=2))
@@ -34,12 +40,24 @@ def build_prompt(task: Task, project: Project) -> str:
     return "\n\n".join(parts)
 
 
+def build_prompt(task: Task, project: Project) -> str:
+    """Промпт, который реально уходит агенту.
+
+    Значений секретов здесь нет и быть не может: ссылки {{SECRET:NAME}}
+    превращаются в имена переменных окружения $NAME, а сами значения
+    попадают в процесс через env= у subprocess.
+    """
+    return to_env_names(_raw_prompt(task, project))
+
+
 class Executor:
     async def run(self, task: Task, project: Project) -> dict:
         workspace = Path(project.workspace or cfg.workspaces / f"p{project.id}")
         # без каталога create_subprocess_exec падает с невнятным WinError 267
         workspace.mkdir(parents=True, exist_ok=True)
-        prompt = build_prompt(task, project)
+        raw = _raw_prompt(task, project)
+        prompt = to_env_names(raw)
+        env = await self._secret_env(raw, project)
 
         args = [cfg.claude_bin, "-p"]
         if task.cc_session_id:
@@ -57,7 +75,7 @@ class Executor:
         t0 = time.monotonic()
         try:
             proc = await asyncio.create_subprocess_exec(
-                *args, cwd=str(workspace),
+                *args, cwd=str(workspace), env=env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError:
@@ -72,15 +90,17 @@ class Executor:
 
         elapsed = time.monotonic() - t0
         log_path = cfg.logs / f"task{task.id}_{int(time.time())}.json"
-        log_path.write_bytes(out or err or b"")
+        # агент вполне может вывести пароль в отчёте — на диск он попасть не должен
+        log_path.write_bytes(vault.mask_bytes(out or err or b""))
 
         try:
             data = json.loads(out.decode(errors="replace"))
         except Exception:
-            raise RuntimeError(f"bad output: {(err or out)[:500]!r}") from None
+            tail = vault.mask((err or out or b"").decode(errors="replace")[:500])
+            raise RuntimeError(f"bad output: {tail!r}") from None
 
         if data.get("is_error"):
-            raise RuntimeError(str(data.get("result"))[:500])
+            raise RuntimeError(vault.mask(str(data.get("result")))[:500])
 
         cost = float(data.get("total_cost_usd") or 0)
         sid = data.get("session_id")
@@ -102,3 +122,24 @@ class Executor:
 
         log.info("task %s done in %.0fs / $%.3f", task.id, elapsed, cost)
         return data
+
+    async def _secret_env(self, raw_prompt: str, project: Project) -> dict[str, str]:
+        """Окружение процесса: своё + значения секретов проекта.
+
+        Берём и то, на что ссылается сам промпт, и весь чеклист доступов —
+        агенту может понадобиться доступ, явно в тексте не упомянутый.
+        """
+        async with Session() as s:
+            item_refs = (await s.execute(
+                select(AccessItem.secret_ref)
+                .where(AccessItem.project_id == project.id,
+                       AccessItem.secret_ref.isnot(None)))).scalars().all()
+        wanted = list(dict.fromkeys(refs_in(raw_prompt) + [n for r in item_refs for n in refs_in(r)]))
+        if not wanted:
+            return None
+        secrets = vault.env_for(*(("{{SECRET:%s}}" % n) for n in wanted))
+        if not secrets:
+            return None
+        log.info("task-окружение: передаю %s секрет(ов) процессу, в промпт они не идут",
+                 len(secrets))
+        return {**os.environ, **secrets}

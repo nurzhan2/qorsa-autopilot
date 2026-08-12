@@ -5,10 +5,10 @@ import asyncio
 import datetime as dt
 
 import pytest
-from conftest import FakeCommunicator, make_project, make_tasks
+from conftest import FakeCommunicator, make_access, make_project, make_tasks
 
 from autopilot.config import cfg
-from autopilot.db import Run, Session, Task
+from autopilot.db import AccessItem, Project, Run, Session, Task
 from autopilot.fakes import FakeExecutor, FakeVerifier
 from autopilot.scheduler import Scheduler
 
@@ -44,9 +44,15 @@ async def test_scheduler_fairness(db):
     # пока работа есть у всех, круг проходится целиком: первые пять выданных
     # слотов достаются пяти разным проектам, а не жадному по кругу
     assert len(set(ex.served[:5])) == 5, f"первые пять слотов: {ex.served[:5]}"
-    # дальше мелкие проекты кончаются, и оставшееся честно забирает жадный —
-    # это уже не несправедливость, а отсутствие конкурентов
-    assert ex.served.count(projects[0].id) <= 2 * 10
+    # пока у мелких проектов есть работа, жадный не получает больше слотов,
+    # чем все остальные вместе. Дальше он забирает всё — но это уже не
+    # несправедливость, а отсутствие конкурентов
+    greedy_id = projects[0].id
+    last_rival = max(i for i, pid in enumerate(ex.served) if pid != greedy_id)
+    contested = ex.served[:last_rival + 1]
+    greedy = contested.count(greedy_id)
+    assert greedy <= len(contested) - greedy, (
+        f"в конкурентной фазе жадный забрал {greedy} из {len(contested)}: {contested}")
 
 
 async def test_scheduler_priority(db):
@@ -190,3 +196,114 @@ async def test_dead_projects_are_not_served(db, status):
     await sched.drain()
 
     assert ex.calls == []
+
+
+async def test_access_blocks_build(db):
+    """Пока хоть один пункт чеклиста не verified, build-слот не выдаётся."""
+    p = await make_project(status="active")
+    await make_tasks(p.id, 3, lane="build")
+    await make_tasks(p.id, 1, lane="chat", start_idx=50)
+    await make_access(p.id, "FTP хостинга", "ftp", "verified")
+    item = await make_access(p.id, "Панель хостинга", "hosting_panel", "requested")
+
+    ex, comm = FakeExecutor(), FakeCommunicator()
+    sched = make_sched(communicator=comm, executor=ex)
+
+    for _ in range(3):
+        await sched.tick()
+        await sched.drain()
+
+    assert ex.calls == [], "проект без доступов получил build-слот"
+    async with Session() as s:
+        proj = await s.get(Project, p.id)
+    assert proj.status == "blocked_access"
+    assert comm.processed, "переписка в chat должна идти и без доступов"
+    assert comm.reminders, "клиенту не напомнили про недостающий доступ"
+
+    # доступ пришёл и проверен — полоса открывается
+    async with Session() as s:
+        stored = await s.get(AccessItem, item.id)
+        stored.status = "verified"
+        await s.commit()
+
+    await sched.tick()
+    await sched.drain()
+
+    assert ex.calls, "после verified проект так и не поехал"
+    async with Session() as s:
+        proj = await s.get(Project, p.id)
+    assert proj.status == "active"
+
+
+async def test_access_reminder_is_one_per_tick_round(db):
+    """Планировщик зовёт напоминание с ПОЛНЫМ списком, а не по пункту."""
+    p = await make_project(status="active")
+    await make_tasks(p.id, 1, lane="build")
+    for name in ("FTP", "Панель", "Домен"):
+        await make_access(p.id, name, "other", "needed")
+
+    comm = FakeCommunicator()
+    sched = make_sched(communicator=comm)
+    await sched.tick()
+    await sched.drain()
+
+    assert comm.reminders == [(p.id, 3)], f"вызовы напоминаний: {comm.reminders}"
+
+
+async def test_sheet_gate(db):
+    """Строка без галочки «Готов к работе» не отдаёт задач в build."""
+    p = await make_project(status="briefing", ready_for_work=False)
+    await make_tasks(p.id, 3, lane="build")
+
+    ex = FakeExecutor()
+    sched = make_sched(executor=ex)
+    for _ in range(3):
+        await sched.tick()
+        await sched.drain()
+
+    assert ex.calls == [], "проект без галочки менеджера поехал в работу"
+    async with Session() as s:
+        proj = await s.get(Project, p.id)
+    assert proj.status == "briefing", "без галочки проект не выходит из briefing"
+
+    async with Session() as s:
+        proj = await s.get(Project, p.id)
+        proj.ready_for_work = True
+        await s.commit()
+
+    await sched.tick()
+    await sched.drain()
+
+    assert ex.calls, "галочку поставили, а проект не поехал"
+    async with Session() as s:
+        proj = await s.get(Project, p.id)
+    assert proj.status == "active"
+
+
+async def test_served_units_decay(db, monkeypatch):
+    """Простоявший проект перестаёт быть вечным должником очереди."""
+    from autopilot.db import decayed_units, utcnow
+
+    monkeypatch.setattr(cfg, "served_halflife_h", 24.0)
+    now = utcnow()
+    assert decayed_units(100.0, now, now) == pytest.approx(100.0)
+    assert decayed_units(100.0, now - dt.timedelta(hours=24), now) == pytest.approx(50.0)
+    assert decayed_units(100.0, now - dt.timedelta(hours=48), now) == pytest.approx(25.0)
+
+    # и планировщик реально пользуется затухшим значением
+    old = await make_project(title="давно ждёт")
+    fresh = await make_project(title="новичок")
+    await make_tasks(old.id, 5, lane="chat")
+    await make_tasks(fresh.id, 5, lane="chat")
+    async with Session() as s:
+        p_old = await s.get(Project, old.id)
+        p_old.served_units = 100.0
+        p_old.served_at = utcnow() - dt.timedelta(hours=24 * 10)   # десять полураспадов
+        await s.commit()
+
+    comm = FakeCommunicator()
+    sched = make_sched(communicator=comm)
+    await sched.tick()
+    await sched.drain()
+
+    assert old.id in comm.processed, "проект с истлевшим долгом всё ещё в хвосте очереди"

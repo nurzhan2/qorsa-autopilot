@@ -10,7 +10,7 @@ from autopilot.db import Project, Session
 # колонки нарочно вперемешку — чтобы индексы человека и бота чередовались
 HEADER = ["ID", "Клиент", "Статус", "Проект", "Прогресс", "TG chat", "Цена",
           "Превью", "Дедлайн", "Приоритет", "Последнее действие", "Папка",
-          "Стоимость $", "Обновлено"]
+          "Готов к работе", "Ждём от клиента", "Стоимость $", "Обновлено"]
 
 HUMAN_COLS = {HEADER.index(n) + 1 for n in sheets.HUMAN if n in HEADER}
 BOT_COLS = {HEADER.index(n) + 1 for n in sheets.BOT if n in HEADER}
@@ -86,8 +86,9 @@ async def test_pull_touches_only_id_column(db, monkeypatch):
     ws = FakeWorksheet(records=[{
         "ID": "", "Клиент": "Айгерим", "Проект": "лендинг", "TG chat": "42",
         "Цена": "150 000", "Дедлайн": "01.09.2026", "Приоритет": "1", "Папка": "",
-        "Статус": "", "Прогресс": "", "Превью": "", "Последнее действие": "",
-        "Стоимость $": "", "Обновлено": "",
+        "Готов к работе": "TRUE",
+        "Статус": "", "Прогресс": "", "Ждём от клиента": "", "Превью": "",
+        "Последнее действие": "", "Стоимость $": "", "Обновлено": "",
     }])
     monkeypatch.setattr(sheets, "_client", lambda: ws)
 
@@ -103,4 +104,5 @@ async def test_pull_touches_only_id_column(db, monkeypatch):
     assert proj.priority == 1
     assert proj.deadline.isoformat() == "2026-09-01"
     assert proj.status == "briefing"       # появился TG chat -> new -> briefing
+    assert proj.ready_for_work is True
     assert proj.sheet_row == 2
