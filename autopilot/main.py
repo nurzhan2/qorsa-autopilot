@@ -4,6 +4,7 @@ import asyncio
 import logging
 import sys
 
+from .brief import Brief, BriefRunner
 from .communicator import Communicator
 from .config import cfg
 from .db import init_db, recover_orphan_tasks
@@ -85,6 +86,12 @@ async def main() -> None:
         tasks.append(asyncio.create_task(ingest.run(), name="ingest"))
     else:
         log.warning("ни один мессенджер не настроен — входящие не принимаются")
+
+    if cfg.anthropic_key and not cfg.dry_run:
+        runner = BriefRunner(Brief(communicator=communicator), communicator)
+        tasks.append(asyncio.create_task(runner.loop(), name="brief"))
+    else:
+        log.warning("ANTHROPIC_API_KEY не задан или DRY_RUN — бриф не собирается")
 
     # если одна петля всё-таки умерла — гасим остальные, а не висим полутрупом
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

@@ -142,19 +142,29 @@ class MaxTransport:
         if chat_id is None:
             chat_id = recipient.get("user_id")
         link = message.get("link") or {}
+        reply_msg = link.get("message") or {}
+        reply_sender = str((link.get("sender") or {}).get("user_id") or "") or None
+        text = body.get("text") or ""
+        mentions = bool(cfg.bot_username and ("@" + cfg.bot_username.lower()) in text.lower())
+        if cfg.bot_max_id and reply_sender and reply_sender == str(cfg.bot_max_id):
+            mentions = True
 
         return InboundMessage(
             transport=self.name,
             chat_id=str(chat_id or ""),
             message_id=str(body.get("mid") or ""),
-            text=body.get("text") or "",
+            text=text,
             date=_ts(upd.get("timestamp") or message.get("timestamp")),
             sender_id=str(sender.get("user_id")) if sender.get("user_id") is not None else None,
             handle=("@" + sender["username"]) if sender.get("username") else None,
             has_media=bool(attachments),
             media_kind=media_kind,
-            reply_to=str((link.get("message") or {}).get("mid"))
-            if link.get("type") == "reply" else None,
+            reply_to=str(reply_msg.get("mid")) if link.get("type") == "reply" else None,
+            reply_to_sender_id=reply_sender,
+            sender_name=(sender.get("name") or sender.get("username") or "").strip(),
+            chat_title=recipient.get("chat_title") or upd.get("chat_title") or "",
+            chat_type=recipient.get("chat_type") or "dialog",
+            mentions_bot=mentions,
             edited=(kind == "message_edited"),
             connection_id=None,          # бизнес-режима в MAX нет
             cursor=str(upd.get("marker") or ""),

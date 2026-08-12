@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
-from sqlalchemy import (JSON, DateTime, ForeignKey, Index, String, TypeDecorator,
+from sqlalchemy import (JSON, DateTime, ForeignKey, Index, String, TypeDecorator, text,
                         UniqueConstraint, event, select, update)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -59,6 +59,8 @@ class Project(Base):
     chat_ref: Mapped[str | None] = mapped_column(default=None)
     # когда клиент последний раз ответил — по этому признаку фаза 4 снимет блокировки
     client_replied_at: Mapped[dt.datetime | None] = mapped_column(default=None)
+    # бриф собран, уверенности хватает, открытых вопросов нет — третий гейт build
+    brief_ready: Mapped[bool] = mapped_column(default=False, server_default=text("0"))
 
     # new -> briefing -> active -> review -> done | blocked | blocked_access (см. CLAUDE.md)
     status: Mapped[str] = mapped_column(String(20), default="new")
@@ -111,8 +113,28 @@ class ProjectChat(Base):
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
     transport: Mapped[str] = mapped_column(String(16), default="telegram")
     chat_id: Mapped[str] = mapped_column(String(64))
-    handle: Mapped[str | None] = mapped_column(default=None)     # @username или телефон
+    handle: Mapped[str | None] = mapped_column(default=None)     # @username или название группы
     is_primary: Mapped[bool] = mapped_column(default=True)
+    # в группе бот — отдельный участник и пишет от своего лица, а не от моего.
+    # server_default обязателен: миграции вставляют строки сырым SQL, а
+    # python-side default в DDL не попадает и ловится как NOT NULL
+    is_group: Mapped[bool] = mapped_column(default=False, server_default=text("0"))
+
+
+class ChatParticipant(Base):
+    """Кто сидит в групповом чате. Роль решает, попадут ли слова человека
+    в бриф: ТЗ строится по репликам КЛИЕНТА, а не менеджера."""
+    __tablename__ = "chat_participants"
+    __table_args__ = (UniqueConstraint("transport", "chat_id", "sender_id",
+                                       name="uq_chat_participant"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    transport: Mapped[str] = mapped_column(String(16), default="telegram")
+    chat_id: Mapped[str] = mapped_column(String(64))
+    sender_id: Mapped[str] = mapped_column(String(64))
+    role: Mapped[str] = mapped_column(String(10), default="client")   # client|manager|owner|bot
+    display_name: Mapped[str] = mapped_column(String(200), default="")
+    first_seen: Mapped[dt.datetime] = mapped_column(default=utcnow)
 
 
 class ChatMessage(Base):
@@ -131,7 +153,9 @@ class ChatMessage(Base):
     tg_message_id: Mapped[str] = mapped_column(String(64))
     project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), default=None)
 
-    direction: Mapped[str] = mapped_column(String(3), default="in")     # in | out
+    direction: Mapped[str] = mapped_column(String(3), default="in")     # in | out (наследие фазы 2)
+    sender_role: Mapped[str] = mapped_column(String(10), default="client",
+                                            server_default=text("'client'"))
     sender_id: Mapped[str | None] = mapped_column(default=None)
     text: Mapped[str] = mapped_column(default="")
     has_media: Mapped[bool] = mapped_column(default=False)
@@ -180,6 +204,9 @@ class AccessItem(Base):
     requested_at: Mapped[dt.datetime | None] = mapped_column(default=None)
     verified_at: Mapped[dt.datetime | None] = mapped_column(default=None)
     note: Mapped[str] = mapped_column(default="")
+    # пункт пропал из брифа: не удаляем, чтобы не потерять уже проверенный доступ
+    stale: Mapped[bool] = mapped_column(default=False, server_default=text("0"))
+    source: Mapped[str] = mapped_column(String(10), default="manual")   # manual|brief
 
 
 class Message(Base):

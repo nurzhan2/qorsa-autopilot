@@ -65,7 +65,7 @@ class QuietComm:
 
 
 class Comm(QuietComm):
-    async def incoming(self, project, text, transport=None, chat_id=None):
+    async def incoming(self, project, text, transport=None, chat_id=None, in_group=False):
         self.forwarded.append(text)
 
 

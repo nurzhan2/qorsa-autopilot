@@ -173,6 +173,15 @@ class Communicator:
                 .order_by(BusinessConnection.updated_at.desc()))).scalars().first()
         return row.id if row else None
 
+    async def _is_group(self, transport: str, chat_id: str) -> bool:
+        """В групповом чате бот — отдельный участник и пишет от своего лица.
+        Подставлять туда бизнес-соединение владельца нельзя."""
+        async with Session() as s:
+            row = (await s.execute(
+                select(ProjectChat).where(ProjectChat.transport == transport,
+                                          ProjectChat.chat_id == str(chat_id)))).scalars().first()
+        return bool(row and row.is_group)
+
     async def notify_owner(self, text: str) -> None:
         """Оперативное уведомление владельцу — мимо очереди и тихих часов."""
         transport = self.transports.get("telegram")
@@ -209,17 +218,47 @@ class Communicator:
         return m
 
     async def incoming(self, project: Project, text: str,
-                       transport: str | None = None, chat_id: str | None = None) -> Message:
-        """Сообщение от клиента. Бот не отвечает сам на то, что не его:
-        спорное просто пересылается менеджеру, и на этом бот замолкает."""
+                       transport: str | None = None, chat_id: str | None = None,
+                       in_group: bool = False) -> Message | None:
+        """Сообщение от клиента.
+
+        В группе менеджер сидит рядом и всё видит сам — пересылать ему нечего,
+        бот просто молчит. Это и есть «не влезать в разговор».
+        """
         msg_route = route(text)
         if msg_route == TO_CLIENT:
             # входящее не может быть «ответом клиенту» — это уже наша реакция
             msg_route = TO_OWNER
+        if in_group and msg_route == TO_MANAGER:
+            log.info("группа %s: вопрос к менеджеру, молчу — он в этой же группе", chat_id)
+            return None
         prefix = {TO_MANAGER: "Клиент пишет (это к тебе)", TO_OWNER: "Клиент пишет (техника)"}
         where = f" [{transport}:{chat_id}]" if transport else ""
         return await self.draft(project, f"{prefix[msg_route]}{where}: {text}",
                                 kind="forward", force_route=msg_route)
+
+    async def ask_questions(self, project: Project, questions: list[str]) -> Message | None:
+        """Вопросы клиенту по брифу: одним сообщением и не чаще кулдауна.
+
+        Три вопроса за раз — потолок. Список из десяти пунктов клиент
+        не читает, а закрывает.
+        """
+        from .brief import question_cooldown
+        if not questions:
+            return None
+        async with Session() as s:
+            since = utcnow() - question_cooldown()
+            recent = (await s.execute(
+                select(Message.id).where(Message.project_id == project.id,
+                                         Message.kind == "brief_questions",
+                                         Message.created_at >= since))).first()
+        if recent is not None:
+            log.debug("проект %s: вопросы уже задавали недавно", project.id)
+            return None
+
+        body = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions[:cfg.brief_max_questions]))
+        text = ("Чтобы точно собрать ТЗ, не хватает нескольких деталей:\n" + body)
+        return await self.draft(project, text, kind="brief_questions", force_route=TO_CLIENT)
 
     async def confirm_access_received(self, project: Project, transport=None,
                                       chat_id: str | None = None) -> Message:
@@ -381,7 +420,7 @@ class Communicator:
 
         connection_id = None
         if m.route == TO_CLIENT:
-            if transport.supports_impersonation():
+            if transport.supports_impersonation() and not await self._is_group(name, chat):
                 connection_id = await self._connection_id(name)
             else:
                 # там, где нельзя писать от лица владельца, притворяться запрещено

@@ -52,13 +52,15 @@ async def test_migration_from_previous_version(db):
         await conn.execute(text("DROP TABLE IF EXISTS schema_version"))
         await conn.run_sync(Base.metadata.create_all)
         for table in ("chat_messages", "project_chats", "transport_state",
-                      "business_connections"):
+                      "business_connections", "chat_participants"):
             await conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
-        await conn.execute(text("ALTER TABLE projects DROP COLUMN chat_ref"))
-        await conn.execute(text("ALTER TABLE projects DROP COLUMN client_replied_at"))
+        for column in ("chat_ref", "client_replied_at", "brief_ready"):
+            await conn.execute(text(f"ALTER TABLE projects DROP COLUMN {column}"))
         await conn.execute(text("ALTER TABLE projects ADD COLUMN tg_chat_id VARCHAR"))
-        await conn.execute(text("ALTER TABLE messages DROP COLUMN transport"))
-        await conn.execute(text("ALTER TABLE messages DROP COLUMN chat_id"))
+        for column in ("transport", "chat_id"):
+            await conn.execute(text(f"ALTER TABLE messages DROP COLUMN {column}"))
+        for column in ("stale", "source"):
+            await conn.execute(text(f"ALTER TABLE access_items DROP COLUMN {column}"))
         await conn.execute(text(
             "INSERT INTO projects (id, client, title, tg_chat_id, status, priority, "
             "ready_for_work, cost_usd, served_units, served_at, brief, last_action, updated_at) "
@@ -281,7 +283,8 @@ async def test_project_two_chats(db, tg, mx, monkeypatch):
 class _Silent:
     async def notify_owner(self, text): ...
     async def confirm_access_received(self, project, transport=None, chat_id=None): ...
-    async def incoming(self, project, text, transport=None, chat_id=None): ...
+    async def incoming(self, project, text, transport=None, chat_id=None,
+                       in_group=False): ...
 
 
 class _FakeTr:

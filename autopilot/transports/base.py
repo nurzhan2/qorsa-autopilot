@@ -32,6 +32,12 @@ class InboundMessage:
     has_media: bool = False
     media_kind: str | None = None        # photo|video|document|voice|audio|sticker|...
     reply_to: str | None = None
+    reply_to_sender_id: str | None = None
+    sender_name: str = ""
+    # групповые чаты: по названию опознаём проект, по типу — можно ли молчать
+    chat_title: str = ""
+    chat_type: str = "private"       # private | group | supergroup | dialog | chat
+    mentions_bot: bool = False
     edited: bool = False
     deleted: bool = False
     direction: str = "in"

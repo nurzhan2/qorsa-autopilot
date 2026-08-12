@@ -24,14 +24,22 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from . import roles
 from .config import cfg
-from .db import (ChatMessage, Project, ProjectChat, Session, Task, utcnow)
+from .db import ChatMessage, Project, ProjectChat, Session, Task, utcnow
+from .groups import match_project
 from .secrets_scan import scrub
 from .transports.base import Backoff, InboundMessage, save_offset
 
 log = logging.getLogger("ingest")
 
 BIND_HINT = "/bind"
+
+GROUP_TYPES = ("group", "supergroup", "chat")
+
+
+def is_group(msg: InboundMessage) -> bool:
+    return (msg.chat_type or "").lower() in GROUP_TYPES
 
 
 def parse_chat_ref(raw: str) -> tuple[str, str] | None:
@@ -108,9 +116,14 @@ class Ingest:
         # ШАГ 1: секреты вырезаются ДО записи в БД
         text, secret_names = scrub(msg.text, project_id=project_id, chat_id=msg.chat_id)
 
+        # роль решает, попадут ли слова в бриф: реплики менеджера в ТЗ не идут
+        sender_role = await roles.remember(msg.transport, msg.chat_id, msg.sender_id,
+                                           msg.sender_name)
+
         row = ChatMessage(
             transport=msg.transport, chat_id=msg.chat_id, tg_message_id=msg.message_id,
             project_id=project_id, direction=msg.direction, sender_id=msg.sender_id,
+            sender_role=sender_role,
             text=text, has_media=msg.has_media, media_kind=msg.media_kind,
             reply_to=msg.reply_to, raw_json=_safe_raw(msg, text),
             created_at=msg.date or utcnow(),
@@ -131,6 +144,11 @@ class Ingest:
 
         if project_id is None:
             await self._report_unbound(msg)
+            return row
+
+        if sender_role in (roles.BOT, roles.OWNER, roles.MANAGER):
+            # своих в базу пишем (бриф читает всю переписку), но реагировать
+            # на них не надо: это не обращение к боту
             return row
 
         # ВНИМАНИЕ: дальше идёт только `text` — вычищенный. Сырой msg.text
@@ -191,6 +209,18 @@ class Ingest:
             if chat is not None:
                 return chat.project_id, False
 
+        # групповой чат опознаём по названию: менеджер называет их по шаблону
+        if msg.chat_title:
+            project_id, score, why = await match_project(msg.chat_title)
+            if project_id is not None:
+                await self.bind_chat(project_id, msg.transport, msg.chat_id,
+                                     handle=msg.chat_title, group=is_group(msg))
+                log.info("группа %r привязана к проекту %s: %s",
+                         msg.chat_title, project_id, why)
+                return project_id, True
+            log.info("группу %r не опознал: %s", msg.chat_title, why)
+
+        async with Session() as s:
             if not msg.handle:
                 return None, False
 
@@ -216,7 +246,8 @@ class Ingest:
                 return p.id, True
         return None, False
 
-    async def bind_chat(self, project_id: int, transport: str, chat_id: str) -> bool:
+    async def bind_chat(self, project_id: int, transport: str, chat_id: str,
+                        handle: str | None = None, group: bool = False) -> bool:
         """Ручная привязка (ответ владельца или scripts/bind_chat.py)."""
         async with Session() as s:
             if await s.get(Project, project_id) is None:
@@ -226,9 +257,14 @@ class Ingest:
                                           ProjectChat.chat_id == chat_id))).scalars().first()
             if exists is None:
                 s.add(ProjectChat(project_id=project_id, transport=transport,
-                                  chat_id=chat_id, is_primary=True))
+                                  chat_id=chat_id, handle=handle, is_primary=True,
+                                  is_group=group))
             else:
                 exists.project_id = project_id
+                if handle:
+                    exists.handle = handle
+                if group:
+                    exists.is_group = True
             # осиротевшие сообщения этого чата тоже получают проект
             for row in (await s.execute(
                     select(ChatMessage).where(ChatMessage.transport == transport,
@@ -283,10 +319,13 @@ class Ingest:
                 return
             project.client_replied_at = utcnow()   # фаза 4 снимет по этому блокировки
             project.updated_at = utcnow()
-            # входящее ставит слот в полосе chat
-            s.add(Task(project_id=project_id, lane="chat", order_idx=int(utcnow().timestamp()),
-                       title=f"ответ клиенту ({msg.transport})",
-                       prompt=(text or "")[:2000], status="ready"))
+            # слот в полосе chat ставим, только если к боту обратились:
+            # в группе большинство сообщений — разговор менеджера с клиентом
+            if msg.mentions_bot or not is_group(msg):
+                s.add(Task(project_id=project_id, lane="chat",
+                           order_idx=int(utcnow().timestamp()),
+                           title=f"ответ клиенту ({msg.transport})",
+                           prompt=(text or "")[:2000], status="ready"))
             await s.commit()
             project = await s.get(Project, project_id)
 
@@ -294,8 +333,16 @@ class Ingest:
             # про перехват клиенту не сообщаем — просто подтверждаем получение
             await self.communicator.confirm_access_received(project, transport, msg.chat_id)
             return
+
+        if is_group(msg) and not msg.mentions_bot:
+            # В группе сидит менеджер. Бот читает всё, но в разговор не влезает:
+            # отвечает, только когда обратились к нему. Молчание здесь — это фича
+            log.debug("группа %s: сообщение прочитано, ответ не требуется", msg.chat_id)
+            return
+
         await self.communicator.incoming(project, text,
-                                         transport=msg.transport, chat_id=msg.chat_id)
+                                         transport=msg.transport, chat_id=msg.chat_id,
+                                         in_group=is_group(msg))
 
 
 def _safe_raw(msg: InboundMessage, scrubbed: str) -> dict:

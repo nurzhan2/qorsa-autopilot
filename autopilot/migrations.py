@@ -91,7 +91,19 @@ async def m002_ingest(conn) -> None:
             UPDATE projects SET chat_ref = 'tg:' || tg_chat_id
             WHERE chat_ref IS NULL AND tg_chat_id IS NOT NULL AND TRIM(tg_chat_id) != ''
         """))
-        log.info("projects.tg_chat_id перенесён в project_chats")
+        # INSERT OR IGNORE глушит не только дубли, но и NOT NULL: колонка,
+        # добавленная будущей фазой без server_default, превратила бы перенос
+        # данных в тихую потерю. Поэтому сверяем количества явно.
+        src = (await conn.execute(text(
+            "SELECT COUNT(*) FROM projects "
+            "WHERE tg_chat_id IS NOT NULL AND TRIM(tg_chat_id) != ''"))).scalar_one()
+        got = (await conn.execute(text(
+            "SELECT COUNT(*) FROM project_chats WHERE transport = 'telegram'"))).scalar_one()
+        if src and not got:
+            raise RuntimeError(
+                f"перенос tg_chat_id не сработал: источников {src}, перенесено 0 — "
+                "скорее всего в project_chats появилась NOT NULL колонка без server_default")
+        log.info("projects.tg_chat_id перенесён в project_chats: %s строк", got)
 
     # уникальность id сообщения — только внутри своего мессенджера
     await conn.execute(text("DROP INDEX IF EXISTS uq_chat_message_legacy"))
@@ -103,9 +115,41 @@ async def m002_ingest(conn) -> None:
         "ON project_chats (transport, chat_id)"))
 
 
+async def m003_group_roles(conn) -> None:
+    """Фаза 3: групповые чаты, роли участников, готовность брифа."""
+    await ensure_tables(conn)
+    await _add_column(conn, "chat_messages", "sender_role", "VARCHAR(10) DEFAULT 'client'")
+    await _add_column(conn, "projects", "brief_ready", "BOOLEAN DEFAULT 0")
+    await _add_column(conn, "access_items", "stale", "BOOLEAN DEFAULT 0")
+    await _add_column(conn, "access_items", "source", "VARCHAR(10) DEFAULT 'manual'")
+    await _add_column(conn, "project_chats", "is_group", "BOOLEAN DEFAULT 0")
+
+    # direction не выбрасываем — переносим в роли. Раньше "out" означало
+    # «написано с моего аккаунта», то есть владельцем
+    await conn.execute(text("""
+        UPDATE chat_messages
+        SET sender_role = CASE WHEN direction = 'out' THEN 'owner' ELSE 'client' END
+        WHERE sender_role IS NULL OR sender_role = ''
+    """))
+
+    # участники — из того, что уже накопилось в переписке
+    await conn.execute(text("""
+        INSERT OR IGNORE INTO chat_participants
+            (transport, chat_id, sender_id, role, display_name, first_seen)
+        SELECT transport, chat_id, sender_id, MIN(sender_role), '', MIN(created_at)
+        FROM chat_messages
+        WHERE sender_id IS NOT NULL AND TRIM(sender_id) != ''
+        GROUP BY transport, chat_id, sender_id
+    """))
+    await conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_chat_participant "
+        "ON chat_participants (transport, chat_id, sender_id)"))
+
+
 MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline: схема фазы 1", m001_baseline),
     (2, "ingest: переписка, транспорты, привязка чатов", m002_ingest),
+    (3, "группы: роли участников, готовность брифа", m003_group_roles),
 ]
 
 
