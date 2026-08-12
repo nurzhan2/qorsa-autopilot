@@ -56,8 +56,10 @@ class Project(Base):
     title: Mapped[str] = mapped_column(String(300), default="")
     tg_chat_id: Mapped[str | None] = mapped_column(default=None)
 
-    # new -> briefing -> active -> review -> done | blocked   (см. CLAUDE.md)
+    # new -> briefing -> active -> review -> done | blocked | blocked_access (см. CLAUDE.md)
     status: Mapped[str] = mapped_column(String(20), default="new")
+    # галочка менеджера в таблице: пока не True, проект не выходит из briefing
+    ready_for_work: Mapped[bool] = mapped_column(default=False)
     priority: Mapped[int] = mapped_column(default=2)          # 1 = высокий, 3 = низкий
     deadline: Mapped[dt.date | None] = mapped_column(default=None)
     price: Mapped[float | None] = mapped_column(default=None)
@@ -68,6 +70,7 @@ class Project(Base):
 
     cost_usd: Mapped[float] = mapped_column(default=0.0)
     served_units: Mapped[float] = mapped_column(default=0.0)  # счётчик WFQ
+    served_at: Mapped[dt.datetime] = mapped_column(default=utcnow)  # к какому моменту он посчитан
     last_action: Mapped[str] = mapped_column(String(300), default="")
     updated_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
 
@@ -94,15 +97,36 @@ class Task(Base):
     updated_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
 
 
+class AccessItem(Base):
+    """Пункт чеклиста доступов. Пока хоть один не verified — проект не строится."""
+    __tablename__ = "access_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    name: Mapped[str] = mapped_column(String(200), default="")
+    # ftp/ssh/git/hosting_panel/domain/api_key/analytics/design/content/other
+    kind: Mapped[str] = mapped_column(String(20), default="other")
+    # needed -> requested -> received -> verified | failed
+    status: Mapped[str] = mapped_column(String(12), default="needed")
+    # ССЫЛКА вида {{SECRET:NAME}}, но НЕ значение — значения живут только в vault
+    secret_ref: Mapped[str | None] = mapped_column(default=None)
+    requested_at: Mapped[dt.datetime | None] = mapped_column(default=None)
+    verified_at: Mapped[dt.datetime | None] = mapped_column(default=None)
+    note: Mapped[str] = mapped_column(default="")
+
+
 class Message(Base):
-    """Исходящие клиенту. Ничего не уходит мимо гейта."""
+    """Исходящее сообщение. Кому именно — решает маршрутизация, см. communicator."""
     __tablename__ = "messages"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
     text: Mapped[str] = mapped_column(default="")
-    gate: Mapped[str] = mapped_column(String(10), default="red")   # green|yellow|red
-    status: Mapped[str] = mapped_column(String(12), default="draft")  # draft|scheduled|sent|cancelled
+    # to_client_auto | to_owner | to_manager
+    route: Mapped[str] = mapped_column(String(16), default="to_manager")
+    # для агрегации и лимитов: task_done | access_reminder | plain
+    kind: Mapped[str] = mapped_column(String(20), default="plain")
+    status: Mapped[str] = mapped_column(String(12), default="scheduled")  # draft|scheduled|sent|cancelled
     send_after: Mapped[dt.datetime | None] = mapped_column(default=None)
     sent_at: Mapped[dt.datetime | None] = mapped_column(default=None)
     created_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
@@ -164,3 +188,23 @@ async def recover_orphan_tasks() -> int:
             update(Task).where(Task.status == "running").values(status="ready", updated_at=utcnow()))
         await s.commit()
         return res.rowcount
+
+
+def decayed_units(served: float, served_at: dt.datetime | None, now: dt.datetime | None = None) -> float:
+    """Экспоненциальное затухание счётчика WFQ.
+
+    Без него проект, простоявший месяц, возвращается в очередь с огромным
+    долгом и вечно проигрывает новичкам. Период полураспада — SERVED_HALFLIFE_H.
+    """
+    if served <= 0:
+        return 0.0
+    half = cfg.served_halflife_h
+    if half <= 0:
+        return served
+    now = now or utcnow()
+    if served_at is None:
+        return served
+    hours = (now - served_at).total_seconds() / 3600
+    if hours <= 0:
+        return served
+    return served * (0.5 ** (hours / half))

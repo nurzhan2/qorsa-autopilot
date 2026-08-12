@@ -130,9 +130,9 @@ class Verifier:
         try:
             data = json.loads(raw)
         except Exception:
-            # судья сломался — не блокируем работу, но это видно в логах
+            # молча засчитывать PASS нельзя: непрочитанный вердикт — это не приёмка
             log.warning("судья вернул не-JSON для задачи %s: %r", task.id, raw[:300])
-            return True, ""
+            return False, "судья не ответил: вердикт не разобран"
         if data.get("verdict") == "PASS":
             return True, ""
         defects = [str(d) for d in data.get("defects", []) if str(d).strip()]

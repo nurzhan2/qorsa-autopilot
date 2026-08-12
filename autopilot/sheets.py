@@ -22,7 +22,7 @@ from google.oauth2.service_account import Credentials
 from sqlalchemy import case, func, select
 
 from .config import cfg
-from .db import Project, Session, Task, utcnow
+from .db import AccessItem, Project, Session, Task, utcnow
 
 log = logging.getLogger("sheets")
 
@@ -36,14 +36,26 @@ HUMAN = {
     "Дедлайн": "deadline",
     "Приоритет": "priority",
     "Папка": "workspace",
+    "Готов к работе": "ready_for_work",
 }
 # --- колонки бота: он перезаписывает их батчем ---
-BOT = ["Статус", "Прогресс", "Превью", "Последнее действие", "Стоимость $", "Обновлено"]
+BOT = ["Статус", "Прогресс", "Ждём от клиента", "Превью", "Последнее действие",
+       "Стоимость $", "Обновлено"]
 
 assert not (set(HUMAN) & set(BOT)), "колонка не может принадлежать и человеку, и боту"
 
 STATUS_RU = {"new": "новый", "briefing": "уточняю ТЗ", "active": "в работе",
-             "review": "на проверке", "blocked": "🔴 нужен ты", "done": "сдан"}
+             "review": "на проверке", "blocked": "🔴 нужен ты", "done": "сдан",
+             "blocked_access": "жду доступы"}
+
+TRUE_WORDS = {"true", "да", "yes", "1", "y", "+", "✓", "✔", "истина", "готов"}
+
+
+def _flag(v) -> bool:
+    """Галочка в Google Sheets приходит как bool, а руками её пишут как угодно."""
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in TRUE_WORDS
 
 
 def _client() -> gspread.Worksheet:
@@ -127,6 +139,7 @@ class SheetSync:
                 proj.deadline = _parse_date(row.get("Дедлайн"))
                 proj.priority = _num(row.get("Приоритет"), int) or 2
                 proj.workspace = str(row.get("Папка", "")).strip() or proj.workspace
+                proj.ready_for_work = _flag(row.get("Готов к работе"))
                 if proj.status == "new" and proj.tg_chat_id:
                     proj.status = "briefing"
                 proj.updated_at = utcnow()
@@ -157,12 +170,15 @@ class SheetSync:
             projects = (await s.execute(
                 select(Project).where(Project.sheet_row.isnot(None)))).scalars().all()
             progress = await self._progress_map(s)
+            waiting = await self._waiting_map(s)
 
         updates = []
         for p in projects:
             vals = {
                 "Статус": STATUS_RU.get(p.status, p.status),
                 "Прогресс": progress.get(p.id, ""),
+                # менеджеру видно, почему проект стоит, и он не дёргает владельца
+                "Ждём от клиента": waiting.get(p.id, ""),
                 "Превью": p.preview_url or "",
                 "Последнее действие": p.last_action or "",
                 "Стоимость $": round(p.cost_usd, 2),
@@ -176,6 +192,18 @@ class SheetSync:
         # батчем — иначе упрёшься в квоту Sheets (60 запросов/мин)
         for chunk in (updates[i:i + 200] for i in range(0, len(updates), 200)):
             await asyncio.to_thread(ws.batch_update, chunk)
+
+    async def _waiting_map(self, s) -> dict[int, str]:
+        """Недостающие доступы одной строкой. Только НАЗВАНИЯ пунктов —
+        ни значений, ни ссылок на секреты в таблицу не попадает никогда."""
+        rows = (await s.execute(
+            select(AccessItem.project_id, AccessItem.name)
+            .where(AccessItem.status != "verified")
+            .order_by(AccessItem.project_id, AccessItem.id))).all()
+        out: dict[int, list[str]] = {}
+        for pid, name in rows:
+            out.setdefault(pid, []).append(name)
+        return {pid: ", ".join(names) for pid, names in out.items()}
 
     async def _progress_map(self, s) -> dict[int, str]:
         """Один запрос на все проекты вместо сессии на каждый."""
