@@ -33,7 +33,8 @@ except (AttributeError, ValueError):
 
 from sqlalchemy import func, select                                    # noqa: E402
 
-from autopilot.brief import LIST_FIELDS, Brief, _msg_key               # noqa: E402
+from autopilot.brief import (LIST_FIELDS, ORIGIN_CONFIRMED, Brief,      # noqa: E402
+                             _msg_key, agreement)
 from autopilot.config import cfg                                       # noqa: E402
 from autopilot.db import ChatMessage, Project, Session, init_db        # noqa: E402
 
@@ -66,10 +67,28 @@ class StubModel:
     async def create(self, *, model, max_tokens, system=None, messages, **kw):
         prompt = messages[0]["content"]
         client_lines = []
+        parsed = []          # (ключ, роль, текст) в порядке переписки
         for line in prompt.splitlines():
-            m = re.match(r"\[([^\]]+)\]\s+client:\s*(.*)", line)
-            if m:
-                client_lines.append((m.group(1), m.group(2).strip()))
+            m = re.match(r"\[([^\]]+)\]\s+(\w+):\s*(.*)", line)
+            if not m:
+                continue
+            parsed.append((m.group(1), m.group(2), m.group(3).strip()))
+            if m.group(2) == "client":
+                client_lines.append((m.group(1), m.group(3).strip()))
+
+        # предложения владельца, на которые клиент ответил согласием или отказом:
+        # ссылаемся на ОБА сообщения, дальше код сам решит, что с ними делать
+        proposals = []
+        for i, (key, role, line_text) in enumerate(parsed):
+            if role != "client" or agreement(line_text) is None:
+                continue
+            for j in range(i - 1, max(-1, i - 1 - cfg.confirm_window), -1):
+                pk, prole, ptext = parsed[j]
+                if prole == "owner" and ptext:
+                    proposals.append({"text": ptext[:160], "evidence": [pk, key]})
+                    break
+                if prole == "client" and agreement(ptext) is None:
+                    break
 
         deliverables, stack, access = [], [], []
         seen_stack, seen_access = set(), set()
@@ -87,6 +106,7 @@ class StubModel:
                     seen_access.add((kind, hit.lower()))
                     access.append({"kind": kind, "name": hit, "evidence": [key]})
 
+        deliverables.extend(proposals)
         goal = None
         if deliverables:
             goal = {"text": deliverables[0]["text"], "evidence": deliverables[0]["evidence"]}
@@ -124,10 +144,14 @@ async def show_chat(project_id: int) -> list[ChatMessage]:
     return rows
 
 
+def _mark(item: dict) -> str:
+    return "   ⚑ ПОДТВЕРЖДЁННОЕ ПРЕДЛОЖЕНИЕ" if item.get("origin") == ORIGIN_CONFIRMED else ""
+
+
 def show_brief(data: dict) -> None:
     print(f"\n{LINE}\nБРИФ\n{LINE}")
     goal = data.get("goal")
-    print(f"  ЦЕЛЬ: {goal['text'] if goal else '— не определена —'}")
+    print(f"  ЦЕЛЬ: {goal['text'] if goal else '— не определена —'}{_mark(goal or {})}")
     if goal:
         print(f"        evidence: {', '.join(goal.get('evidence', []))}")
     for field in LIST_FIELDS:
@@ -137,13 +161,42 @@ def show_brief(data: dict) -> None:
         print(f"\n  {field.upper()} ({len(items)}):")
         for item in items:
             label = item.get("text") or f"{item.get('kind')}: {item.get('name')}"
-            print(f"    • {label}")
+            print(f"    • {label}{_mark(item)}")
             print(f"      evidence: {', '.join(item.get('evidence', []))}")
     if data.get("unreadable"):
         print(f"\n  НЕ ПРОЧИТАНО ({len(data['unreadable'])}):")
         for u in data["unreadable"]:
             print(f"    • сообщение {u.get('message_id')} — {u.get('kind')}")
     print(f"\n  CONFIDENCE: {data.get('confidence')}  (порог {cfg.brief_min_confidence})")
+
+
+def show_confirmed(data: dict) -> None:
+    """Самое рискованное место схемы — показываем отдельно и заметно.
+
+    Здесь требование держится не на словах клиента, а на нашей трактовке его
+    «да». Ошибка тут означает пункт ТЗ, которого клиент не просил.
+    """
+    rows = []
+    goal = data.get("goal")
+    if isinstance(goal, dict) and goal.get("origin") == ORIGIN_CONFIRMED:
+        rows.append(("goal", goal))
+    for field in LIST_FIELDS:
+        for item in data.get(field) or []:
+            if isinstance(item, dict) and item.get("origin") == ORIGIN_CONFIRMED:
+                rows.append((field, item))
+
+    print(f"\n{LINE}\n⚑ ПОДТВЕРЖДЁННЫЕ ПРЕДЛОЖЕНИЯ ({len(rows)}) — ПРОВЕРЬ ГЛАЗАМИ\n{LINE}")
+    if not rows:
+        print("  (нет: всё в брифе сказано клиентом напрямую)")
+        return
+    print("  Эти пункты клиент сам не формулировал: их предложил ты, а он согласился.")
+    print("  Смотри, действительно ли согласие относится именно к этому предложению.\n")
+    for field, item in rows:
+        label = item.get("text") or f"{item.get('kind')}: {item.get('name')}"
+        flag = " [ОТКАЗ]" if item.get("rejected") else ""
+        print(f"    • [{field}]{flag} {label}")
+        for ref in item.get("evidence", []):
+            print(f"        ← {ref}")
 
 
 def show_dropped(project: Project) -> None:
@@ -219,6 +272,7 @@ async def run(project_id: int, stub: bool, save: bool, do_compare: bool) -> int:
         return 1
 
     show_brief(data)
+    show_confirmed(data)
     async with Session() as s:
         show_dropped(await s.get(Project, project_id))
 

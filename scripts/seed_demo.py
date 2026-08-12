@@ -82,7 +82,7 @@ async def main() -> None:
             s.add(p)
             await s.flush()
             s.add(ProjectChat(project_id=p.id, transport="telegram",
-                              chat_id=f"demo-{client.lower()}", is_primary=True))
+                              chat_id=f"demo-{p.id}-{client.lower()}", is_primary=True))
             for name, kind, st in access:
                 s.add(AccessItem(project_id=p.id, name=name, kind=kind, status=st))
             for i in range(n_build):

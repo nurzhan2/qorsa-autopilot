@@ -73,6 +73,13 @@ class Ingest:
     # ---------- запуск ----------
 
     async def run(self) -> None:
+        if not roles.owner_configured():
+            # Без id владельца система примет собственные реплики за слова
+            # клиента и потащит их в ТЗ как требования. Это хуже, чем не
+            # работать вовсе, поэтому падаем сразу и громко.
+            log.critical("OWNER_TG_ID (или OWNER_MAX_ID) не задан — ingest не запускается: "
+                         "без него владелец неотличим от клиента")
+            raise RuntimeError("OWNER_TG_ID не задан")
         if not self.transports:
             log.warning("ни один транспорт не настроен — ingest не поднимается")
             return
@@ -207,7 +214,15 @@ class Ingest:
                     ProjectChat.transport == msg.transport,
                     ProjectChat.chat_id == msg.chat_id))).scalars().first()
             if chat is not None:
-                return chat.project_id, False
+                stored, project_id = chat.handle, chat.project_id
+        if chat is not None:
+            # Привязка живёт по chat_id и переименование её не рвёт.
+            # Название всего лишь обновляем, а расхождение с таблицей
+            # показываем предупреждением — это повод посмотреть, а не повод
+            # потерять чат
+            if msg.chat_title and msg.chat_title != stored:
+                await self._rename_chat(msg, stored, project_id)
+            return project_id, False
 
         # групповой чат опознаём по названию: менеджер называет их по шаблону
         if msg.chat_title:
@@ -245,6 +260,38 @@ class Ingest:
                          msg.transport, msg.chat_id, p.id, msg.handle)
                 return p.id, True
         return None, False
+
+    async def _rename_chat(self, msg: InboundMessage, old: str | None,
+                           project_id: int) -> None:
+        """Группу переименовали. Привязку не трогаем, название обновляем."""
+        async with Session() as s:
+            row = (await s.execute(
+                select(ProjectChat).where(ProjectChat.transport == msg.transport,
+                                          ProjectChat.chat_id == msg.chat_id))).scalars().first()
+            if row is not None:
+                row.handle = msg.chat_title
+                await s.commit()
+        log.info("группа %s переименована: %r -> %r (проект %s, привязка сохранена)",
+                 msg.chat_id, old or "—", msg.chat_title, project_id)
+
+        matched, score, why = await match_project(msg.chat_title)
+        if matched is not None and matched != project_id:
+            await self._warn_owner(
+                f"Группа {msg.transport}:{msg.chat_id} переименована в "
+                f"«{msg.chat_title}» и теперь похожа на другой проект ({why}). "
+                f"Чат остаётся привязан к проекту {project_id}. "
+                f"Если это ошибка — «{BIND_HINT} <id> {msg.chat_id}».")
+        elif matched is None and score < cfg.group_match_threshold:
+            await self._warn_owner(
+                f"Группа {msg.transport}:{msg.chat_id} называется «{msg.chat_title}», "
+                f"это не похоже ни на один проект ({why}). Привязка к проекту "
+                f"{project_id} сохранена, но название стоит поправить.")
+
+    async def _warn_owner(self, text: str) -> None:
+        log.warning(text)
+        notify = getattr(self.communicator, "notify_owner", None)
+        if notify is not None:
+            await notify(text)
 
     async def bind_chat(self, project_id: int, transport: str, chat_id: str,
                         handle: str | None = None, group: bool = False) -> bool:

@@ -35,21 +35,43 @@ except (AttributeError, ValueError):
 from sqlalchemy import func, select                                # noqa: E402
 from sqlalchemy.exc import IntegrityError                          # noqa: E402
 
+import logging                                                     # noqa: E402
+
 from autopilot import roles                                        # noqa: E402
 from autopilot.db import ChatMessage, ProjectChat, Session, init_db  # noqa: E402
 from autopilot.secrets_scan import scrub                            # noqa: E402
 
 TRANSPORT = "telegram"
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+log = logging.getLogger("import")
+
+# Реальный экспорт куда пестрее синтетики. Всё, что не опознали, честно
+# помечаем медиа неизвестного вида: пусть попадёт в unreadable[], но не
+# притворяется текстом и не роняет импорт.
 MEDIA_HINTS = (
-    ("photo", "photo"), ("file", "document"), ("media_type", None),
-    ("sticker_emoji", "sticker"), ("location_information", "location"),
-    ("contact_information", "contact"),
+    ("photo", "photo"), ("file", "document"), ("sticker_emoji", "sticker"),
+    ("location_information", "location"), ("contact_information", "contact"),
+    ("poll", "poll"), ("game_title", "game"), ("live_location_period_seconds", "location"),
 )
+
+# media_type из экспорта -> наш вид
+MEDIA_TYPES = {
+    "voice_message": "voice",
+    "video_message": "video_note",     # кружок
+    "sticker": "sticker",
+    "animation": "animation",
+    "video_file": "video",
+    "audio_file": "audio",
+}
 
 
 def flatten_text(value) -> str:
-    """`text` в экспорте бывает строкой, а бывает списком кусков с разметкой."""
+    """`text` в экспорте бывает строкой, а бывает списком кусков с разметкой.
+
+    Куски — это ссылки, упоминания, код, спойлеры. Нас интересует только
+    видимый текст; всё непонятное молча пропускаем, но не роняем импорт.
+    """
     if isinstance(value, str):
         return value
     if isinstance(value, list):
@@ -60,16 +82,29 @@ def flatten_text(value) -> str:
             elif isinstance(piece, dict):
                 parts.append(str(piece.get("text", "")))
         return "".join(parts)
-    return ""
+    if value is None:
+        return ""
+    return str(value)
 
 
 def media_of(msg: dict) -> tuple[bool, str | None]:
-    if msg.get("media_type"):
-        return True, str(msg["media_type"])
+    """Содержимое не качаем — фиксируем факт и вид."""
+    raw_type = msg.get("media_type")
+    if raw_type:
+        return True, MEDIA_TYPES.get(str(raw_type), str(raw_type))
     for key, kind in MEDIA_HINTS:
-        if key != "media_type" and msg.get(key):
+        if msg.get(key):
             return True, kind
     return False, None
+
+
+def poll_text(msg: dict) -> str:
+    """У опроса нет обычного текста — берём вопрос, ответы не угадываем."""
+    poll = msg.get("poll")
+    if not isinstance(poll, dict):
+        return ""
+    question = str(poll.get("question") or "").strip()
+    return f"[опрос] {question}" if question else "[опрос]"
 
 
 def sender_id_of(msg: dict) -> str | None:
@@ -95,6 +130,36 @@ def parse_date(msg: dict) -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
+def make_role_resolver(data: dict, client_id: str | None, owner_id: str | None):
+    """Кто есть кто в импортируемом чате.
+
+    В экспорте личной переписки ролей нет вообще — там просто два человека.
+    Поэтому:
+      1) `--client-id` / `--owner-id` заданы явно — используем их;
+      2) иначе для личного чата собеседник (верхнеуровневый `id`) считается
+         клиентом, а все остальные отправители — владельцем;
+      3) иначе роли берутся из .env, как на живом потоке.
+    """
+    kind = str(data.get("type") or "")
+    counterpart = str(data.get("id") or "").lstrip("-")
+    personal = kind.startswith("personal") or kind == "private_chat"
+
+    def resolve(sender: str | None) -> str | None:
+        if sender is None:
+            return None
+        if client_id and sender == str(client_id):
+            return roles.CLIENT
+        if owner_id and sender == str(owner_id):
+            return roles.OWNER
+        if client_id or owner_id:
+            return None            # задан только один — остальных решает .env
+        if personal and counterpart:
+            return roles.CLIENT if sender == counterpart else roles.OWNER
+        return None
+
+    return resolve
+
+
 async def resolve_project(chat_id: str, explicit: int | None) -> int | None:
     if explicit:
         return explicit
@@ -105,7 +170,8 @@ async def resolve_project(chat_id: str, explicit: int | None) -> int | None:
     return row.project_id if row else None
 
 
-async def run(path: Path, project_id: int | None, chat_id: str | None, dry: bool) -> int:
+async def run(path: Path, project_id: int | None, chat_id: str | None, dry: bool,
+              client_id: str | None = None, owner_id: str | None = None) -> int:
     data = json.loads(path.read_text(encoding="utf-8"))
     messages = data.get("messages") or []
     chat = str(chat_id or data.get("id") or "")
@@ -117,22 +183,55 @@ async def run(path: Path, project_id: int | None, chat_id: str | None, dry: bool
     project_id = await resolve_project(chat, project_id)
     print(f"чат {chat}, сообщений в файле: {len(messages)}, проект: {project_id or '—'}")
 
+    resolve_role = make_role_resolver(data, client_id, owner_id)
+
     added = skipped = secrets_found = 0
+    service = broken = 0
+    service_kinds: dict[str, int] = {}
+
     for msg in messages:
-        if msg.get("type") != "message":
-            continue                                  # сервисные события пропускаем
-        mid = str(msg.get("id", ""))
-        if not mid:
+        if not isinstance(msg, dict):
+            broken += 1
             continue
-        raw_text = flatten_text(msg.get("text"))
+        kind_of_entry = str(msg.get("type") or "")
+        if kind_of_entry != "message":
+            # вступления в группу, закрепления, звонки, смена названия.
+            # Пропускаем, но считаем и показываем: молча терять записи нельзя
+            service += 1
+            action = str(msg.get("action") or kind_of_entry or "unknown")
+            service_kinds[action] = service_kinds.get(action, 0) + 1
+            continue
+
+        mid = str(msg.get("id", "")).strip()
+        if not mid:
+            broken += 1
+            log.warning("сообщение без id пропущено: %s", str(msg)[:120])
+            continue
+
+        try:
+            raw_text = flatten_text(msg.get("text"))
+            if not raw_text.strip():
+                raw_text = poll_text(msg)
+            has_media, kind = media_of(msg)
+            sender = sender_id_of(msg)
+        except Exception as e:
+            # одно кривое сообщение не должно ронять импорт целиком
+            broken += 1
+            log.warning("сообщение %s не разобралось (%s) — пропущено", mid, e)
+            continue
+
         text, names = scrub(raw_text, project_id=project_id, chat_id=chat)
         secrets_found += len(names)
-        has_media, kind = media_of(msg)
-        sender = sender_id_of(msg)
-        # роль определяется так же, как на живом потоке: по id из .env.
-        # Без неё бриф не отличит требование клиента от реплики менеджера
-        sender_role = await roles.remember(TRANSPORT, chat, sender,
-                                           str(msg.get("from") or ""))
+
+        # роль: сперва явное указание и эвристика личного чата,
+        # иначе — то же правило, что на живом потоке
+        forced = resolve_role(sender)
+        if forced is not None:
+            sender_role = forced
+            await roles.remember(TRANSPORT, chat, sender, str(msg.get("from") or ""))
+        else:
+            sender_role = await roles.remember(TRANSPORT, chat, sender,
+                                               str(msg.get("from") or ""))
 
         if dry:
             added += 1
@@ -147,7 +246,15 @@ async def run(path: Path, project_id: int | None, chat_id: str | None, dry: bool
             sender_role=sender_role,
             text=text, has_media=has_media, media_kind=kind,
             reply_to=str(msg["reply_to_message_id"]) if msg.get("reply_to_message_id") else None,
-            raw_json={"imported": True, "date": msg.get("date")},
+            raw_json={
+                "imported": True,
+                "date": msg.get("date"),
+                # пересылку сохраняем: это чужие слова, и в брифе они
+                # не должны выглядеть как сказанные клиентом
+                "forwarded_from": msg.get("forwarded_from"),
+                "reactions": len(msg.get("reactions") or []) or None,
+                "via_bot": msg.get("via_bot"),
+            },
             created_at=parse_date(msg),
         )
         async with Session() as s:
@@ -161,6 +268,11 @@ async def run(path: Path, project_id: int | None, chat_id: str | None, dry: bool
 
     verb = "нашлось бы" if dry else "добавлено"
     print(f"{verb}: {added}, пропущено дублей: {skipped}, перехвачено секретов: {secrets_found}")
+    if service:
+        detail = ", ".join(f"{k}={v}" for k, v in sorted(service_kinds.items()))
+        print(f"сервисных записей пропущено: {service} ({detail})")
+    if broken:
+        print(f"не разобрано и пропущено: {broken} — смотри WARNING выше")
     if not dry:
         async with Session() as s:
             rows = (await s.execute(
@@ -177,11 +289,15 @@ def main() -> int:
     ap.add_argument("--project", type=int, default=None, help="id проекта")
     ap.add_argument("--chat-id", default=None, help="если в файле нет поля id")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--client-id", default=None,
+                    help="id клиента в экспорте; в личном чате определяется сам")
+    ap.add_argument("--owner-id", default=None, help="твой id в экспорте")
     args = ap.parse_args()
     if not args.path.exists():
         print(f"нет файла {args.path}", file=sys.stderr)
         return 2
-    return asyncio.run(run(args.path, args.project, args.chat_id, args.dry_run))
+    return asyncio.run(run(args.path, args.project, args.chat_id, args.dry_run,
+                          args.client_id, args.owner_id))
 
 
 if __name__ == "__main__":

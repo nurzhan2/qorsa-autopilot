@@ -23,6 +23,13 @@ os.environ["WORKSPACES"] = str(_TMP / "workspaces")
 os.environ["LOGS"] = str(_TMP / "logs")
 os.environ["ANTHROPIC_API_KEY"] = ""       # судья в тестах не поднимается
 os.environ["SHEET_ID"] = ""
+# Тихие часы по умолчанию 23–9. Без этого половина тестов про отправку
+# клиенту зелёная днём и красная ночью — ловушка, на которую я уже попался.
+os.environ["QUIET_START"] = "0"
+os.environ["QUIET_END"] = "0"
+# менеджер и владелец — один аккаунт; отдельная роль включается точечно
+os.environ["MANAGER_SEPARATE"] = "0"
+os.environ["OWNER_TG_ID"] = "777"
 
 from autopilot.db import (AccessItem, Base, ChatMessage, Project, ProjectChat,  # noqa: E402
                           Session, Task, engine)

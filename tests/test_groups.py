@@ -137,7 +137,6 @@ async def test_group_ambiguous_name_is_not_guessed(db):
 async def test_bot_silent_in_dialogue(db, monkeypatch):
     """Обмен репликами менеджера и клиента не вызывает ответа бота."""
     monkeypatch.setattr(cfg, "bot_tg_id", "999")
-    monkeypatch.setattr(cfg, "manager_tg_id", "888")
     p = await make_project(title="интернет-магазин", tg_chat_id=None)
     async with Session() as s:
         row = await s.get(Project, p.id)
@@ -148,10 +147,10 @@ async def test_bot_silent_in_dialogue(db, monkeypatch):
     ing = Ingest([], comm)
 
     dialogue = [
-        (1, 10, "сколько будет стоить доработка?", 111),      # клиент про деньги
-        (2, 11, "давайте посчитаем, вернусь с цифрой", 888),   # менеджер
-        (3, 12, "хорошо, жду", 111),                           # клиент
-        (4, 13, "нужен ещё блок отзывов", 111),                # требование, но не к боту
+        (1, 10, "сколько будет стоить доработка?", 111),       # клиент про деньги
+        (2, 11, "давайте посчитаем, вернусь с цифрой", 777),   # я (владелец-менеджер)
+        (3, 12, "хорошо, жду", 111),                            # клиент
+        (4, 13, "нужен ещё блок отзывов", 111),                 # требование, но не к боту
     ]
     for upd in dialogue:
         await ing.handle(Tr(), inbound(group_update(*upd)))
@@ -161,7 +160,7 @@ async def test_bot_silent_in_dialogue(db, monkeypatch):
         tasks = (await s.execute(select(Task).where(Task.lane == "chat"))).scalars().all()
 
     assert len(stored) == 4, "бот обязан читать и запоминать всё"
-    assert [m.sender_role for m in stored] == ["client", "manager", "client", "client"]
+    assert [m.sender_role for m in stored] == ["client", "owner", "client", "client"]
     assert comm.forwarded == [], "бот влез в разговор менеджера с клиентом"
     assert tasks == [], "молчание не должно занимать слот полосы chat"
 
@@ -202,7 +201,6 @@ async def test_manager_message_never_triggers_bot(db, monkeypatch):
     """Даже прямое упоминание от менеджера не считается запросом клиента."""
     monkeypatch.setattr(cfg, "bot_tg_id", "999")
     monkeypatch.setattr(cfg, "bot_username", "qorsa_bot")
-    monkeypatch.setattr(cfg, "manager_tg_id", "888")
     p = await make_project(title="интернет-магазин", tg_chat_id=None)
     async with Session() as s:
         row = await s.get(Project, p.id)
@@ -211,16 +209,16 @@ async def test_manager_message_never_triggers_bot(db, monkeypatch):
 
     comm = Comm()
     ing = Ingest([], comm)
-    await ing.handle(Tr(), inbound(group_update(1, 10, "@qorsa_bot сделай отчёт", 888)))
+    await ing.handle(Tr(), inbound(group_update(1, 10, "@qorsa_bot сделай отчёт", 777)))
 
     async with Session() as s:
         stored = (await s.execute(select(ChatMessage))).scalars().one()
-    assert stored.sender_role == roles.MANAGER
+    assert stored.sender_role == roles.OWNER
     assert comm.forwarded == []
 
 
-async def test_group_manager_question_is_silent(db, monkeypatch):
-    """Вопрос про деньги в группе не пересылается: менеджер сидит рядом."""
+async def test_group_commercial_question_is_silent(db, monkeypatch):
+    """Вопрос про деньги в группе не пересылается: человек сидит в той же группе."""
     monkeypatch.setattr(cfg, "bot_tg_id", "999")
     monkeypatch.setattr(cfg, "bot_username", "qorsa_bot")
     from autopilot.communicator import Communicator
@@ -229,6 +227,6 @@ async def test_group_manager_question_is_silent(db, monkeypatch):
     comm = Communicator()
     assert await comm.incoming(p, "сколько будет стоить?", "telegram", GROUP,
                                in_group=True) is None
-    # в личке поведение прежнее — уходит менеджеру
+    # в личке поведение прежнее — уведомление уходит человеку
     m = await comm.incoming(p, "сколько будет стоить?", "telegram", "42", in_group=False)
-    assert m is not None and m.route == "to_manager"
+    assert m is not None and m.route == "to_owner"

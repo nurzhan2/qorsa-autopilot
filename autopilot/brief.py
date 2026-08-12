@@ -7,9 +7,16 @@
 
 1. **Evidence.** Любой пункт брифа ссылается на конкретные сообщения
    `(transport, chat_id, message_id)`. Код проверяет, что эти сообщения
-   существуют И что их `sender_role == client`. Пункт без выживших ссылок
-   выбрасывается. Так отсекаются и выдуманные id, и слова менеджера,
-   выданные за требования клиента.
+   существуют И что они подтверждают требование одним из двух способов:
+
+   * `origin="client"` — содержательная реплика самого клиента;
+   * `origin="confirmed_proposal"` — предложение ВЛАДЕЛЬЦА, на которое клиент
+     явно согласился. Владелец ведёт переговоры сам и часто предлагает
+     решения: «давайте сделаем фильтр по бренду» — «да, давайте». Без этого
+     вида evidence половина реально согласованных требований терялась бы.
+
+   Голое согласие без предложения по-прежнему невалидно, а явный отказ
+   («нет, не надо») не теряется молча — пункт уезжает в `out_of_scope`.
 2. **Схема.** Ответ валидируется по структуре; при несоответствии — повтор
    с текстом ошибки, максимум `BRIEF_MAX_ATTEMPTS` попыток, дальше эскалация.
 3. **Деньги.** Цену, сроки и объём работ бриф не извлекает никогда. Это зона
@@ -32,11 +39,42 @@ from sqlalchemy import select
 
 from .config import cfg
 from .db import AccessItem, ChatMessage, Project, Run, Session, Task, utcnow
-from .roles import CLIENT
+from .roles import CLIENT, OWNER
 from .vault import MIN_MASKABLE_LEN
 from .vault import vault as default_vault
 
 log = logging.getLogger("brief")
+
+ORIGIN_CLIENT = "client"
+ORIGIN_CONFIRMED = "confirmed_proposal"
+
+# Согласие и отказ. Списки короткие намеренно: чем шире сеть, тем выше шанс
+# принять вежливое «хорошо, я подумаю» за подтверждение требования.
+#
+# Маркеры разделены на две группы, и это не придирка. «Нужен» в начале фразы
+# почти всегда вводит ТРЕБОВАНИЕ («нужен интернет-магазин»), а согласием
+# становится, только когда составляет всю реплику целиком («нужно»).
+# Без такого разделения «нужен сайт» превращалось в голое согласие и
+# переставало быть самостоятельным требованием клиента.
+STRONG_AGREE_RE = re.compile(
+    r"^\W*(да|ага|угу|ок|окей|okay|ok|хорошо|отлично|супер|согласн\w*|"
+    r"давай(те)?|поддерживаю|верно|точно|именно|подходит|устраивает|"
+    r"годится|принимается|утверждаю|запускаем)\b",
+    re.IGNORECASE)
+# эти считаются согласием, только если ими исчерпывается вся реплика
+WEAK_AGREE_RE = re.compile(
+    r"^\W*(нужно|нужен|нужна|нужны|надо|делайте|сделайте|делаем|можно)\W*$",
+    re.IGNORECASE)
+DISAGREE_RE = re.compile(
+    r"^\W*(нет|не надо|не нужно|не нужен|не нужна|не будем|пока не|"
+    r"давайте не|не стоит|откажемся|отказываемся|против|не подходит|"
+    r"не устраивает|обойдёмся|обойдемся|лишнее|не хочу|не хотим)\b",
+    re.IGNORECASE)
+
+# Голое согласие — это «да», «ок», «давайте», и ничего больше. Если клиент
+# написал «да, и ещё нужен блок отзывов», содержания там достаточно,
+# чтобы считать реплику самостоятельным требованием.
+BARE_AGREEMENT_MAX_WORDS = 4
 
 # поля-списки, каждый элемент которых обязан нести evidence
 LIST_FIELDS = ("deliverables", "stack", "constraints", "assets",
@@ -66,9 +104,12 @@ FORBIDDEN_RE = re.compile(
 SYSTEM = """Ты аналитик. Из переписки рабочей группы ты собираешь техническое задание.
 
 ЖЕЛЕЗНЫЕ ПРАВИЛА:
-1. Требование существует, только если его высказал КЛИЕНТ. В переписке есть
-   менеджер и владелец — их слова требованиями не являются. Роль указана
-   у каждой реплики.
+1. Требование существует в двух случаях:
+   а) его высказал КЛИЕНТ;
+   б) его ПРЕДЛОЖИЛ владелец, и клиент явно согласился («да», «давайте»).
+   Во втором случае указывай в evidence ОБА сообщения: предложение и согласие.
+   Собственные слова владельца без согласия клиента требованием не являются.
+   Если клиент на предложение ответил отказом — помести пункт в out_of_scope.
 2. Каждый пункт обязан ссылаться на конкретные сообщения — поле evidence
    со списком id из переписки. Пункт без evidence будет выброшен.
 3. НИКОГДА не извлекай цену, стоимость, бюджет, скидки, оплату, сроки и
@@ -121,6 +162,84 @@ def assert_no_secrets(prompt: str, vault=None) -> None:
 
 def _msg_key(m: ChatMessage) -> str:
     return f"{m.transport}:{m.chat_id}:{m.tg_message_id}"
+
+
+def agreement(text: str) -> str | None:
+    """«да» -> "yes", «нет, не надо» -> "no", всё остальное -> None."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if DISAGREE_RE.match(t):
+        return "no"
+    if STRONG_AGREE_RE.match(t):
+        return "yes"
+    if WEAK_AGREE_RE.match(t):
+        return "yes"
+    return None
+
+
+def is_bare_agreement(text: str) -> bool:
+    """Согласие без собственного содержания."""
+    if agreement(text) is None:
+        return False
+    words = [w for w in re.split(r"\W+", (text or "")) if w]
+    return len(words) <= BARE_AGREEMENT_MAX_WORDS
+
+
+def find_confirmations(messages: list[ChatMessage],
+                       window: int | None = None) -> dict[str, tuple[str, str, str]]:
+    """Ищет пары «предложение владельца → согласие клиента».
+
+    Возвращает два индекса в одном словаре: по ключу предложения и по ключу
+    согласия, значение — (ключ предложения, ключ согласия, вердикт).
+    Модель может сослаться на любое из двух сообщений, и оба должны работать.
+
+    Связь засчитывается, если согласие клиента либо является reply на
+    предложение, либо идёт не дальше `window` сообщений после него и между
+    ними не вклинилась реплика клиента на другую тему.
+    """
+    window = cfg.confirm_window if window is None else window
+    by_msg_id = {(m.transport, m.chat_id, m.tg_message_id): m for m in messages}
+    out: dict[str, tuple[str, str, str]] = {}
+
+    for i, m in enumerate(messages):
+        if m.sender_role != CLIENT:
+            continue
+        verdict = agreement(m.text)
+        if verdict is None:
+            continue
+
+        proposal = None
+        # 1) явный reply — самая надёжная связь, окно не применяем и содержание
+        # согласия не ограничиваем: клиент прямо указал, на что отвечает
+        if m.reply_to:
+            cand = by_msg_id.get((m.transport, m.chat_id, str(m.reply_to)))
+            if cand is not None and cand.sender_role == OWNER and (cand.text or "").strip():
+                proposal = cand
+
+        # 2) иначе смотрим назад в пределах окна — но только для ГОЛОГО согласия.
+        # «Хорошо. Сайт хочу на wordpress» начинается с «хорошо», однако это не
+        # подтверждение предыдущего предложения, а собственное требование
+        # клиента. Без этого условия любое вежливое начало реплики задним
+        # числом утверждало бы всё, что мы успели предложить
+        if proposal is None and is_bare_agreement(m.text):
+            for step, j in enumerate(range(i - 1, -1, -1), start=1):
+                if step > window:
+                    break
+                prev = messages[j]
+                if prev.sender_role == OWNER and (prev.text or "").strip():
+                    proposal = prev
+                    break
+                if prev.sender_role == CLIENT and agreement(prev.text) is None:
+                    # клиент успел заговорить о другом — связь разорвана
+                    break
+
+        if proposal is None:
+            continue
+        pair = (_msg_key(proposal), _msg_key(m), verdict)
+        out[_msg_key(proposal)] = pair
+        out[_msg_key(m)] = pair
+    return out
 
 
 def _norm_evidence(raw) -> list[str]:
@@ -266,27 +385,61 @@ class Brief:
         return errors
 
     def apply_evidence(self, data: dict, messages: list[ChatMessage]) -> tuple[dict, list[str]]:
-        """Выбрасывает всё, что не подтверждено словами клиента."""
-        allowed = {_msg_key(m) for m in messages if m.sender_role == CLIENT}
-        # модель часто отдаёт голый message_id — принимаем и его
-        short = {m.tg_message_id: _msg_key(m) for m in messages if m.sender_role == CLIENT}
-        known_any = {_msg_key(m) for m in messages} | {m.tg_message_id for m in messages}
+        """Оставляет только подтверждённое. Два законных вида подтверждения:
+
+        * содержательная реплика клиента (origin="client");
+        * предложение владельца + явное согласие клиента
+          (origin="confirmed_proposal").
+
+        Отказ клиента — не потеря: пункт переезжает в out_of_scope, чтобы
+        было видно, что вопрос обсуждали и закрыли.
+        """
+        client_msgs = {_msg_key(m): m for m in messages if m.sender_role == CLIENT}
+        # модель часто отдаёт голый message_id — принимаем и его, по всем ролям:
+        # ссылка на предложение владельца теперь тоже законна
+        short = {m.tg_message_id: _msg_key(m) for m in messages}
+        known_any = set(short) | {_msg_key(m) for m in messages}
+        confirmations = find_confirmations(messages)
 
         dropped: list[str] = []
+        rejected: list[dict] = []
 
-        def keep(item: dict, where: str) -> bool:
-            refs = _norm_evidence(item.get("evidence"))
-            good = [r for r in refs if r in allowed or r in short]
-            if not good:
-                reason = "ссылок нет"
-                if refs and not any(r in known_any for r in refs):
-                    reason = f"выдуманные ссылки {refs}"
-                elif refs:
-                    reason = f"ссылки не на клиента {refs}"
-                dropped.append(f"{where}: {reason}")
-                return False
-            item["evidence"] = [short.get(r, r) for r in good]
-            return True
+        def resolve(refs: list[str]) -> list[str]:
+            return [short.get(r, r) for r in refs]
+
+        def keep(item: dict, where: str) -> str:
+            """Возвращает "keep", "reject" или "drop"."""
+            refs = resolve(_norm_evidence(item.get("evidence")))
+
+            # 1) обычный путь: клиент сказал это сам.
+            # Голое «да» самостоятельным требованием не считается —
+            # иначе любое согласие оправдывало бы что угодно
+            substantive = [r for r in refs
+                           if r in client_msgs and not is_bare_agreement(client_msgs[r].text)]
+            if substantive:
+                item["evidence"] = substantive
+                item["origin"] = ORIGIN_CLIENT
+                return "keep"
+
+            # 2) подтверждённое предложение владельца
+            for r in refs:
+                pair = confirmations.get(r)
+                if pair is None:
+                    continue
+                proposal_key, agree_key, verdict = pair
+                item["evidence"] = [proposal_key, agree_key]
+                item["origin"] = ORIGIN_CONFIRMED
+                return "keep" if verdict == "yes" else "reject"
+
+            reason = "ссылок нет"
+            if refs and not any(r in known_any for r in refs):
+                reason = f"выдуманные ссылки {refs}"
+            elif refs and any(r in client_msgs for r in refs):
+                reason = f"только голое согласие без предложения {refs}"
+            elif refs:
+                reason = f"не слова клиента и не подтверждённое предложение {refs}"
+            dropped.append(f"{where}: {reason}")
+            return "drop"
 
         out = dict(data)
         goal = out.get("goal")
@@ -295,8 +448,14 @@ class Brief:
             if FORBIDDEN_RE.search(text):
                 dropped.append("goal: про деньги или сроки — не зона брифа")
                 out["goal"] = None
-            elif not keep(goal, "goal"):
-                out["goal"] = None
+            else:
+                verdict = keep(goal, "goal")
+                if verdict == "reject":
+                    dropped.append("goal: клиент отказался — ушло в out_of_scope")
+                    rejected.append(goal)
+                    out["goal"] = None
+                elif verdict == "drop":
+                    out["goal"] = None
 
         for f in LIST_FIELDS:
             kept = []
@@ -307,9 +466,30 @@ class Brief:
                 if FORBIDDEN_RE.search(text):
                     dropped.append(f"{f}[{i}]: про деньги или сроки — не зона брифа")
                     continue
-                if keep(item, f"{f}[{i}]"):
+                verdict = keep(item, f"{f}[{i}]")
+                if verdict == "keep":
                     kept.append(item)
+                elif verdict == "reject" and f != "out_of_scope":
+                    dropped.append(f"{f}[{i}]: клиент отказался — ушло в out_of_scope")
+                    rejected.append(item)
             out[f] = kept
+
+        if rejected:
+            merged = list(out.get("out_of_scope") or [])
+            seen = {str(x.get("text") or x.get("name") or "").strip().lower() for x in merged}
+            # одна и та же отклонённая пара не должна попадать в список дважды,
+            # как бы модель ни назвала пункт
+            seen_pairs = {tuple(x.get("evidence") or []) for x in merged}
+            for item in rejected:
+                text = str(item.get("text") or item.get("name") or "").strip()
+                pair = tuple(item.get("evidence") or [])
+                if text.lower() in seen or (pair and pair in seen_pairs):
+                    continue
+                seen.add(text.lower())
+                seen_pairs.add(pair)
+                merged.append({"text": text, "evidence": list(pair),
+                               "origin": ORIGIN_CONFIRMED, "rejected": True})
+            out["out_of_scope"] = merged
 
         out["confidence"] = float(out.get("confidence") or 0.0)
         out["unreadable"] = [u for u in (out.get("unreadable") or []) if isinstance(u, dict)]

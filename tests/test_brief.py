@@ -86,7 +86,12 @@ def reply(goal="сделать интернет-магазин", goal_ev=("1",),
 # ---------- роли ----------
 
 async def test_roles_assigned(db, monkeypatch):
-    """Сообщения от менеджера, клиента и владельца получают верный sender_role."""
+    """Механизм ролей цел: при MANAGER_SEPARATE=1 роли раздаются все четыре.
+
+    По умолчанию менеджер — алиас владельца, это проверяет
+    test_manager_role_absent. Здесь важно, что механизм не выродился.
+    """
+    monkeypatch.setattr(cfg, "manager_separate", True)
     monkeypatch.setattr(cfg, "owner_tg_id", "777")
     monkeypatch.setattr(cfg, "manager_tg_id", "888")
     monkeypatch.setattr(cfg, "bot_tg_id", "999")

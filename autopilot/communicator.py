@@ -1,15 +1,22 @@
-"""Маршрутизация сообщений между тремя участниками.
+"""Маршрутизация сообщений.
 
-Участников трое, и автопилот замещает только одного из них:
+Живых участников двое: **ВЛАДЕЛЕЦ** (он же менеджер — один человек с одного
+аккаунта) и **КЛИЕНТ**. Бот — третий участник группы, пишет от своего лица.
 
-* МЕНЕДЖЕР — берёт заказы, договаривается о цене и сроках. Всё про деньги,
-  сроки, объём и претензии принадлежит ему. Бот сюда не лезет и не смягчает.
-* ВЛАДЕЛЕЦ — техчасть: доступы, ключи, технические уточнения. Его и замещаем.
-* КЛИЕНТ — даёт доступы и отвечает на технические вопросы.
+ТЕМА и АДРЕСАТ здесь разные вещи, и это важно:
 
-Сеть на `to_manager` намеренно широкая. Ложное срабатывание стоит одного
-лишнего уведомления, пропуск стоит обязательства, которого никто не давал.
-Поэтому при любом сомнении — `to_manager`.
+* `topic()` говорит, о чём сообщение: коммерция (деньги, сроки, объём),
+  техника или обычная реплика клиенту. Тема не зависит от того, кто сейчас
+  занимает роль менеджера.
+* `route()` говорит, кому его доставить. Пока менеджер не отделён
+  (`MANAGER_SEPARATE=0`), коммерция уезжает владельцу — то есть `to_manager`
+  схлопывается в `to_owner`.
+
+Разделение нужно, чтобы не потерять поведение: в группе бот обязан МОЛЧАТЬ
+на коммерческие вопросы, а не отвечать на них. Молчание завязано на тему,
+а не на адресата, поэтому смена адресата его не отменяет.
+
+Сеть на коммерцию намеренно широкая: при любом сомнении — не бот.
 """
 from __future__ import annotations
 
@@ -33,6 +40,11 @@ TO_MANAGER = "to_manager"
 
 # чем правее, тем строже: при склейке текстов побеждает самый правый
 ROUTE_ORDER = (TO_CLIENT, TO_OWNER, TO_MANAGER)
+
+# темы сообщений — не путать с адресатами
+TOPIC_CLIENT = "client"          # то, что бот вправе сказать клиенту сам
+TOPIC_TECHNICAL = "technical"    # сломанный доступ, ошибка, непонятное
+TOPIC_COMMERCIAL = "commercial"  # деньги, сроки, объём, претензии
 
 # --- всё, что создаёт обязательство или стоит денег: только менеджеру ---
 MANAGER_RE = re.compile(
@@ -77,17 +89,32 @@ def _unparseable(text: str) -> bool:
     return not t or not LETTER_RE.search(t)
 
 
-def route(text: str) -> str:
-    """Куда уходит сообщение. Порядок проверок — это и есть приоритет."""
+def topic(text: str) -> str:
+    """О ЧЁМ сообщение. Порядок проверок — это и есть приоритет."""
     if MANAGER_RE.search(text or ""):
-        return TO_MANAGER
+        return TOPIC_COMMERCIAL
     if _unparseable(text):
-        return TO_OWNER
+        return TOPIC_TECHNICAL
     if OWNER_RE.search(text):
-        return TO_OWNER
+        return TOPIC_TECHNICAL
     if CLIENT_RE.search(text):
-        return TO_CLIENT
-    return TO_MANAGER          # при сомнении — менеджеру
+        return TOPIC_CLIENT
+    return TOPIC_COMMERCIAL     # при сомнении — не бот
+
+
+def commercial_route() -> str:
+    """Куда уходит коммерция. Менеджер не отделён — значит владельцу."""
+    return TO_MANAGER if cfg.manager_separate else TO_OWNER
+
+
+def route(text: str) -> str:
+    """КОМУ доставить сообщение."""
+    t = topic(text)
+    if t == TOPIC_COMMERCIAL:
+        return commercial_route()
+    if t == TOPIC_TECHNICAL:
+        return TO_OWNER
+    return TO_CLIENT
 
 
 def escalation(text: str) -> str:
@@ -98,7 +125,7 @@ def escalation(text: str) -> str:
     к менеджеру весь накопленный отчёт о готовности.
     """
     if MANAGER_RE.search(text or ""):
-        return TO_MANAGER
+        return commercial_route()
     if OWNER_RE.search(text or ""):
         return TO_OWNER
     return TO_CLIENT
@@ -225,12 +252,16 @@ class Communicator:
         В группе менеджер сидит рядом и всё видит сам — пересылать ему нечего,
         бот просто молчит. Это и есть «не влезать в разговор».
         """
+        msg_topic = topic(text)
         msg_route = route(text)
         if msg_route == TO_CLIENT:
             # входящее не может быть «ответом клиенту» — это уже наша реакция
             msg_route = TO_OWNER
-        if in_group and msg_route == TO_MANAGER:
-            log.info("группа %s: вопрос к менеджеру, молчу — он в этой же группе", chat_id)
+        if in_group and msg_topic == TOPIC_COMMERCIAL:
+            # Про деньги, сроки и объём бот в группе молчит. Условие на ТЕМУ,
+            # а не на адресата: иначе схлопывание to_manager -> to_owner
+            # незаметно превратило бы молчание в ответ
+            log.info("группа %s: коммерческий вопрос, молчу — отвечает человек", chat_id)
             return None
         prefix = {TO_MANAGER: "Клиент пишет (это к тебе)", TO_OWNER: "Клиент пишет (техника)"}
         where = f" [{transport}:{chat_id}]" if transport else ""
