@@ -11,6 +11,7 @@ import httpx
 
 from .config import cfg
 from .db import Project, Run, Session, Task
+from .vault import anthropic_key, missing_secret_message
 
 log = logging.getLogger("verify")
 
@@ -45,12 +46,14 @@ class Verifier:
         # молча пропускать llm-приёмку — прямое противоречие смыслу модуля.
         # JUDGE_OPTIONAL=1 понижает до пропуска с предупреждением.
         self.judge_optional = str(os.getenv("JUDGE_OPTIONAL", "")).strip().lower() in ("1", "true", "yes")
-        if cfg.anthropic_key:
+        key = anthropic_key()
+        if key:
             from anthropic import AsyncAnthropic
-            self.client = AsyncAnthropic(api_key=cfg.anthropic_key)
+            self.client = AsyncAnthropic(api_key=key)
         else:
-            log.warning("ANTHROPIC_API_KEY пуст — llm-приёмка %s",
-                        "пропускается" if self.judge_optional else "будет валить задачи")
+            log.warning("ключа нет — llm-приёмка %s.\n%s",
+                        "пропускается" if self.judge_optional else "будет валить задачи",
+                        missing_secret_message("ANTHROPIC_API_KEY"))
 
     async def run(self, task: Task, project: Project) -> tuple[bool, list[str]]:
         cwd = project.workspace or str(cfg.workspaces / f"p{project.id}")
@@ -110,7 +113,7 @@ class Verifier:
             if self.judge_optional:
                 log.warning("судья пропущен (нет ANTHROPIC_API_KEY), задача %s", task.id)
                 return True, ""
-            return False, "судья недоступен: не задан ANTHROPIC_API_KEY"
+            return False, "судья недоступен: " + missing_secret_message("ANTHROPIC_API_KEY")
 
         diff = await self._diff(cwd)
         msg = JUDGE_PROMPT.format(

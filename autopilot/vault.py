@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -71,7 +72,12 @@ class Vault:
             data = json.loads(self._fernet.decrypt(self.path.read_bytes()).decode())
         except InvalidToken:
             raise RuntimeError(
-                f"{self.path} не расшифровывается текущим VAULT_KEY — ключ сменили?") from None
+                f"{self.path} не расшифровывается текущим VAULT_KEY.\n"
+                f"  • сменил VAULT_KEY, а файл остался старым — верни прежний ключ;\n"
+                f"  • файл достался от другой установки (например, от чужого "
+                f"прогона) — удали {self.path} и заведи секреты заново:\n"
+                f"      python scripts/vault_cli.py add ANTHROPIC_API_KEY\n"
+                f"  • VAULT_PATH указывает не на тот файл — проверь .env") from None
         except Exception as e:
             raise RuntimeError(f"хранилище {self.path} повреждено: {e}") from None
         self._cache = {str(k): str(v) for k, v in data.items()}
@@ -192,3 +198,79 @@ def install_log_masking(source: Vault | None = None) -> SecretMasker | None:
     for handler in root.handlers:
         handler.addFilter(masker)
     return masker
+
+
+# ---------- единая точка получения секретов ----------
+
+# Значения-заглушки из .env.example. Без этой проверки `sk-ant-...` считается
+# настоящим ключом, код уходит в API и получает 401 вместо внятного «ключа нет».
+PLACEHOLDERS = ("sk-ant-...", "sk-...", "1abc...", "changeme", "todo", "xxx")
+
+ENV_FILE = "окружение"
+ENV_DOTFILE = ".env"
+SOURCE_VAULT = "vault"
+
+
+def _usable(value: str | None) -> bool:
+    v = (value or "").strip()
+    if not v:
+        return False
+    if v in PLACEHOLDERS or v.endswith("..."):
+        return False
+    return True
+
+
+def _dotenv_values() -> dict[str, str]:
+    from dotenv import dotenv_values
+    try:
+        return dotenv_values(cfg.root / ".env") or {}
+    except Exception:
+        return {}
+
+
+def resolve_secret(name: str, source: Vault | None = None) -> tuple[str | None, str]:
+    """Ищет значение в трёх местах по порядку: vault → окружение → .env.
+
+    Возвращает (значение, откуда). Vault первый, потому что это единственное
+    место, где значение лежит зашифрованным; окружение и .env — запасные
+    варианты для тех, кто хранилище ещё не завёл.
+    """
+    v = source or vault
+    if v.enabled:
+        try:
+            found = v.get(name)
+        except RuntimeError:
+            found = None          # хранилище не читается — скажем об этом отдельно
+        if _usable(found):
+            return found, SOURCE_VAULT
+
+    dotfile = _dotenv_values().get(name)
+    env = os.environ.get(name)
+
+    # dotenv на старте уже влил .env в окружение, поэтому «окружение» засчитываем
+    # только если значение там ОТЛИЧАЕТСЯ от файла — иначе источник это .env
+    if _usable(env) and env != dotfile:
+        return env, ENV_FILE
+    if _usable(dotfile):
+        return dotfile, ENV_DOTFILE
+    if _usable(env):
+        return env, ENV_FILE
+    return None, ""
+
+
+def missing_secret_message(name: str) -> str:
+    return (
+        f"{name} не найден ни в одном из трёх мест:\n"
+        f"  1. хранилище secrets.enc — python scripts/vault_cli.py add {name}\n"
+        f"  2. переменная окружения — {name}=... python -m autopilot.main\n"
+        f"  3. файл .env рядом с проектом — строка {name}=...\n"
+        f"Значения-заглушки вроде «sk-ant-...» настоящим ключом не считаются."
+    )
+
+
+def anthropic_key(source: Vault | None = None) -> str | None:
+    return resolve_secret("ANTHROPIC_API_KEY", source)[0]
+
+
+def anthropic_key_source(source: Vault | None = None) -> str:
+    return resolve_secret("ANTHROPIC_API_KEY", source)[1]
