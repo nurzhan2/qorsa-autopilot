@@ -26,14 +26,25 @@ from .base import Backoff, InboundMessage, load_offset
 log = logging.getLogger("tg")
 
 # Бизнес-апдейты Telegram не присылает, если их не попросить явно
+# Групповые чаты — основной канал; my_chat_member нужен, чтобы узнать
+# о добавлении бота в группу и сразу попытаться опознать проект.
 ALLOWED_UPDATES = [
     "message",
     "edited_message",
+    "my_chat_member",
+]
+# Бизнес-режим (личка от лица владельца) выключен по умолчанию: работа
+# переехала в группы. Код оставлен на случай возврата — см. CLAUDE.md
+BUSINESS_UPDATES = [
     "business_connection",
     "business_message",
     "edited_business_message",
     "deleted_business_messages",
 ]
+
+
+def allowed_updates() -> list[str]:
+    return ALLOWED_UPDATES + (BUSINESS_UPDATES if cfg.tg_business_enabled else [])
 
 MEDIA_FIELDS = [
     ("photo", "photo"), ("video", "video"), ("document", "document"),
@@ -53,6 +64,15 @@ def _media_of(msg: dict) -> tuple[bool, str | None]:
 
 def _text_of(msg: dict) -> str:
     return msg.get("text") or msg.get("caption") or ""
+
+
+def _mentions_bot(text: str, reply_to_sender_id: str | None) -> bool:
+    """Обращение — это упоминание @имени или ответ на сообщение бота."""
+    if cfg.bot_tg_id and reply_to_sender_id and str(reply_to_sender_id) == str(cfg.bot_tg_id):
+        return True
+    if cfg.bot_username and ("@" + cfg.bot_username.lower()) in (text or "").lower():
+        return True
+    return False
 
 
 class TelegramTransport:
@@ -108,7 +128,7 @@ class TelegramTransport:
                     "getUpdates",
                     offset=next_offset,
                     timeout=self.poll_timeout,
-                    allowed_updates=ALLOWED_UPDATES,
+                    allowed_updates=allowed_updates(),
                 )
                 backoff.reset()
             except RateLimited as e:
@@ -162,6 +182,8 @@ class TelegramTransport:
         sender = msg.get("from") or {}
         has_media, kind = _media_of(msg)
         ts = msg.get("edit_date") or msg.get("date")
+        reply = msg.get("reply_to_message") or {}
+        reply_sender = str((reply.get("from") or {}).get("id") or "") or None
         return InboundMessage(
             transport=self.name,
             chat_id=str(chat.get("id", "")),
@@ -172,8 +194,12 @@ class TelegramTransport:
             handle=("@" + sender["username"]) if sender.get("username") else None,
             has_media=has_media,
             media_kind=kind,
-            reply_to=str((msg.get("reply_to_message") or {}).get("message_id"))
-            if msg.get("reply_to_message") else None,
+            reply_to=str(reply.get("message_id")) if reply else None,
+            reply_to_sender_id=reply_sender,
+            sender_name=(sender.get("first_name") or sender.get("username") or "").strip(),
+            chat_title=chat.get("title") or "",
+            chat_type=chat.get("type") or "private",
+            mentions_bot=_mentions_bot(_text_of(msg), reply_sender),
             edited=edited,
             connection_id=msg.get("business_connection_id"),
             cursor=cursor,

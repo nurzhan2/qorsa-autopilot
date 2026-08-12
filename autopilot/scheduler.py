@@ -147,6 +147,9 @@ class Scheduler:
             if lane == GATED_LANE:
                 # галочка менеджера: пока не стоит, проект не выходит из briefing
                 q = q.where(Project.ready_for_work.is_(True))
+                # и собранный бриф: строить по недопонятому ТЗ — способ
+                # сделать не то и потратить на это деньги
+                q = q.where(Project.brief_ready.is_(True))
             rows = (await s.execute(q)).all()
 
         # ВАЖНО: rows — снимок, снятый до этой строки. Пока мы его фильтруем,

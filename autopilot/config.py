@@ -78,6 +78,22 @@ class Config:
     tg_owner = os.getenv("TG_OWNER_CHAT_ID", "")       # я, техчасть
     tg_manager = os.getenv("TG_MANAGER_CHAT_ID", "")   # менеджер: деньги, сроки, объём
     tg_poll_timeout = _i("TG_POLL_TIMEOUT", 25)        # long polling getUpdates
+    # Личка через Telegram Business выключена: работа переехала в групповые чаты.
+    # Код бизнес-режима оставлен на случай возврата — см. CLAUDE.md
+    tg_business_enabled = _b("TG_BUSINESS_ENABLED", False)
+
+    # --- кто есть кто в группе ---
+    owner_tg_id = os.getenv("OWNER_TG_ID", "")
+    manager_tg_id = os.getenv("MANAGER_TG_ID", "")
+    bot_tg_id = os.getenv("BOT_TG_ID", "")
+    bot_username = os.getenv("BOT_USERNAME", "").lstrip("@")
+    owner_max_id = os.getenv("OWNER_MAX_ID", "")
+    manager_max_id = os.getenv("MANAGER_MAX_ID", "")
+    bot_max_id = os.getenv("BOT_MAX_ID", "")
+
+    # менеджер называет группы по шаблону — по нему и опознаём проект
+    group_name_template = os.getenv("GROUP_NAME_TEMPLATE", "Qorsa • {client} • {project}")
+    group_match_threshold = _f("GROUP_MATCH_THRESHOLD", 0.78)
 
     # --- MAX ---
     max_token = os.getenv("MAX_TOKEN", "")
@@ -90,6 +106,15 @@ class Config:
     max_webhook_url = os.getenv("MAX_WEBHOOK_URL", "")
 
     ingest_enabled = _b("INGEST_ENABLED", True)
+
+    # --- brief.py ---
+    brief_model = os.getenv("BRIEF_MODEL", "") or os.getenv("JUDGE_MODEL", "claude-sonnet-4-6")
+    brief_min_confidence = _f("BRIEF_MIN_CONFIDENCE", 0.75)
+    brief_question_cooldown_h = _f("BRIEF_QUESTION_COOLDOWN_H", 12)
+    brief_full_rebuild_every = _i("BRIEF_FULL_REBUILD_EVERY", 50)
+    brief_context_messages = _i("BRIEF_CONTEXT_MESSAGES", 80)
+    brief_max_attempts = _i("BRIEF_MAX_ATTEMPTS", 2)
+    brief_max_questions = _i("BRIEF_MAX_QUESTIONS", 3)
 
 
 cfg = Config()

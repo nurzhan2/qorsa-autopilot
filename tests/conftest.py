@@ -50,11 +50,13 @@ async def make_project(status: str = "active", priority: int = 2,
                        deadline: dt.date | None = None, title: str = "проект",
                        tg_chat_id: str | None = AUTO_CHAT,
                        ready_for_work: bool = True,
+                       brief_ready: bool = True,
                        transport: str = "telegram") -> Project:
     """tg_chat_id остался для читаемости тестов — под ним создаётся ProjectChat."""
     async with Session() as s:
         p = Project(client="клиент", title=title, status=status, priority=priority,
                     deadline=deadline, ready_for_work=ready_for_work,
+                    brief_ready=brief_ready,
                     chat_ref=(f"{'max' if transport == 'max' else 'tg'}:{tg_chat_id}"
                               if tg_chat_id else None))
         s.add(p)
@@ -120,6 +122,9 @@ class FakeCommunicator:
 
     async def on_stage_done(self, project) -> None:
         self.stages.append(project.id)
+
+    async def ask_questions(self, project, questions) -> None:
+        self.reminders.append((project.id, len(questions)))
 
     async def remind_access(self, project, items) -> None:
         self.reminders.append((project.id, len(items)))

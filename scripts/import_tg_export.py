@@ -32,9 +32,10 @@ try:                     # под pytest stdout подменён и reconfigure 
 except (AttributeError, ValueError):
     pass
 
-from sqlalchemy import select                                      # noqa: E402
+from sqlalchemy import func, select                                # noqa: E402
 from sqlalchemy.exc import IntegrityError                          # noqa: E402
 
+from autopilot import roles                                        # noqa: E402
 from autopilot.db import ChatMessage, ProjectChat, Session, init_db  # noqa: E402
 from autopilot.secrets_scan import scrub                            # noqa: E402
 
@@ -69,6 +70,16 @@ def media_of(msg: dict) -> tuple[bool, str | None]:
         if key != "media_type" and msg.get(key):
             return True, kind
     return False, None
+
+
+def sender_id_of(msg: dict) -> str | None:
+    """`from_id` в экспорте выглядит как "user123456789" — нам нужен голый id,
+    иначе роли из .env не совпадут ни с чем."""
+    raw = str(msg.get("from_id") or "")
+    if not raw:
+        return None
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    return digits or raw
 
 
 def parse_date(msg: dict) -> dt.datetime:
@@ -117,7 +128,11 @@ async def run(path: Path, project_id: int | None, chat_id: str | None, dry: bool
         text, names = scrub(raw_text, project_id=project_id, chat_id=chat)
         secrets_found += len(names)
         has_media, kind = media_of(msg)
-        sender = msg.get("from_id")
+        sender = sender_id_of(msg)
+        # роль определяется так же, как на живом потоке: по id из .env.
+        # Без неё бриф не отличит требование клиента от реплики менеджера
+        sender_role = await roles.remember(TRANSPORT, chat, sender,
+                                           str(msg.get("from") or ""))
 
         if dry:
             added += 1
@@ -127,8 +142,9 @@ async def run(path: Path, project_id: int | None, chat_id: str | None, dry: bool
             transport=TRANSPORT, chat_id=chat, tg_message_id=mid, project_id=project_id,
             # в личном чате верхнеуровневый id — это собеседник; его сообщения
             # входящие, всё остальное написано с моего аккаунта
-            direction="in" if str(sender or "") == f"user{chat}" else "out",
-            sender_id=str(sender) if sender else None,
+            direction="in" if sender_role == roles.CLIENT else "out",
+            sender_id=sender,
+            sender_role=sender_role,
             text=text, has_media=has_media, media_kind=kind,
             reply_to=str(msg["reply_to_message_id"]) if msg.get("reply_to_message_id") else None,
             raw_json={"imported": True, "date": msg.get("date")},
@@ -145,6 +161,13 @@ async def run(path: Path, project_id: int | None, chat_id: str | None, dry: bool
 
     verb = "нашлось бы" if dry else "добавлено"
     print(f"{verb}: {added}, пропущено дублей: {skipped}, перехвачено секретов: {secrets_found}")
+    if not dry:
+        async with Session() as s:
+            rows = (await s.execute(
+                select(ChatMessage.sender_role, func.count())
+                .where(ChatMessage.chat_id == chat)
+                .group_by(ChatMessage.sender_role))).all()
+        print("роли:", ", ".join(f"{r}={n}" for r, n in rows))
     return 0
 
 

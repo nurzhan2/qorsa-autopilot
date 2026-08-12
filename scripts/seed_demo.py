@@ -77,6 +77,7 @@ async def main() -> None:
                 client=client, title=title, priority=prio, deadline=deadline,
                 status=status, chat_ref=f"tg:demo-{client.lower()}",
                 price=float(100 * prio), brief={"demo": True}, ready_for_work=ready,
+                brief_ready=True,   # демо не гоняет brief.py — считаем ТЗ собранным
             )
             s.add(p)
             await s.flush()
