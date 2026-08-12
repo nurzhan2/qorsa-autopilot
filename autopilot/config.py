@@ -77,6 +77,19 @@ class Config:
     tg_token = os.getenv("TG_BOT_TOKEN", "")
     tg_owner = os.getenv("TG_OWNER_CHAT_ID", "")       # я, техчасть
     tg_manager = os.getenv("TG_MANAGER_CHAT_ID", "")   # менеджер: деньги, сроки, объём
+    tg_poll_timeout = _i("TG_POLL_TIMEOUT", 25)        # long polling getUpdates
+
+    # --- MAX ---
+    max_token = os.getenv("MAX_TOKEN", "")
+    # справочник dev.max.ru отдаёт platform-api2, часть публикаций — platform-api.
+    # Проверь на своём токене и поправь здесь, если не сойдётся
+    max_api_base = os.getenv("MAX_API_BASE", "https://platform-api.max.ru")
+    max_poll_timeout = _i("MAX_POLL_TIMEOUT", 30)
+    # polling — для локальной работы, webhook — для сервера. Одновременно нельзя
+    max_mode = os.getenv("MAX_MODE", "polling").strip().lower()
+    max_webhook_url = os.getenv("MAX_WEBHOOK_URL", "")
+
+    ingest_enabled = _b("INGEST_ENABLED", True)
 
 
 cfg = Config()

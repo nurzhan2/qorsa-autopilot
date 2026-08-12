@@ -3,7 +3,8 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String, TypeDecorator, event, select, update
+from sqlalchemy import (JSON, DateTime, ForeignKey, Index, String, TypeDecorator,
+                        UniqueConstraint, event, select, update)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -54,7 +55,10 @@ class Project(Base):
 
     client: Mapped[str] = mapped_column(String(200), default="")
     title: Mapped[str] = mapped_column(String(300), default="")
-    tg_chat_id: Mapped[str | None] = mapped_column(default=None)
+    # то, что менеджер написал в колонке «Чат клиента»: tg:@user / max:@user / @user
+    chat_ref: Mapped[str | None] = mapped_column(default=None)
+    # когда клиент последний раз ответил — по этому признаку фаза 4 снимет блокировки
+    client_replied_at: Mapped[dt.datetime | None] = mapped_column(default=None)
 
     # new -> briefing -> active -> review -> done | blocked | blocked_access (см. CLAUDE.md)
     status: Mapped[str] = mapped_column(String(20), default="new")
@@ -97,6 +101,69 @@ class Task(Base):
     updated_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
 
 
+class ProjectChat(Base):
+    """Чат проекта в конкретном мессенджере. У проекта их может быть несколько:
+    клиент вполне может писать и в Telegram, и в MAX."""
+    __tablename__ = "project_chats"
+    __table_args__ = (UniqueConstraint("transport", "chat_id", name="uq_project_chat"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    transport: Mapped[str] = mapped_column(String(16), default="telegram")
+    chat_id: Mapped[str] = mapped_column(String(64))
+    handle: Mapped[str | None] = mapped_column(default=None)     # @username или телефон
+    is_primary: Mapped[bool] = mapped_column(default=True)
+
+
+class ChatMessage(Base):
+    """Переписка с клиентом. Историю не затираем: правки и удаления
+    отражаются полями, а не перезаписью."""
+    __tablename__ = "chat_messages"
+    __table_args__ = (
+        # id сообщений уникальны только внутри своего мессенджера
+        UniqueConstraint("transport", "chat_id", "tg_message_id", name="uq_chat_message"),
+        Index("ix_chat_messages_project", "project_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    transport: Mapped[str] = mapped_column(String(16), default="telegram")
+    chat_id: Mapped[str] = mapped_column(String(64))
+    tg_message_id: Mapped[str] = mapped_column(String(64))
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), default=None)
+
+    direction: Mapped[str] = mapped_column(String(3), default="in")     # in | out
+    sender_id: Mapped[str | None] = mapped_column(default=None)
+    text: Mapped[str] = mapped_column(default="")
+    has_media: Mapped[bool] = mapped_column(default=False)
+    media_kind: Mapped[str | None] = mapped_column(default=None)
+    reply_to: Mapped[str | None] = mapped_column(default=None)
+    edited_at: Mapped[dt.datetime | None] = mapped_column(default=None)
+    deleted: Mapped[bool] = mapped_column(default=False)
+    raw_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
+
+
+class TransportState(Base):
+    """Offset поллера. Живёт в БД, поэтому рестарт не теряет и не дублирует."""
+    __tablename__ = "transport_state"
+
+    transport: Mapped[str] = mapped_column(String(16), primary_key=True)
+    offset: Mapped[str | None] = mapped_column(default=None)
+    updated_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
+
+
+class BusinessConnection(Base):
+    """Бизнес-соединение Telegram: от чьего имени бот пишет клиенту."""
+    __tablename__ = "business_connections"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    transport: Mapped[str] = mapped_column(String(16), default="telegram")
+    user_chat_id: Mapped[str | None] = mapped_column(default=None)
+    is_enabled: Mapped[bool] = mapped_column(default=True)
+    can_reply: Mapped[bool] = mapped_column(default=True)
+    updated_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
+
+
 class AccessItem(Base):
     """Пункт чеклиста доступов. Пока хоть один не verified — проект не строится."""
     __tablename__ = "access_items"
@@ -124,8 +191,11 @@ class Message(Base):
     text: Mapped[str] = mapped_column(default="")
     # to_client_auto | to_owner | to_manager
     route: Mapped[str] = mapped_column(String(16), default="to_manager")
-    # для агрегации и лимитов: task_done | access_reminder | plain
+    # для агрегации и лимитов: task_done | access_reminder | plain | forward
     kind: Mapped[str] = mapped_column(String(20), default="plain")
+    # куда отвечать: ответ уходит в тот мессенджер, откуда пришёл вопрос
+    transport: Mapped[str | None] = mapped_column(String(16), default=None)
+    chat_id: Mapped[str | None] = mapped_column(String(64), default=None)
     status: Mapped[str] = mapped_column(String(12), default="scheduled")  # draft|scheduled|sent|cancelled
     send_after: Mapped[dt.datetime | None] = mapped_column(default=None)
     sent_at: Mapped[dt.datetime | None] = mapped_column(default=None)
@@ -168,8 +238,10 @@ Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession
 
 
 async def init_db() -> None:
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    """Схему поднимают миграции, а не create_all: с фазы 2 в базе лежит
+    живая переписка с клиентами, и «удали БД» перестало быть вариантом."""
+    from .migrations import migrate      # поздний импорт: migrations импортирует db
+    await migrate()
 
 
 async def spent_today() -> float:

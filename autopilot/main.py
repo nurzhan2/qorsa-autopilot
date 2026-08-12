@@ -8,8 +8,11 @@ from .communicator import Communicator
 from .config import cfg
 from .db import init_db, recover_orphan_tasks
 from .executor import Executor
+from .ingest import Ingest
 from .scheduler import Scheduler
 from .sheets import SheetSync
+from .transports.max import MaxTransport
+from .transports.telegram import TelegramTransport
 from .vault import install_log_masking
 from .verifier import Verifier
 
@@ -43,13 +46,29 @@ def build_stack():
     return Executor(), Verifier()
 
 
+def build_transports() -> list:
+    """Поднимаем только те мессенджеры, для которых есть токен."""
+    transports = []
+    if cfg.tg_token:
+        transports.append(TelegramTransport())
+    else:
+        log.warning("TG_BOT_TOKEN не задан — Telegram выключен")
+    if cfg.max_token:
+        if cfg.max_mode == "polling":
+            transports.append(MaxTransport())
+        else:
+            log.warning("MAX_MODE=%s — поллер не поднимаю, ждём webhook", cfg.max_mode)
+    return transports
+
+
 async def main() -> None:
     await init_db()
     orphans = await recover_orphan_tasks()
     if orphans:
         log.warning("вернул в очередь %s задач, зависших в running после прошлого запуска", orphans)
 
-    communicator = Communicator()
+    transports = build_transports() if cfg.ingest_enabled else []
+    communicator = Communicator(transports=transports)
     executor, verifier = build_stack()
     sched = Scheduler(executor, verifier, communicator)
 
@@ -61,6 +80,11 @@ async def main() -> None:
         tasks.append(asyncio.create_task(SheetSync().loop(), name="sheets"))
     else:
         log.warning("SHEET_ID не задан — синк с таблицей выключен")
+    if transports:
+        ingest = Ingest(transports, communicator, sched)
+        tasks.append(asyncio.create_task(ingest.run(), name="ingest"))
+    else:
+        log.warning("ни один мессенджер не настроен — входящие не принимаются")
 
     # если одна петля всё-таки умерла — гасим остальные, а не висим полутрупом
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
