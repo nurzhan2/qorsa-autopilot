@@ -6,11 +6,32 @@
 ## Запуск
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env      # заполни ANTHROPIC_API_KEY и SHEET_ID
+python -m venv .venv
+.venv/Scripts/activate            # Windows;  на *nix — source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+cp .env.example .env
 python -m autopilot.main
 ```
+
+**Все команды запускай из активированного venv.** Зависимости стоят только
+в нём: системный `python` их не видит и падает с `ModuleNotFoundError`.
+Если активировать окружение не хочется, зови интерпретатор напрямую:
+
+```bash
+.venv/Scripts/python.exe -m autopilot.main      # на *nix — .venv/bin/python
+.venv/Scripts/python.exe -m pytest
+.venv/Scripts/python.exe scripts/brief_eval.py --list
+```
+
+Ключ Anthropic ищется в трёх местах по порядку: **хранилище secrets.enc**,
+переменная окружения, файл `.env`. Хранилище надёжнее всего:
+
+```bash
+.venv/Scripts/python.exe scripts/vault_cli.py genkey     # положи в .env как VAULT_KEY
+.venv/Scripts/python.exe scripts/vault_cli.py add ANTHROPIC_API_KEY
+```
+
+Заглушку `sk-ant-...` из `.env.example` код настоящим ключом не считает.
 
 ## Google-таблица
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import re
 import sys
 from pathlib import Path
@@ -37,6 +38,13 @@ from autopilot.brief import (LIST_FIELDS, ORIGIN_CONFIRMED, Brief,      # noqa: 
                              _msg_key, agreement)
 from autopilot.config import cfg                                       # noqa: E402
 from autopilot.db import ChatMessage, Project, Session, init_db        # noqa: E402
+from autopilot.vault import (anthropic_key, anthropic_key_source,      # noqa: E402
+                             missing_secret_message)
+
+# INFO у brief: там печатается расход токенов и стоимость прогона.
+# Без этого цифры не видно, а понимать их порядок надо до фазы 4.
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s %(message)s")
+logging.getLogger("brief").setLevel(logging.INFO)
 
 FIXTURES = ROOT / "tests" / "fixtures" / "briefs"
 LINE = "─" * 78
@@ -250,13 +258,15 @@ async def run(project_id: int, stub: bool, save: bool, do_compare: bool) -> int:
         return 1
 
     if stub:
-        print(f"\n[режим --stub: модель НЕ вызывается, работает офлайн-заглушка]")
+        print("\n[режим --stub: модель НЕ вызывается, работает офлайн-заглушка]")
         brief = Brief(client=StubModel())
-    elif not cfg.anthropic_key:
-        print("ANTHROPIC_API_KEY не задан. Либо задай его, либо гоняй с --stub",
-              file=sys.stderr)
+    elif not anthropic_key():
+        print(missing_secret_message("ANTHROPIC_API_KEY"), file=sys.stderr)
+        print("Либо задай ключ, либо гоняй с --stub", file=sys.stderr)
         return 2
     else:
+        print(f"\n[живая модель {cfg.brief_model}, ключ взят из: "
+              f"{anthropic_key_source()}]")
         brief = Brief()
 
     # для eval всегда полный пересбор: смотреть надо на весь чат

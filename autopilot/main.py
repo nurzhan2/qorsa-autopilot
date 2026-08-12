@@ -15,7 +15,7 @@ from .scheduler import Scheduler
 from .sheets import SheetSync
 from .transports.max import MaxTransport
 from .transports.telegram import TelegramTransport
-from .vault import install_log_masking
+from .vault import anthropic_key, install_log_masking
 from .verifier import Verifier
 
 # консоль Windows по умолчанию не cp65001 — без этого весь русский лог превращается в кракозябры
@@ -91,11 +91,11 @@ async def main() -> None:
     else:
         log.warning("ни один мессенджер не настроен — входящие не принимаются")
 
-    if cfg.anthropic_key and not cfg.dry_run:
+    if anthropic_key() and not cfg.dry_run:
         runner = BriefRunner(Brief(communicator=communicator), communicator)
         tasks.append(asyncio.create_task(runner.loop(), name="brief"))
     else:
-        log.warning("ANTHROPIC_API_KEY не задан или DRY_RUN — бриф не собирается")
+        log.warning("ключа нет или включён DRY_RUN — бриф не собирается")
 
     # если одна петля всё-таки умерла — гасим остальные, а не висим полутрупом
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

@@ -40,7 +40,7 @@ from sqlalchemy import select
 from .config import cfg
 from .db import AccessItem, ChatMessage, Project, Run, Session, Task, utcnow
 from .roles import CLIENT, OWNER
-from .vault import MIN_MASKABLE_LEN
+from .vault import MIN_MASKABLE_LEN, anthropic_key, missing_secret_message
 from .vault import vault as default_vault
 
 log = logging.getLogger("brief")
@@ -310,9 +310,12 @@ class Brief:
 
     @property
     def client(self):
-        if self._client is None and cfg.anthropic_key:
-            from anthropic import AsyncAnthropic
-            self._client = AsyncAnthropic(api_key=cfg.anthropic_key)
+        """Ключ ищется в трёх местах: vault, окружение, .env — см. resolve_secret."""
+        if self._client is None:
+            key = anthropic_key(self.vault)
+            if key:
+                from anthropic import AsyncAnthropic
+                self._client = AsyncAnthropic(api_key=key)
         return self._client
 
     async def _call(self, prompt: str, task_id: int | None, project_id: int) -> str:
@@ -320,7 +323,7 @@ class Brief:
         assert_no_secrets(prompt, self.vault)
 
         if self.client is None:
-            raise BriefFailed("ANTHROPIC_API_KEY не задан — бриф собрать нечем")
+            raise BriefFailed(missing_secret_message("ANTHROPIC_API_KEY"))
 
         t0 = time.monotonic()
         resp = await self.client.messages.create(
@@ -333,9 +336,13 @@ class Brief:
         from .verifier import PRICE_IN, PRICE_OUT
         usage = getattr(resp, "usage", None)
         cost = 0.0
+        tokens_in = tokens_out = 0
         if usage is not None:
-            cost = (getattr(usage, "input_tokens", 0) / 1e6 * PRICE_IN
-                    + getattr(usage, "output_tokens", 0) / 1e6 * PRICE_OUT)
+            tokens_in = getattr(usage, "input_tokens", 0) or 0
+            tokens_out = getattr(usage, "output_tokens", 0) or 0
+            cost = tokens_in / 1e6 * PRICE_IN + tokens_out / 1e6 * PRICE_OUT
+        log.info("бриф: вход %s токенов, выход %s токенов, $%.4f, %.1fs",
+                 tokens_in, tokens_out, cost, seconds)
         async with Session() as s:
             if task_id is None:
                 # Run привязан к задаче: заводим служебную, иначе стоимость
@@ -497,10 +504,19 @@ class Brief:
 
     def collect_unreadable(self, data: dict, messages: list[ChatMessage]) -> dict:
         """Вложения фиксируем сами: полагаться на модель тут незачем,
-        факт наличия файла виден из БД."""
-        seen = {str(u.get("message_id")) for u in data.get("unreadable", [])}
+        факт наличия файла виден из БД.
+
+        Сверяем по ХВОСТУ идентификатора: модель отдаёт полный ключ
+        `telegram:-100…:7`, а мы знаем голое `7`. Без нормализации одно и то же
+        вложение попадает в список дважды — поймано на живом прогоне.
+        """
+        def tail(value) -> str:
+            return str(value or "").rsplit(":", 1)[-1]
+
+        seen = {tail(u.get("message_id")) for u in data.get("unreadable", [])}
         for m in messages:
-            if m.has_media and m.tg_message_id not in seen:
+            if m.has_media and tail(m.tg_message_id) not in seen:
+                seen.add(tail(m.tg_message_id))
                 data.setdefault("unreadable", []).append(
                     {"message_id": m.tg_message_id, "kind": m.media_kind or "файл"})
         return data

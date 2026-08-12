@@ -4,10 +4,13 @@
     python scripts/vault_cli.py list            # только имена, значений не показывает
     python scripts/vault_cli.py add FTP_PASS    # значение спросит, не отображая
     python scripts/vault_cli.py add FTP_PASS --stdin < file
+    python scripts/vault_cli.py get FTP_PASS     # печатает значение в stdout
     python scripts/vault_cli.py rm FTP_PASS
 
-Значения не печатаются ни одной командой: показать секрет — это записать его
-в историю терминала и в скроллбек. Нужен он агенту, а не глазам.
+Значение печатает только `get`, и только потому, что иногда нужно передать
+секрет скрипту. Помни: напечатанное оседает в истории оболочки и в скроллбеке.
+Для повседневной работы это лишнее — агент получает секреты через окружение,
+а не через твои глаза.
 """
 from __future__ import annotations
 
@@ -33,6 +36,8 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("genkey", help="сгенерировать ключ Fernet")
     sub.add_parser("list", help="показать имена секретов")
+    p_get = sub.add_parser("get", help="напечатать значение (осторожно: попадёт в историю)")
+    p_get.add_argument("name")
     p_add = sub.add_parser("add", help="добавить или заменить секрет")
     p_add.add_argument("name")
     p_add.add_argument("--stdin", action="store_true", help="взять значение со stdin")
@@ -58,6 +63,17 @@ def main() -> int:
         print(f"{cfg.vault_path} — {len(names)} шт.:")
         for n in names:
             print(f"  {n:24s} {ref(n)}")
+        return 0
+
+    if args.cmd == "get":
+        # Единственная команда, печатающая значение. Нужна для скриптов и
+        # разовой проверки; в повседневной работе значение осядет в истории
+        # оболочки и в скроллбеке, поэтому по умолчанию так делать не стоит.
+        value = vault.get(args.name)
+        if value is None:
+            print(f"нет секрета {args.name}", file=sys.stderr)
+            return 1
+        sys.stdout.write(value + "\n")
         return 0
 
     if args.cmd == "add":
