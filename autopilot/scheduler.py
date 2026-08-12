@@ -1,0 +1,297 @@
+"""Честный планировщик: полосы + weighted fair queueing по проектам.
+
+Почему не FIFO: проект с 40 задачами полностью блокирует остальных.
+WFQ раздаёт время по кругу, вес = приоритет из таблицы + буст по дедлайну.
+"""
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import logging
+
+from sqlalchemy import select, update
+
+from .config import cfg
+from .db import Project, Session, Task, spent_today, utcnow
+
+log = logging.getLogger("sched")
+
+LANES = ("chat", "build", "verify")
+
+# Полосы, которые встают при исчерпании суточного бюджета.
+# chat работает всегда: клиент не должен молчать из-за денег.
+PAID_LANES = ("build", "verify")
+
+# Проект обслуживается в любом статусе, кроме терминального и заблокированного.
+# blocked = ждёт человека, done = сдан. Всё остальное — рабочее.
+DEAD_STATUSES = ("done", "blocked")
+
+# Сколько единиц WFQ списывается в момент выдачи слота. Списываем ДО работы:
+# иначе проект с 40 задачами заберёт все свободные слоты одного тика, ведь
+# served_units не меняется, пока задачи не завершились.
+DISPATCH_UNITS = 1.0
+
+
+def weight(p: Project) -> float:
+    """Больше вес — чаще обслуживаем."""
+    w = {1: 3.0, 2: 2.0, 3: 1.0}.get(p.priority, 2.0)
+    if p.deadline:
+        days = (p.deadline - dt.date.today()).days
+        if days <= 0:
+            w *= 4.0        # просрочено — тушим пожар
+        elif days <= 3:
+            w *= 2.0
+    return w
+
+
+class Scheduler:
+    def __init__(self, executor, verifier, communicator):
+        self.executor = executor
+        self.verifier = verifier
+        self.communicator = communicator
+        # занятые слоты по полосам — считаем сами, без чтения приватных полей Semaphore
+        self.running: dict[str, int] = {ln: 0 for ln in cfg.lane_limits}
+        self.busy_projects: set[int] = set()   # проекты с активной эксклюзивной задачей
+        self.inflight: set[int] = set()        # id задач в работе
+        self._workers: set[asyncio.Task] = set()   # держим ссылки, иначе GC съест задачу на лету
+        self.budget_paused = False
+        self.tick_sec = 1.0
+
+    def free_slots(self, lane: str) -> int:
+        return cfg.lane_limits[lane] - self.running[lane]
+
+    # ---------- главный цикл ----------
+
+    async def run(self) -> None:
+        log.info("scheduler up | lanes=%s", cfg.lane_limits)
+        while True:
+            try:
+                await self.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("tick failed")
+            await asyncio.sleep(self.tick_sec)
+
+    async def tick(self) -> None:
+        """Один проход по всем полосам. Вынесен из run(), чтобы дёргать поштучно из тестов."""
+        over_budget = await spent_today() >= cfg.daily_budget_usd
+        if over_budget and not self.budget_paused:
+            log.warning("СУТОЧНЫЙ БЮДЖЕТ ИСЧЕРПАН ($%.2f) — пауза build/verify, chat работает",
+                        cfg.daily_budget_usd)
+        elif self.budget_paused and not over_budget:
+            log.info("бюджет снова в норме — build/verify разморожены")
+        self.budget_paused = over_budget
+
+        for lane in LANES:
+            if self.budget_paused and lane in PAID_LANES:
+                continue
+            await self._dispatch(lane)
+
+    async def drain(self, timeout: float = 30.0) -> None:
+        """Дождаться завершения всех запущенных задач (тесты и мягкая остановка)."""
+        while self._workers:
+            await asyncio.wait(set(self._workers), timeout=timeout)
+
+    # ---------- выбор задачи ----------
+
+    async def _dispatch(self, lane: str) -> None:
+        exclusive = cfg.lane_exclusive[lane]
+        # за один тик занимаем не больше, чем свободно сейчас: иначе на мгновенных
+        # задачах цикл вычерпывает всю очередь полосы и другие полосы ждут
+        quota = self.free_slots(lane)
+
+        while quota > 0 and self.free_slots(lane) > 0:
+            quota -= 1
+            pair = await self._pick(lane, exclusive)
+            if pair is None:
+                return
+            task, project = pair
+
+            if not await self._claim(task.id):
+                # снимок из _pick устарел: задачу уже забрали. Берём следующую
+                continue
+
+            self.running[lane] += 1
+            self.inflight.add(task.id)
+            if exclusive:
+                self.busy_projects.add(project.id)
+            # списываем сразу — следующий _pick в этом же тике увидит новый score
+            await self._charge_dispatch(project.id)
+            if lane == "build":
+                await self._activate(project)
+
+            worker = asyncio.create_task(
+                self._work(lane, task, project, exclusive), name=f"{lane}:task{task.id}")
+            self._workers.add(worker)
+            worker.add_done_callback(self._workers.discard)
+
+    async def _pick(self, lane: str, exclusive: bool):
+        """Проект с минимальным served_units/weight, из него — самая ранняя задача."""
+        async with Session() as s:
+            q = (
+                select(Task, Project)
+                .join(Project, Project.id == Task.project_id)
+                .where(Task.lane == lane, Task.status == "ready")
+                .where(Project.status.notin_(DEAD_STATUSES))
+                .order_by(Task.order_idx, Task.id)
+            )
+            rows = (await s.execute(q)).all()
+
+        # ВАЖНО: rows — снимок, снятый до этой строки. Пока мы его фильтруем,
+        # какая-то задача успевает доработать и выйти из inflight, оставшись в
+        # снимке со статусом ready. Поэтому выбор здесь — только кандидат,
+        # право на работу выдаёт _claim() одним условным UPDATE.
+        best = None
+        best_score = None
+        for task, project in rows:
+            if task.id in self.inflight:
+                continue
+            if exclusive and project.id in self.busy_projects:
+                continue
+            score = project.served_units / weight(project)
+            if best_score is None or score < best_score:
+                best, best_score = (task, project), score
+        return best
+
+    # ---------- исполнение ----------
+
+    async def _claim(self, task_id: int) -> bool:
+        """Атомарно переводит ready -> running. Ровно один захват на задачу:
+        условие проверяется и меняется одним UPDATE, а не read-modify-write."""
+        async with Session() as s:
+            res = await s.execute(
+                update(Task)
+                .where(Task.id == task_id, Task.status == "ready")
+                .values(status="running", updated_at=utcnow()))
+            await s.commit()
+            return res.rowcount == 1
+
+    async def _work(self, lane: str, task: Task, project: Project, exclusive: bool) -> None:
+        started = utcnow()
+        try:
+            if lane == "build":
+                await self.executor.run(task, project)
+                # собранное уходит на приёмку той же задачей, но в другой полосе
+                await self._set_status(task.id, "ready", lane="verify")
+            elif lane == "verify":
+                ok, defects = await self.verifier.run(task, project)
+                if ok:
+                    await self._set_status(task.id, "done")
+                    await self.communicator.on_task_done(task, project)
+                    await self._maybe_finish(project.id)
+                else:
+                    await self._on_fail(lane, task, project, defects)
+            elif lane == "chat":
+                await self.communicator.process(task, project)
+                await self._set_status(task.id, "done")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception("task %s failed", task.id)
+            try:
+                await self._on_fail(lane, task, project, [f"exception: {e}"])
+            except Exception:
+                log.exception("не смог записать провал task %s", task.id)
+        finally:
+            minutes = (utcnow() - started).total_seconds() / 60
+            try:
+                await self._charge_done(project.id, minutes)
+            except Exception:
+                log.exception("не смог списать время project %s", project.id)
+            self.inflight.discard(task.id)
+            if exclusive:
+                self.busy_projects.discard(project.id)
+            self.running[lane] -= 1
+
+    async def _on_fail(self, lane: str, task: Task, project: Project, defects: list[str]) -> None:
+        async with Session() as s:
+            t = await s.get(Task, task.id)
+            if t is None:
+                return
+            t.attempts += 1
+            t.defects = defects
+            if t.attempts >= cfg.max_attempts:
+                t.status = "escalated"
+                p = await s.get(Project, project.id)
+                if p is not None:
+                    p.status = "blocked"
+                    p.last_action = f"эскалация: {t.title}"
+                    p.updated_at = utcnow()
+                log.warning("ЭСКАЛАЦИЯ -> %s / %s", project.title, t.title)
+            else:
+                t.status = "ready"
+                if lane == "verify":
+                    # не прошло приёмку — обратно на починку, тем же cc_session_id
+                    t.lane = "build"
+                # упавшие build/chat остаются в своей полосе: перекидывать
+                # chat-задачу в build — это менять её смысл
+            t.updated_at = utcnow()
+            await s.commit()
+
+    async def _set_status(self, task_id: int, status: str, lane: str | None = None) -> None:
+        async with Session() as s:
+            t = await s.get(Task, task_id)
+            if t is None:
+                return
+            t.status = status
+            if lane:
+                t.lane = lane
+            t.updated_at = utcnow()
+            await s.commit()
+
+    # ---------- статусы проекта ----------
+
+    async def _activate(self, project: Project) -> None:
+        """new/briefing -> active в момент выдачи первого build-слота.
+        Раньше нельзя: пока задач нет, проект действительно ещё брифуется."""
+        if project.status not in ("new", "briefing"):
+            return
+        async with Session() as s:
+            p = await s.get(Project, project.id)
+            if p is None or p.status not in ("new", "briefing"):
+                return
+            was = p.status
+            p.status = "active"
+            p.updated_at = utcnow()
+            await s.commit()
+        project.status = "active"
+        log.info("проект %s: %s -> active", project.id, was)
+
+    async def _maybe_finish(self, project_id: int) -> None:
+        """active -> review, когда не осталось незакрытых задач.
+        review -> done ставит человек: принял работу — закрыл строку в таблице."""
+        async with Session() as s:
+            p = await s.get(Project, project_id)
+            if p is None or p.status != "active":
+                return
+            left = (await s.execute(
+                select(Task.id).where(Task.project_id == project_id,
+                                      Task.status.notin_(("done", "escalated"))))).first()
+            if left is not None:
+                return
+            p.status = "review"
+            p.last_action = "все задачи закрыты, жду проверки"
+            p.updated_at = utcnow()
+            await s.commit()
+        log.info("проект %s: active -> review", project_id)
+
+    # ---------- WFQ ----------
+
+    async def _charge_dispatch(self, project_id: int) -> None:
+        await self._add_units(project_id, DISPATCH_UNITS)
+
+    async def _charge_done(self, project_id: int, minutes: float) -> None:
+        # выдача слота уже оплачена, добиваем только превышение над ней
+        await self._add_units(project_id, max(minutes - DISPATCH_UNITS, 0.0))
+
+    async def _add_units(self, project_id: int, units: float) -> None:
+        if units <= 0:
+            return
+        async with Session() as s:
+            p = await s.get(Project, project_id)
+            if p is None:
+                return
+            p.served_units += units
+            p.updated_at = utcnow()
+            await s.commit()
