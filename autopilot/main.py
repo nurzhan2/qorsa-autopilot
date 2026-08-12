@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+
+from .communicator import Communicator
+from .config import cfg
+from .db import init_db, recover_orphan_tasks
+from .executor import Executor
+from .scheduler import Scheduler
+from .sheets import SheetSync
+from .verifier import Verifier
+
+# консоль Windows по умолчанию не cp65001 — без этого весь русский лог превращается в кракозябры
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-7s %(name)-8s %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+log = logging.getLogger("main")
+
+
+def build_stack():
+    """Возвращает (executor, verifier). В DRY_RUN — заглушки вместо
+    настоящего Claude Code и платного судьи."""
+    if cfg.dry_run:
+        from .fakes import FakeExecutor, FakeVerifier
+        log.warning("DRY_RUN=1 — работают заглушки, Claude Code и судья не вызываются")
+        return FakeExecutor(delay=(0.5, 3.0)), FakeVerifier()
+    return Executor(), Verifier()
+
+
+async def main() -> None:
+    await init_db()
+    orphans = await recover_orphan_tasks()
+    if orphans:
+        log.warning("вернул в очередь %s задач, зависших в running после прошлого запуска", orphans)
+
+    communicator = Communicator()
+    executor, verifier = build_stack()
+    sched = Scheduler(executor, verifier, communicator)
+
+    tasks = [
+        asyncio.create_task(sched.run(), name="scheduler"),
+        asyncio.create_task(communicator.pump(), name="pump"),
+    ]
+    if cfg.sheet_id:
+        tasks.append(asyncio.create_task(SheetSync().loop(), name="sheets"))
+    else:
+        log.warning("SHEET_ID не задан — синк с таблицей выключен")
+
+    # если одна петля всё-таки умерла — гасим остальные, а не висим полутрупом
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for t in pending:
+        t.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    for t in done:
+        if t.cancelled():
+            continue
+        if t.exception() is not None:
+            log.error("петля %s упала", t.get_name(), exc_info=t.exception())
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nstopped")
