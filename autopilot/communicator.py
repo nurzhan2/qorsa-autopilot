@@ -22,7 +22,8 @@ import re
 from sqlalchemy import select
 
 from .config import cfg
-from .db import AccessItem, Message, Project, Session, Task, utcnow
+from .db import (AccessItem, BusinessConnection, Message, Project, ProjectChat,
+                 Session, Task, utcnow)
 
 log = logging.getLogger("comm")
 
@@ -64,6 +65,10 @@ CLIENT_RE = re.compile(
     re.IGNORECASE)
 
 LETTER_RE = re.compile(r"[A-Za-zА-Яа-яЁё]")
+
+# Там, где мессенджер не даёт писать от лица владельца, притворяться человеком
+# нельзя. Подписываемся явно — один раз в начале сообщения.
+BOT_SIGNATURE = "🤖 Бот по техническим вопросам (не человек).\n\n"
 
 
 def _unparseable(text: str) -> bool:
@@ -121,30 +126,77 @@ def in_quiet_hours(now_local: dt.datetime | None = None) -> bool:
     return h >= cfg.quiet_start or h < cfg.quiet_end
 
 
-def recipient(msg_route: str, project: Project) -> str | None:
-    if msg_route == TO_CLIENT:
-        return project.tg_chat_id
+def internal_recipient(msg_route: str) -> str:
+    """Свои живут в Telegram обычным ботом, без бизнес-соединения."""
     if msg_route == TO_OWNER:
         return cfg.tg_owner or "OWNER"
     return cfg.tg_manager or "MANAGER"
 
 
 class Communicator:
-    def __init__(self, send_fn=None):
+    def __init__(self, send_fn=None, transports=None):
+        # transports задан — шлём по-настоящему; нет — остаётся заглушка фазы 1,
+        # на которой держатся DRY_RUN и тесты
+        self.transports = {t.name: t for t in (transports or [])}
         self.send_fn = send_fn or self._stub_send
 
     async def _stub_send(self, chat_id: str, text: str) -> None:
         log.info("[TG -> %s] %s", chat_id, text)
 
+    # ---------- адресация ----------
+
+    async def client_chat(self, project: Project,
+                          prefer: str | None = None) -> tuple[str | None, str | None]:
+        """Куда писать клиенту: в тот мессенджер, откуда пришёл вопрос,
+        иначе в основной чат проекта."""
+        async with Session() as s:
+            chats = (await s.execute(
+                select(ProjectChat).where(ProjectChat.project_id == project.id)
+                .order_by(ProjectChat.is_primary.desc(), ProjectChat.id))).scalars().all()
+        if not chats:
+            return None, None
+        if prefer:
+            for c in chats:
+                if c.transport == prefer:
+                    return c.transport, c.chat_id
+        return chats[0].transport, chats[0].chat_id
+
+    async def _connection_id(self, transport_name: str) -> str | None:
+        """business_connection_id — то, что превращает «бот написал»
+        в «владелец написал»."""
+        async with Session() as s:
+            row = (await s.execute(
+                select(BusinessConnection)
+                .where(BusinessConnection.transport == transport_name,
+                       BusinessConnection.is_enabled.is_(True),
+                       BusinessConnection.can_reply.is_(True))
+                .order_by(BusinessConnection.updated_at.desc()))).scalars().first()
+        return row.id if row else None
+
+    async def notify_owner(self, text: str) -> None:
+        """Оперативное уведомление владельцу — мимо очереди и тихих часов."""
+        transport = self.transports.get("telegram")
+        chat = cfg.tg_owner or "OWNER"
+        if transport is None:
+            await self.send_fn(chat, text)
+            return
+        try:
+            await transport.send(chat, text)
+        except Exception:
+            log.exception("не смог уведомить владельца")
+
     # ---------- создание ----------
 
     async def draft(self, project: Project, text: str, kind: str = "plain",
-                    force_route: str | None = None) -> Message:
+                    force_route: str | None = None,
+                    transport: str | None = None, chat_id: str | None = None) -> Message:
         msg_route = strictest(route(text), force_route) if force_route else route(text)
+        if msg_route == TO_CLIENT and chat_id is None:
+            transport, chat_id = await self.client_chat(project, prefer=transport)
         async with Session() as s:
             m = Message(
                 project_id=project.id, text=text, route=msg_route, kind=kind,
-                status="scheduled",
+                status="scheduled", transport=transport, chat_id=chat_id,
                 # клиенту — с человеческой паузой, своим — сразу
                 send_after=utcnow() + (human_delay() if msg_route == TO_CLIENT else dt.timedelta(0)),
             )
@@ -156,7 +208,8 @@ class Communicator:
             log.info("-> ВЛАДЕЛЬЦУ (проект %s): %s", project.id, text[:120])
         return m
 
-    async def incoming(self, project: Project, text: str) -> Message:
+    async def incoming(self, project: Project, text: str,
+                       transport: str | None = None, chat_id: str | None = None) -> Message:
         """Сообщение от клиента. Бот не отвечает сам на то, что не его:
         спорное просто пересылается менеджеру, и на этом бот замолкает."""
         msg_route = route(text)
@@ -164,8 +217,18 @@ class Communicator:
             # входящее не может быть «ответом клиенту» — это уже наша реакция
             msg_route = TO_OWNER
         prefix = {TO_MANAGER: "Клиент пишет (это к тебе)", TO_OWNER: "Клиент пишет (техника)"}
-        return await self.draft(project, f"{prefix[msg_route]}: {text}",
+        where = f" [{transport}:{chat_id}]" if transport else ""
+        return await self.draft(project, f"{prefix[msg_route]}{where}: {text}",
                                 kind="forward", force_route=msg_route)
+
+    async def confirm_access_received(self, project: Project, transport=None,
+                                      chat_id: str | None = None) -> Message:
+        """Клиент прислал доступ. Про то, что мы вырезали из сообщения секрет,
+        ему знать незачем — подтверждаем получение и всё."""
+        name = getattr(transport, "name", transport)
+        return await self.draft(project, "Доступ получен, спасибо. Проверю и напишу.",
+                                kind="access_ack", force_route=TO_CLIENT,
+                                transport=name, chat_id=chat_id)
 
     # ---------- отчёт о готовности: один на окно ----------
 
@@ -283,18 +346,44 @@ class Communicator:
                 # тишина касается только клиента: своих будим когда надо
                 if quiet and m.route == TO_CLIENT:
                     continue
-                chat = recipient(m.route, p)
-                if not chat:
+                try:
+                    delivered = await self._deliver(m, p)
+                except Exception:
+                    log.exception("не смог отправить сообщение %s", m.id)
+                    continue      # не помечаем отправленным, попробуем на следующем круге
+                if delivered is None:
                     m.status = "cancelled"
                     log.warning("проект %s: маршрут %s без адресата — сообщение %s отменено",
                                 p.id, m.route, m.id)
                     continue
-                try:
-                    await self.send_fn(chat, m.text)
-                except Exception:
-                    log.exception("не смог отправить сообщение %s", m.id)
-                    continue      # не помечаем отправленным, попробуем на следующем круге
                 m.status, m.sent_at = "sent", now
                 sent += 1
             await s.commit()
         return sent
+
+    async def _deliver(self, m: Message, project: Project) -> str | None:
+        """Возвращает id отправленного сообщения либо None, если адресата нет."""
+        text = m.text
+        if m.route == TO_CLIENT:
+            name, chat = m.transport, m.chat_id
+            if not chat:
+                name, chat = await self.client_chat(project, prefer=m.transport)
+            if not chat:
+                return None
+        else:
+            # владелец и менеджер — всегда обычным ботом в Telegram
+            name, chat = "telegram", internal_recipient(m.route)
+
+        transport = self.transports.get(name)
+        if transport is None:
+            await self.send_fn(chat, text)          # заглушка фазы 1
+            return chat
+
+        connection_id = None
+        if m.route == TO_CLIENT:
+            if transport.supports_impersonation():
+                connection_id = await self._connection_id(name)
+            else:
+                # там, где нельзя писать от лица владельца, притворяться запрещено
+                text = BOT_SIGNATURE + text
+        return await transport.send(chat, text, connection_id=connection_id)

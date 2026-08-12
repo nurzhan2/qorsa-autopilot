@@ -22,7 +22,8 @@ from google.oauth2.service_account import Credentials
 from sqlalchemy import case, func, select
 
 from .config import cfg
-from .db import AccessItem, Project, Session, Task, utcnow
+from .db import AccessItem, Project, ProjectChat, Session, Task, utcnow
+from .ingest import parse_chat_ref
 
 log = logging.getLogger("sheets")
 
@@ -31,7 +32,7 @@ HUMAN = {
     "ID": "id",
     "Клиент": "client",
     "Проект": "title",
-    "TG chat": "tg_chat_id",
+    "Чат клиента": "chat_ref",
     "Цена": "price",
     "Дедлайн": "deadline",
     "Приоритет": "priority",
@@ -41,6 +42,10 @@ HUMAN = {
 # --- колонки бота: он перезаписывает их батчем ---
 BOT = ["Статус", "Прогресс", "Ждём от клиента", "Превью", "Последнее действие",
        "Стоимость $", "Обновлено"]
+
+# Колонка выросла из «TG chat»: старое имя продолжаем читать, чтобы уже
+# заполненные таблицы не пришлось править руками
+CHAT_COLUMNS = ("Чат клиента", "TG chat")
 
 assert not (set(HUMAN) & set(BOT)), "колонка не может принадлежать и человеку, и боту"
 
@@ -71,6 +76,16 @@ def _parse_date(v):
             return dt.datetime.strptime(str(v).strip(), f).date()
         except Exception:
             pass
+    return None
+
+
+def _chat_ref(row) -> str | None:
+    """«Чат клиента»: tg:@user / max:@user / @user / числовой id.
+    Без префикса — telegram."""
+    for name in CHAT_COLUMNS:
+        value = str(row.get(name, "") or "").strip()
+        if value:
+            return value
     return None
 
 
@@ -134,15 +149,16 @@ class SheetSync:
                 proj.sheet_row = i
                 proj.client = str(row.get("Клиент", "")).strip()
                 proj.title = str(row.get("Проект", "")).strip()
-                proj.tg_chat_id = str(row.get("TG chat", "")).strip() or None
+                proj.chat_ref = _chat_ref(row)
                 proj.price = _num(row.get("Цена"))
                 proj.deadline = _parse_date(row.get("Дедлайн"))
                 proj.priority = _num(row.get("Приоритет"), int) or 2
                 proj.workspace = str(row.get("Папка", "")).strip() or proj.workspace
                 proj.ready_for_work = _flag(row.get("Готов к работе"))
-                if proj.status == "new" and proj.tg_chat_id:
+                if proj.status == "new" and proj.chat_ref:
                     proj.status = "briefing"
                 proj.updated_at = utcnow()
+                await _link_numeric_chat(s, proj)
             await s.commit()
 
         # фаза 3: единственная запись в твою колонку — ID у новых строк,
@@ -153,6 +169,7 @@ class SheetSync:
                 [{"range": gspread.utils.rowcol_to_a1(r, c), "values": [[v]]} for r, c, v in writes])
 
     # ---------- БД → таблица ----------
+
 
     async def _push(self) -> None:
         ws = await self.ws()
@@ -213,3 +230,20 @@ class SheetSync:
                    func.sum(case((Task.status == "done", 1), else_=0)))
             .group_by(Task.project_id))).all()
         return {pid: f"{int(done or 0)}/{total}" for pid, total, done in rows}
+
+
+async def _link_numeric_chat(s, proj: Project) -> None:
+    """Если менеджер вписал не @username, а готовый chat_id — привязываем сразу.
+    Для @username привязка случится по первому входящему сообщению."""
+    parsed = parse_chat_ref(proj.chat_ref or "")
+    if not parsed:
+        return
+    transport, handle = parsed
+    if handle.startswith("@") or not handle.lstrip("-").isdigit():
+        return
+    exists = (await s.execute(
+        select(ProjectChat).where(ProjectChat.transport == transport,
+                                  ProjectChat.chat_id == handle))).scalars().first()
+    if exists is None:
+        s.add(ProjectChat(project_id=proj.id, transport=transport,
+                          chat_id=handle, is_primary=True))

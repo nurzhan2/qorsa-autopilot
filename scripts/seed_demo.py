@@ -16,11 +16,15 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+try:                     # под pytest stdout подменён и reconfigure может не быть
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass
 
 from sqlalchemy import delete, select                       # noqa: E402
 
-from autopilot.db import AccessItem, Message, Project, Run, Session, Task, init_db  # noqa: E402
+from autopilot.db import (AccessItem, ChatMessage, Message, Project, ProjectChat,  # noqa: E402
+                          Run, Session, Task, init_db)
 
 PREFIX = "DEMO:"
 TODAY = dt.date.today()
@@ -53,6 +57,8 @@ async def wipe(s) -> int:
     if task_ids:
         await s.execute(delete(Run).where(Run.task_id.in_(task_ids)))
     await s.execute(delete(AccessItem).where(AccessItem.project_id.in_(ids)))
+    await s.execute(delete(ChatMessage).where(ChatMessage.project_id.in_(ids)))
+    await s.execute(delete(ProjectChat).where(ProjectChat.project_id.in_(ids)))
     await s.execute(delete(Message).where(Message.project_id.in_(ids)))
     await s.execute(delete(Task).where(Task.project_id.in_(ids)))
     await s.execute(delete(Project).where(Project.id.in_(ids)))
@@ -69,11 +75,13 @@ async def main() -> None:
         for title, client, prio, deadline, status, n_build, n_chat, ready, access in DEMO:
             p = Project(
                 client=client, title=title, priority=prio, deadline=deadline,
-                status=status, tg_chat_id=f"demo-{client.lower()}",
+                status=status, chat_ref=f"tg:demo-{client.lower()}",
                 price=float(100 * prio), brief={"demo": True}, ready_for_work=ready,
             )
             s.add(p)
             await s.flush()
+            s.add(ProjectChat(project_id=p.id, transport="telegram",
+                              chat_id=f"demo-{client.lower()}", is_primary=True))
             for name, kind, st in access:
                 s.add(AccessItem(project_id=p.id, name=name, kind=kind, status=st))
             for i in range(n_build):

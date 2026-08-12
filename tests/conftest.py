@@ -24,7 +24,8 @@ os.environ["LOGS"] = str(_TMP / "logs")
 os.environ["ANTHROPIC_API_KEY"] = ""       # судья в тестах не поднимается
 os.environ["SHEET_ID"] = ""
 
-from autopilot.db import AccessItem, Base, Project, Session, Task, engine  # noqa: E402
+from autopilot.db import (AccessItem, Base, ChatMessage, Project, ProjectChat,  # noqa: E402
+                          Session, Task, engine)
 
 
 @pytest.fixture
@@ -42,17 +43,41 @@ async def db():
     await engine.dispose()
 
 
+AUTO_CHAT = "<auto>"
+
+
 async def make_project(status: str = "active", priority: int = 2,
                        deadline: dt.date | None = None, title: str = "проект",
-                       tg_chat_id: str | None = "chat-1",
-                       ready_for_work: bool = True) -> Project:
+                       tg_chat_id: str | None = AUTO_CHAT,
+                       ready_for_work: bool = True,
+                       transport: str = "telegram") -> Project:
+    """tg_chat_id остался для читаемости тестов — под ним создаётся ProjectChat."""
     async with Session() as s:
         p = Project(client="клиент", title=title, status=status, priority=priority,
-                    deadline=deadline, tg_chat_id=tg_chat_id,
-                    ready_for_work=ready_for_work)
+                    deadline=deadline, ready_for_work=ready_for_work,
+                    chat_ref=(f"{'max' if transport == 'max' else 'tg'}:{tg_chat_id}"
+                              if tg_chat_id else None))
         s.add(p)
+        await s.flush()
+        if tg_chat_id == AUTO_CHAT:
+            # chat_id уникален в пределах транспорта — на проект свой
+            tg_chat_id = f"chat-{p.id}"
+            p.chat_ref = f"tg:{tg_chat_id}"
+        if tg_chat_id:
+            s.add(ProjectChat(project_id=p.id, transport=transport,
+                              chat_id=tg_chat_id, is_primary=True))
         await s.commit()
     return p
+
+
+async def add_chat(project_id: int, transport: str, chat_id: str,
+                   handle: str | None = None, is_primary: bool = False) -> ProjectChat:
+    async with Session() as s:
+        c = ProjectChat(project_id=project_id, transport=transport, chat_id=chat_id,
+                        handle=handle, is_primary=is_primary)
+        s.add(c)
+        await s.commit()
+    return c
 
 
 async def make_access(project_id: int, name: str = "FTP", kind: str = "ftp",

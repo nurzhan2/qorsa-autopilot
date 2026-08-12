@@ -17,7 +17,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+try:                     # под pytest stdout подменён и reconfigure может не быть
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass
 
 from cryptography.fernet import Fernet          # noqa: E402
 
