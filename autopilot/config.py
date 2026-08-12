@@ -83,7 +83,12 @@ class Config:
     tg_business_enabled = _b("TG_BUSINESS_ENABLED", False)
 
     # --- кто есть кто в группе ---
+    # Менеджер и владелец — один человек с одного аккаунта, поэтому
+    # MANAGER_TG_ID по умолчанию просто алиас OWNER_TG_ID. Роль manager
+    # осталась в перечислении: включи MANAGER_SEPARATE=1, если менеджер
+    # когда-нибудь отделится и сядет в группу со своего аккаунта.
     owner_tg_id = os.getenv("OWNER_TG_ID", "")
+    manager_separate = _b("MANAGER_SEPARATE", False)
     manager_tg_id = os.getenv("MANAGER_TG_ID", "")
     bot_tg_id = os.getenv("BOT_TG_ID", "")
     bot_username = os.getenv("BOT_USERNAME", "").lstrip("@")
@@ -115,6 +120,8 @@ class Config:
     brief_context_messages = _i("BRIEF_CONTEXT_MESSAGES", 80)
     brief_max_attempts = _i("BRIEF_MAX_ATTEMPTS", 2)
     brief_max_questions = _i("BRIEF_MAX_QUESTIONS", 3)
+    # на сколько сообщений вперёд ищем согласие клиента на предложение владельца
+    confirm_window = _i("CONFIRM_WINDOW", 3)
 
 
 cfg = Config()

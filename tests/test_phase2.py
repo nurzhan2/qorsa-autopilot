@@ -204,8 +204,8 @@ async def due(message_id: int) -> None:
 
 
 async def test_outbound_routing(db, tg, monkeypatch):
-    """Клиенту — через business_connection_id, менеджеру — обычным ботом."""
-    monkeypatch.setattr(cfg, "tg_manager", "manager-chat")
+    """Клиенту — через business_connection_id, себе — обычным ботом."""
+    monkeypatch.setattr(cfg, "tg_owner", "owner-chat")
     monkeypatch.setattr(cfg, "quiet_start", 0)
     monkeypatch.setattr(cfg, "quiet_end", 0)
     p = await make_project(tg_chat_id="client-chat")
@@ -216,10 +216,10 @@ async def test_outbound_routing(db, tg, monkeypatch):
 
     comm = Communicator(transports=[tg])
     to_client = await comm.draft(p, "выложил превью, посмотри")
-    to_manager = await comm.draft(p, "клиент спрашивает про скидку")
+    to_owner = await comm.draft(p, "клиент спрашивает про скидку")
     assert to_client.route == TO_CLIENT
     await due(to_client.id)
-    await due(to_manager.id)
+    await due(to_owner.id)
 
     assert await comm.pump_once() == 2
     by_chat = {chat: (text, conn) for chat, text, conn in tg.sent}
@@ -228,8 +228,9 @@ async def test_outbound_routing(db, tg, monkeypatch):
     assert by_chat["client-chat"][1] == "bizconn-1", "клиенту ушло не от лица владельца"
     assert BOT_SIGNATURE not in by_chat["client-chat"][0], "в Telegram подпись бота не нужна"
 
-    assert "manager-chat" in by_chat
-    assert by_chat["manager-chat"][1] is None, "менеджеру ушло через бизнес-соединение"
+    # коммерция уходит владельцу обычным ботом: бизнес-соединение — только клиенту
+    assert "owner-chat" in by_chat
+    assert by_chat["owner-chat"][1] is None, "своим ушло через бизнес-соединение"
 
 
 async def test_no_impersonation_in_max(db, mx, monkeypatch):

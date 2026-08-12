@@ -3,32 +3,45 @@
     "text": "Здравствуйте! У нас магазин корейской косметики, сейчас продаём только через инстаграм. Нужен нормальный интернет-магазин, чтобы люди сами оформляли заказ и опл",
     "evidence": [
       "telegram:-1001987654321:3"
-    ]
+    ],
+    "origin": "client"
   },
   "deliverables": [
     {
       "text": "Здравствуйте! У нас магазин корейской косметики, сейчас продаём только через инстаграм. Нужен нормальный интернет-магазин, чтобы люди сами оформляли заказ и опл",
       "evidence": [
         "telegram:-1001987654321:3"
-      ]
+      ],
+      "origin": "client"
     },
     {
       "text": "Хорошо. Сайт хочу на wordpress, у знакомых так сделано и им удобно самим товары добавлять.",
       "evidence": [
         "telegram:-1001987654321:6"
-      ]
+      ],
+      "origin": "client"
     },
     {
       "text": "Ещё нужна страница про доставку и оплату, и обязательно казахский и русский языки. Английский не нужен, у нас его никто не спрашивает.",
       "evidence": [
         "telegram:-1001987654321:11"
-      ]
+      ],
+      "origin": "client"
     },
     {
       "text": "И ещё аналитику подключите, хочу видеть откуда люди приходят. Метрика подойдёт.",
       "evidence": [
         "telegram:-1001987654321:14"
-      ]
+      ],
+      "origin": "client"
+    },
+    {
+      "text": "Предлагаю добавить быстрый просмотр товара прямо из каталога, чтобы не уходить со страницы. Сделаем?",
+      "evidence": [
+        "telegram:-1001987654321:16",
+        "telegram:-1001987654321:17"
+      ],
+      "origin": "confirmed_proposal"
     }
   ],
   "stack": [
@@ -36,7 +49,8 @@
       "text": "wordpress",
       "evidence": [
         "telegram:-1001987654321:6"
-      ]
+      ],
+      "origin": "client"
     }
   ],
   "constraints": [],
@@ -47,39 +61,54 @@
       "name": "Домен",
       "evidence": [
         "telegram:-1001987654321:9"
-      ]
+      ],
+      "origin": "client"
     },
     {
       "kind": "hosting_panel",
       "name": "Хостинг",
       "evidence": [
         "telegram:-1001987654321:9"
-      ]
+      ],
+      "origin": "client"
     },
     {
       "kind": "hosting_panel",
       "name": "панел",
       "evidence": [
         "telegram:-1001987654321:10"
-      ]
+      ],
+      "origin": "client"
     },
     {
       "kind": "analytics",
       "name": "аналитик",
       "evidence": [
         "telegram:-1001987654321:14"
-      ]
+      ],
+      "origin": "client"
     },
     {
       "kind": "analytics",
       "name": "Метрик",
       "evidence": [
         "telegram:-1001987654321:14"
-      ]
+      ],
+      "origin": "client"
     }
   ],
   "open_questions": [],
-  "out_of_scope": [],
+  "out_of_scope": [
+    {
+      "text": "нет, не надо, потом",
+      "evidence": [
+        "telegram:-1001987654321:18",
+        "telegram:-1001987654321:19"
+      ],
+      "origin": "confirmed_proposal",
+      "rejected": true
+    }
+  ],
   "unreadable": [
     {
       "message_id": "7",

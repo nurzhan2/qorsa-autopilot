@@ -4,6 +4,7 @@ import asyncio
 import logging
 import sys
 
+from . import roles
 from .brief import Brief, BriefRunner
 from .communicator import Communicator
 from .config import cfg
@@ -81,7 +82,10 @@ async def main() -> None:
         tasks.append(asyncio.create_task(SheetSync().loop(), name="sheets"))
     else:
         log.warning("SHEET_ID не задан — синк с таблицей выключен")
-    if transports:
+    if transports and not roles.owner_configured():
+        log.critical("OWNER_TG_ID не задан — ingest выключен. Без id владельца "
+                     "его собственные реплики уедут в ТЗ как требования клиента")
+    elif transports:
         ingest = Ingest(transports, communicator, sched)
         tasks.append(asyncio.create_task(ingest.run(), name="ingest"))
     else:

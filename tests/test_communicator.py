@@ -6,8 +6,8 @@ import datetime as dt
 from conftest import make_access, make_project
 from sqlalchemy import func, select
 
-from autopilot.communicator import (TO_CLIENT, TO_MANAGER, TO_OWNER, Communicator,
-                                    in_quiet_hours, route, strictest)
+from autopilot.communicator import (TO_CLIENT, TO_MANAGER, TO_OWNER, TOPIC_COMMERCIAL,
+                                    Communicator, in_quiet_hours, route, strictest, topic)
 from autopilot.config import cfg
 from autopilot.db import AccessItem, Message, Session, Task, utcnow
 
@@ -24,21 +24,28 @@ class Spy:
 
 
 async def test_routing_manager(db, monkeypatch):
-    """Вопрос про деньги уходит менеджеру, клиенту при этом — ничего."""
-    monkeypatch.setattr(cfg, "tg_manager", "manager-chat")
+    """Вопрос про деньги уходит человеку, клиенту при этом — ничего.
+
+    Менеджер и владелец — один аккаунт, поэтому адресат коммерции —
+    владелец. Тема при этом остаётся коммерческой: именно на ней держится
+    молчание бота в группе.
+    """
+    monkeypatch.setattr(cfg, "manager_separate", False)
+    monkeypatch.setattr(cfg, "tg_owner", "owner-chat")
     p = await make_project(tg_chat_id="client-chat")
     spy = Spy()
     comm = Communicator(send_fn=spy)
 
-    assert route("сколько будет стоить доработка?") == TO_MANAGER
+    assert topic("сколько будет стоить доработка?") == TOPIC_COMMERCIAL
+    assert route("сколько будет стоить доработка?") == TO_OWNER
 
     m = await comm.incoming(p, "сколько будет стоить доработка?")
-    assert m.route == TO_MANAGER
+    assert m.route == TO_OWNER
 
     assert await comm.pump_once() == 1
-    assert spy.to("client-chat") == [], "клиенту ушло то, что должно было уйти менеджеру"
-    assert len(spy.to("manager-chat")) == 1
-    assert "сколько будет стоить" in spy.to("manager-chat")[0]
+    assert spy.to("client-chat") == [], "клиенту ушло то, на что бот отвечать не вправе"
+    assert len(spy.to("owner-chat")) == 1
+    assert "сколько будет стоить" in spy.to("owner-chat")[0]
 
 
 async def test_routing_client_auto(db):
@@ -84,10 +91,11 @@ async def test_routing_owner(db, monkeypatch):
     assert spy.to("client-chat") == []
 
 
-async def test_doubt_goes_to_manager(db):
-    """Правило по умолчанию: непонятное, но осмысленное — менеджеру."""
-    assert route("ок, давайте так и сделаем") == TO_MANAGER
-    assert route("а ещё бы логотип поменять") == TO_MANAGER
+async def test_doubt_goes_to_human(db):
+    """Правило по умолчанию: непонятное, но осмысленное — человеку, не боту."""
+    assert topic("ок, давайте так и сделаем") == TOPIC_COMMERCIAL
+    assert route("ок, давайте так и сделаем") == TO_OWNER
+    assert route("а ещё бы логотип поменять") == TO_OWNER
 
 
 async def test_aggregation(db):
@@ -178,7 +186,7 @@ async def test_strictest():
 
 async def test_quiet_hours_holds_client_only(db, monkeypatch):
     """Ночью молчим клиенту, но не своим."""
-    monkeypatch.setattr(cfg, "tg_manager", "manager-chat")
+    monkeypatch.setattr(cfg, "tg_owner", "owner-chat")
     monkeypatch.setattr(cfg, "quiet_start", 0)
     monkeypatch.setattr(cfg, "quiet_end", 24)      # тишина круглосуточно
     p = await make_project(tg_chat_id="client-chat")
@@ -194,7 +202,7 @@ async def test_quiet_hours_holds_client_only(db, monkeypatch):
 
     assert await comm.pump_once() == 1
     assert spy.to("client-chat") == []
-    assert len(spy.to("manager-chat")) == 1
+    assert len(spy.to("owner-chat")) == 1
 
 
 def test_quiet_hours_window(monkeypatch):
