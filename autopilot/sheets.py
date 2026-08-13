@@ -29,23 +29,34 @@ from .ingest import parse_chat_ref
 log = logging.getLogger("sheets")
 
 # --- твои колонки: бот только читает ---
+#
+# ВНИМАНИЕ на две пары, которые легко перепутать, и цена ошибки — затёртая
+# руками заполненная ячейка:
+#   «Статус» — ТВОЙ, бот его не трогает. Своё состояние он пишет
+#   в «Стадия заказа».
+#   «Дата выполнения» — ТВОЯ. Срок проекта бот читает из «Срок».
 HUMAN = {
-    "ID": "id",
+    "Лист CRM": None,
+    "Строка CRM": None,
+    "Дата": None,
+    "Заказ": "title",
     "Клиент": "client",
-    "Проект": "title",
-    "Чат клиента": "chat_ref",
-    "Цена": "price",
-    "Дедлайн": "deadline",
+    "Остаток клиента": None,
+    "Описание": None,
     "Приоритет": "priority",
-    "Папка": "workspace",
-    "Готов к работе": "ready_for_work",
-    # только для режима одной общей таблицы; в раздельном её просто нет.
-    # Держим в HUMAN, чтобы бот гарантированно в неё не писал
+    "Статус": None,              # твой статус, не бота
+    "Дата выполнения": None,     # твоя, не бота
+    "Комментарий": None,
+    "Срок": "deadline",
     "Компания": "account_id",
+    "Чат клиента": "chat_ref",
+    "Готов к работе": "ready_for_work",
+    "Папка": "workspace",
 }
 # --- колонки бота: он перезаписывает их батчем ---
-BOT = ["Статус", "Прогресс", "Ждём от клиента", "Превью", "Последнее действие",
-       "Стоимость $", "Обновлено"]
+# ID теперь тоже его: раньше бот дописывал номер в человеческую колонку,
+# теперь она честно объявлена ботовой
+BOT = ["ID", "Стадия заказа", "Нужно от клиента", "Прогресс", "Превью"]
 
 # Колонка выросла из «TG chat»: старое имя продолжаем читать, чтобы уже
 # заполненные таблицы не пришлось править руками
@@ -181,6 +192,63 @@ class SheetSync:
                 log.exception("sheet sync failed")
             await asyncio.sleep(cfg.sheet_sync_sec)
 
+    # ---------- только чтение ----------
+
+    async def preview(self) -> dict:
+        """Что синк УВИДИТ в таблице, ничего не записав — ни в лист, ни в БД.
+
+        Нужен ровно для одного: посмотреть глазами до первой записи. Читает
+        тем же кодом, что и `_pull` (тот же резолвер компании, те же парсеры),
+        потому что отчёт, собранный параллельной реализацией, отвечал бы на
+        другой вопрос — «что увидел бы другой код», а не «что сделает синк».
+        """
+        ws = await self.ws()
+        header = await asyncio.to_thread(ws.row_values, 1)
+        second = await asyncio.to_thread(ws.row_values, 2)
+        rows = await asyncio.to_thread(ws.get_all_records)
+
+        by_company: dict[str, list] = {}
+        questions: list[tuple[int, str, str]] = []
+        empty = 0
+        parsed: list[dict] = []
+
+        for i, row in enumerate(rows, start=2):
+            client = str(row.get("Клиент", "") or "").strip()
+            order = str(row.get("Заказ", "") or "").strip()
+            if not client and not order:
+                empty += 1
+                continue
+            company = self.resolve_company(row)
+            if company is None:
+                questions.append((i, client or order,
+                                  str(row.get(COMPANY_COLUMN, "") or "").strip()))
+                continue
+            item = {
+                "row": i,
+                "company": company.code,
+                "client": client,
+                "title": order,
+                "chat_ref": _chat_ref(row),
+                "deadline": _parse_date(row.get("Срок")),
+                "priority": _num(row.get("Приоритет"), int) or 2,
+                "ready": _flag(row.get("Готов к работе")),
+                "workspace": str(row.get("Папка", "") or "").strip(),
+                "sheet_id_cell": _num(row.get("ID"), int),
+                "human_status": str(row.get("Статус", "") or "").strip(),
+            }
+            parsed.append(item)
+            by_company.setdefault(company.code, []).append(item)
+
+        return {
+            "header": header,
+            "second_row": second,
+            "total_rows": len(rows),
+            "empty_rows": empty,
+            "parsed": parsed,
+            "by_company": by_company,
+            "questions": questions,
+        }
+
     # ---------- таблица → БД ----------
 
     async def _pull(self) -> None:
@@ -236,10 +304,11 @@ class SheetSync:
 
                 proj.sheet_row = i
                 proj.client = str(row.get("Клиент", "")).strip()
-                proj.title = str(row.get("Проект", "")).strip()
+                proj.title = str(row.get("Заказ", "")).strip()
                 proj.chat_ref = _chat_ref(row)
-                proj.price = _num(row.get("Цена"))
-                proj.deadline = _parse_date(row.get("Дедлайн"))
+                # колонки «Цена» в новой таблице нет — деньги живут в CRM,
+                # и боту они не нужны: коммерцию он не ведёт по построению
+                proj.deadline = _parse_date(row.get("Срок"))
                 proj.priority = _num(row.get("Приоритет"), int) or 2
                 proj.workspace = str(row.get("Папка", "")).strip() or proj.workspace
                 proj.ready_for_work = _flag(row.get("Готов к работе"))
@@ -320,15 +389,14 @@ class SheetSync:
         updates = []
         for p in projects:
             vals = {
-                "Статус": STATUS_RU.get(p.status, p.status),
+                "ID": p.id,
+                # СВОЁ состояние бот пишет сюда. Колонка «Статус» — твоя,
+                # и трогать её нельзя: там твоя разметка по заказу
+                "Стадия заказа": STATUS_RU.get(p.status, p.status),
                 "Прогресс": progress.get(p.id, ""),
-                # менеджеру видно, почему проект стоит, и он не дёргает владельца
-                "Ждём от клиента": waiting.get(p.id, ""),
+                # видно, почему проект стоит, и не надо спрашивать
+                "Нужно от клиента": waiting.get(p.id, ""),
                 "Превью": p.preview_url or "",
-                "Последнее действие": p.last_action or "",
-                "Стоимость $": round(p.cost_usd, 2),
-                # в БД всё в UTC, в таблице человеку нужно местное время
-                "Обновлено": p.updated_at.astimezone().strftime("%d.%m %H:%M"),
             }
             for name, col in cols.items():
                 updates.append({"range": gspread.utils.rowcol_to_a1(p.sheet_row, col),

@@ -7,10 +7,14 @@ from conftest import make_project, make_tasks, make_account
 from autopilot import sheets
 from autopilot.db import Project, Session
 
-# колонки нарочно вперемешку — чтобы индексы человека и бота чередовались
-HEADER = ["ID", "Клиент", "Статус", "Проект", "Прогресс", "TG chat", "Цена",
-          "Превью", "Дедлайн", "Приоритет", "Последнее действие", "Папка",
-          "Готов к работе", "Ждём от клиента", "Стоимость $", "Обновлено"]
+# Настоящая раскладка рабочей таблицы, порядок колонок как в листе «Задачи».
+# Колонки человека и бота и так чередуются — специально путать не нужно.
+# Две пары стоят рядом намеренно: «Статус» (твой) против «Стадия заказа»
+# (бота) и «Дата выполнения» (твоя) против «Срок» (читается ботом).
+HEADER = ["Лист CRM", "Строка CRM", "Дата", "Заказ", "Клиент", "Остаток клиента",
+          "Описание", "Приоритет", "Статус", "Дата выполнения", "Стадия заказа",
+          "Комментарий", "Нужно от клиента", "Срок", "ID", "Компания",
+          "Чат клиента", "Готов к работе", "Папка", "Прогресс", "Превью"]
 
 HUMAN_COLS = {HEADER.index(n) + 1 for n in sheets.HUMAN if n in HEADER}
 BOT_COLS = {HEADER.index(n) + 1 for n in sheets.BOT if n in HEADER}
@@ -78,17 +82,23 @@ async def test_push_writes_progress_and_status(db, monkeypatch):
 
     by_col = {gspread.utils.a1_to_rowcol(i["range"])[1]: i["values"][0][0] for i in ws.batches}
     assert by_col[HEADER.index("Прогресс") + 1] == "1/4"
-    assert by_col[HEADER.index("Статус") + 1] == "в работе"
+    # своё состояние бот пишет в «Стадия заказа»...
+    assert by_col[HEADER.index("Стадия заказа") + 1] == "в работе"
+    # ...а колонку «Статус» не трогает вовсе: она твоя
+    assert HEADER.index("Статус") + 1 not in by_col
 
 
 async def test_pull_touches_only_id_column(db, monkeypatch):
     """Единственная запись бота в твои колонки — проставленный ID новой строки."""
+    base = {c: "" for c in HEADER}
     ws = FakeWorksheet(records=[{
-        "ID": "", "Клиент": "Айгерим", "Проект": "лендинг", "TG chat": "42",
-        "Цена": "150 000", "Дедлайн": "01.09.2026", "Приоритет": "1", "Папка": "",
+        **base,
+        "Клиент": "Айгерим", "Заказ": "лендинг", "Чат клиента": "42",
+        "Срок": "01.09.2026", "Приоритет": "1",
+        # чекбокс приходит СТРОКОЙ «TRUE», а не bool — проверено на живой таблице
         "Готов к работе": "TRUE",
-        "Статус": "", "Прогресс": "", "Ждём от клиента": "", "Превью": "",
-        "Последнее действие": "", "Стоимость $": "", "Обновлено": "",
+        # твой статус заполнен: бот обязан его не тронуть
+        "Статус": "В работе", "Дата выполнения": "04.08.2026",
     }])
     monkeypatch.setattr(sheets, "_client", lambda *a, **k: ws)
 
@@ -101,10 +111,10 @@ async def test_pull_touches_only_id_column(db, monkeypatch):
         from sqlalchemy import select
         proj = (await s.execute(select(Project))).scalars().one()
     assert proj.client == "Айгерим"
-    assert proj.price == 150000.0
+    assert proj.title == "лендинг", "заголовок берётся из колонки «Заказ»"
     assert proj.priority == 1
-    assert proj.deadline.isoformat() == "2026-09-01"
-    assert proj.status == "briefing"       # появился TG chat -> new -> briefing
+    assert proj.deadline.isoformat() == "2026-09-01", "срок читается из «Срок»"
+    assert proj.status == "briefing"       # появился чат -> new -> briefing
     assert proj.ready_for_work is True
     assert proj.sheet_row == 2
     assert proj.account_id == acc.id, "новый проект остался без компании"
