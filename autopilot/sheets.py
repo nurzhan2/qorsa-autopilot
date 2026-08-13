@@ -56,7 +56,8 @@ HUMAN = {
 # --- колонки бота: он перезаписывает их батчем ---
 # ID теперь тоже его: раньше бот дописывал номер в человеческую колонку,
 # теперь она честно объявлена ботовой
-BOT = ["ID", "Стадия заказа", "Нужно от клиента", "Прогресс", "Превью"]
+BOT = ["ID", "Стадия заказа", "Нужно от клиента", "Прогресс", "Превью",
+       "Стоимость $"]
 
 # Колонка выросла из «TG chat»: старое имя продолжаем читать, чтобы уже
 # заполненные таблицы не пришлось править руками
@@ -121,7 +122,8 @@ def _num(v, cast=float):
 
 class SheetSync:
     def __init__(self, accounts=None, account_ids=None, communicator=None,
-                 account=None, account_id: int | None = None):
+                 account=None, account_id: int | None = None,
+                 require_chat: bool | None = None):
         """Один синк — одна ФИЗИЧЕСКАЯ ТАБЛИЦА, сколько бы компаний в ней ни было.
 
         Раньше синк заводился на компанию. При одной общей таблице это значило
@@ -138,6 +140,9 @@ class SheetSync:
         self.accounts = list(accounts or [])
         self.account_ids = dict(account_ids or {})
         self.communicator = communicator
+        # заводить проекты только для строк с чатом — см. cfg.sheet_require_chat
+        self.require_chat = (cfg.sheet_require_chat if require_chat is None
+                             else bool(require_chat))
         self._ws_cache = None
         self._lock = asyncio.Lock()
         # про какие ячейки уже спрашивали — чтобы не долбить владельца
@@ -261,6 +266,7 @@ class SheetSync:
         id_col = header.index("ID") + 1 if "ID" in header else None
 
         unresolved: list[tuple[int, str, str]] = []   # (строка, клиент, ячейка)
+        skipped_no_chat = 0
 
         # фаза 2: только БД, без сетевых вызовов внутри сессии
         async with Session() as s:
@@ -296,6 +302,12 @@ class SheetSync:
                 if proj is None:
                     if not str(row.get("Клиент", "")).strip():
                         continue
+                    if self.require_chat and not _chat_ref(row):
+                        # Строка без чата боту бесполезна: писать по ней некуда,
+                        # а завести её значит проставить ID и показать заказ
+                        # в работе. Ждём, пока в «Чат клиента» появится значение
+                        skipped_no_chat += 1
+                        continue
                     proj = Project(account_id=account_id)
                     s.add(proj)
                     await s.flush()
@@ -318,6 +330,10 @@ class SheetSync:
                 await _link_numeric_chat(s, proj, company.transport)
             await s.commit()
 
+        if skipped_no_chat:
+            log.info("строк без «Чат клиента» пропущено: %s "
+                     "(SHEET_REQUIRE_CHAT=1 — проекты по ним не заводятся)",
+                     skipped_no_chat)
         await self._ask_about_unresolved(unresolved)
 
         # фаза 3: единственная запись в твою колонку — ID у новых строк,
@@ -397,6 +413,9 @@ class SheetSync:
                 # видно, почему проект стоит, и не надо спрашивать
                 "Нужно от клиента": waiting.get(p.id, ""),
                 "Превью": p.preview_url or "",
+                # что потрачено на проект. Колонки может не быть в листе —
+                # тогда она просто не попадёт в cols и не запишется
+                "Стоимость $": round(p.cost_usd, 2),
             }
             for name, col in cols.items():
                 updates.append({"range": gspread.utils.rowcol_to_a1(p.sheet_row, col),

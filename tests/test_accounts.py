@@ -279,7 +279,8 @@ async def test_sheet_shared_table_splits_by_column(db, monkeypatch):
     monkeypatch.setattr(sheets, "_client", lambda *a, **k: ws)
 
     sync = sheets.SheetSync(accounts=[qorsa_cfg, hustle_cfg],
-                            account_ids={'qorsa': qorsa.id, 'hustle': hustle.id})
+                            account_ids={'qorsa': qorsa.id, 'hustle': hustle.id},
+                            require_chat=False)   # тест про компанию, не про чат
     await sync._pull()
 
     async with Session() as s:
@@ -589,7 +590,7 @@ async def test_unknown_company_cell_asks_owner(db, monkeypatch):
     comm = FakeCommunicator()
     sync = sheets.SheetSync(accounts=[q_cfg, h_cfg],
                             account_ids={"qorsa": qorsa.id, "hustle": hustle.id},
-                            communicator=comm)
+                            communicator=comm, require_chat=False)
     await sync._pull()
 
     async with Session() as s:

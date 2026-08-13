@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+from collections import Counter
 
 import pytest
+from sqlalchemy import select
 from conftest import FakeCommunicator, make_access, make_project, make_tasks
 
 from autopilot.config import cfg
 from autopilot.db import AccessItem, Project, Run, Session, Task
 from autopilot.fakes import FakeExecutor, FakeVerifier
-from autopilot.scheduler import Scheduler
+from autopilot.scheduler import Scheduler, weight
 
 
 def make_sched(communicator=None, executor=None, verifier=None):
@@ -307,3 +309,55 @@ async def test_served_units_decay(db, monkeypatch):
     await sched.drain()
 
     assert old.id in comm.processed, "проект с истлевшим долгом всё ещё в хвосте очереди"
+
+
+async def test_wfq_without_any_deadlines(db):
+    """Все сроки пустые — планировщик работает на базовом весе, а не падает.
+
+    В рабочей таблице колонка «Срок» не заполнена ни у одного из 38 заказов,
+    так что это не гипотетический случай, а ровно то состояние, в котором
+    система пойдёт в первый живой прогон. Буст по дедлайну при этом не
+    применяется никогда, и вес определяется только приоритетом.
+    """
+    p1 = await make_project(title="высокий", priority=1, deadline=None)
+    p2 = await make_project(title="обычный", priority=2, deadline=None)
+    p3 = await make_project(title="фоновый", priority=3, deadline=None)
+
+    # вес считается и без дедлайна, ничего не роняя
+    async with Session() as s:
+        rows = {p.title: p for p in (await s.execute(select(Project))).scalars().all()}
+    assert weight(rows["высокий"]) == 3.0
+    assert weight(rows["обычный"]) == 2.0
+    assert weight(rows["фоновый"]) == 1.0
+
+    for proj in (p1, p2, p3):
+        await make_tasks(proj.id, 60, lane="chat")
+
+    ex, ver, comm = FakeExecutor(), FakeVerifier(), FakeCommunicator()
+    sched = make_sched(comm, ex, ver)
+    for _ in range(12):
+        await sched.tick()
+        await sched.drain()
+
+    served = Counter(ex.served) + Counter(comm.processed)
+    # каждый проект обслужен — никто не заперт из-за отсутствия срока
+    for proj in (p1, p2, p3):
+        assert served[proj.id] > 0, f"проект {proj.title} не получил ни одного слота"
+    # и приоритет по-прежнему решает: высокий обслужен чаще фонового
+    assert served[p1.id] > served[p3.id], (
+        f"приоритет перестал работать без дедлайнов: {dict(served)}")
+
+
+async def test_wfq_deadline_boost_still_applies_when_filled(db):
+    """Обратная сторона: как только «Срок» заполнен, буст возвращается."""
+    overdue = await make_project(title="просрочен", priority=2,
+                                 deadline=dt.date.today() - dt.timedelta(days=1))
+    soon = await make_project(title="скоро", priority=2,
+                              deadline=dt.date.today() + dt.timedelta(days=2))
+    far = await make_project(title="не горит", priority=2,
+                             deadline=dt.date.today() + dt.timedelta(days=90))
+    async with Session() as s:
+        rows = {p.title: p for p in (await s.execute(select(Project))).scalars().all()}
+    assert weight(rows["просрочен"]) == 8.0     # 2.0 x 4
+    assert weight(rows["скоро"]) == 4.0         # 2.0 x 2
+    assert weight(rows["не горит"]) == 2.0      # без буста
