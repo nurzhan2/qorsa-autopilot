@@ -24,6 +24,7 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from . import accounts as accounts_cfg
 from . import roles
 from .config import cfg
 from .db import ChatMessage, Project, ProjectChat, Session, Task, utcnow
@@ -44,16 +45,21 @@ def is_group(msg: InboundMessage) -> bool:
     return (msg.chat_type or "").lower() in GROUP_TYPES
 
 
-def parse_chat_ref(raw: str) -> tuple[str, str] | None:
+def parse_chat_ref(raw: str, default_transport: str = "telegram") -> tuple[str, str] | None:
     """`tg:@ivan` / `max:@ivan` / `@ivan` / `12345` -> (transport, handle).
 
-    Без префикса — telegram: колонка «Чат клиента» выросла из «TG chat»,
-    и уже заполненные строки ломать нельзя.
+    Явный префикс всегда сильнее. Без префикса берём ОСНОВНОЙ МЕССЕНДЖЕР
+    КОМПАНИИ: у компании MAX клиенты сидят в MAX, и подставлять им telegram
+    значит завести проект с каналом, по которому никто не ответит. Раньше
+    здесь стоял жёсткий telegram — это работало, пока компания была одна.
+
+    Значение по умолчанию оставлено `telegram` ради уже заполненных строк:
+    колонка выросла из «TG chat», и ломать их нельзя.
     """
     value = (raw or "").strip()
     if not value:
         return None
-    transport = "telegram"
+    transport = str(default_transport or "telegram")
     if ":" in value:
         prefix, rest = value.split(":", 1)
         prefix = prefix.strip().lower()
@@ -116,7 +122,7 @@ class Ingest:
             log.error("компании без owner_tg_id: %s — их собственные реплики "
                       "уедут в ТЗ как требования клиента", ", ".join(blind))
         if not self.transports:
-            log.warning("ни один транспорт не настроен — ingest не поднимается")
+            log.warning("ни одного подключения к мессенджерам — ingest не поднимается")
             return
         # return_exceptions: падение одного подключения не должно снимать
         # остальные. Внутри _loop стоит вечный цикл с переподключением, так
@@ -126,7 +132,8 @@ class Ingest:
             *(self._loop(t) for t in self.transports.values()), return_exceptions=True)
         for (account, name), res in zip(self.transports, results):
             if isinstance(res, Exception) and not isinstance(res, asyncio.CancelledError):
-                log.error("поллер %s/%s остановлен: %s", account, name, res)
+                log.error("поллер остановлен (%s): %s",
+                          accounts_cfg.label(account, name), res)
 
     # Пауза после того, как poll() ВЕРНУЛСЯ штатно. По контракту он висит
     # вечно, но если транспорт всё же вернул управление (кончился фейковый
@@ -139,8 +146,9 @@ class Ingest:
         backoff = Backoff()
         while True:
             try:
-                log.info("поллер %s/%s запущен",
-                         getattr(transport, "account", "?"), transport.name)
+                log.info("поллер запущен: %s",
+                         accounts_cfg.label(getattr(transport, "account", None),
+                                            transport.name))
                 async for msg in transport.poll():
                     await self.handle(transport, msg)
                     backoff.reset()
@@ -148,8 +156,9 @@ class Ingest:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("поллер %s/%s упал, переподключаюсь",
-                              getattr(transport, "account", "?"), transport.name)
+                log.exception("поллер упал, переподключаюсь: %s",
+                              accounts_cfg.label(getattr(transport, "account", None),
+                                                 transport.name))
                 await backoff.sleep()
 
     # ---------- обработка одного сообщения ----------

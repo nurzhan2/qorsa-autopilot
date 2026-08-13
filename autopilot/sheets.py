@@ -21,6 +21,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from sqlalchemy import case, func, select
 
+from . import accounts as accounts_cfg
 from .config import cfg
 from .db import AccessItem, Project, ProjectChat, Session, Task, utcnow
 from .ingest import parse_chat_ref
@@ -58,10 +59,11 @@ STATUS_RU = {"new": "новый", "briefing": "уточняю ТЗ", "active": "
 
 TRUE_WORDS = {"true", "да", "yes", "1", "y", "+", "✓", "✔", "истина", "готов"}
 
-# Колонка для режима «одна таблица на все компании». В раздельном режиме
-# (по умолчанию) её не нужно заводить вовсе.
+# Колонка, привязывающая строку к компании. Нужна, когда таблица одна на
+# несколько компаний (наш случай). Значения — алиасы из accounts.toml:
+# «qorsa», «hustle», «max»/«МАКС». Пустая или незнакомая ячейка НЕ трактуется
+# как компания по умолчанию — см. SheetSync.resolve_company.
 COMPANY_COLUMN = "Компания"
-DEFAULT_CODE = "qorsa"
 
 
 def _flag(v) -> bool:
@@ -107,46 +109,64 @@ def _num(v, cast=float):
 
 
 class SheetSync:
-    def __init__(self, account=None, account_id: int | None = None,
-                 shared: bool = False):
-        """Один синк — одна КОМПАНИЯ.
+    def __init__(self, accounts=None, account_ids=None, communicator=None,
+                 account=None, account_id: int | None = None):
+        """Один синк — одна ФИЗИЧЕСКАЯ ТАБЛИЦА, сколько бы компаний в ней ни было.
 
-        `shared=True` означает, что этой таблицей пользуются несколько
-        компаний: тогда строки различаются колонкой «Компания», и чужие
-        синк не трогает. По умолчанию таблицы раздельные, и колонка не нужна.
+        Раньше синк заводился на компанию. При одной общей таблице это значило
+        бы три поллера, читающих один и тот же лист и пишущих в него по
+        очереди: втрое больше запросов к квоте Google (60 в минуту) и три
+        независимых мнения о том, что сейчас в таблице. Поэтому синк один,
+        а компанию строки определяет колонка «Компания».
+
+        `account` / `account_id` — форма для одной компании, оставлена ради
+        уже написанных вызовов и тестов.
         """
-        self.account = account
-        self.account_id = account_id
-        self.shared = shared
+        if account is not None and accounts is None:
+            accounts, account_ids = [account], {getattr(account, "code", ""): account_id}
+        self.accounts = list(accounts or [])
+        self.account_ids = dict(account_ids or {})
+        self.communicator = communicator
         self._ws_cache = None
         self._lock = asyncio.Lock()
+        # про какие ячейки уже спрашивали — чтобы не долбить владельца
+        # одним и тем же вопросом каждые 60 секунд
+        self._asked: set[str] = set()
 
     @property
-    def code(self) -> str:
-        return str(getattr(self.account, "code", "") or "")
+    def primary(self):
+        """Компания, чьи реквизиты таблицы используем для подключения."""
+        return self.accounts[0] if self.accounts else None
+
+    @property
+    def multi(self) -> bool:
+        return len(self.accounts) > 1
 
     async def ws(self):
         """Авторизация переиспользуется: строить клиента каждые 60 секунд —
         лишний раунд-трип к Google на каждый цикл синка."""
         if self._ws_cache is None:
             self._ws_cache = await asyncio.to_thread(
-                _client, getattr(self.account, "sheet_id", None),
-                getattr(self.account, "sheet_tab", None))
+                _client, getattr(self.primary, "sheet_id", None),
+                getattr(self.primary, "sheet_tab", None))
         return self._ws_cache
 
-    def _row_is_mine(self, row: dict) -> bool:
-        """Строка общей таблицы принадлежит этой компании?
+    def resolve_company(self, row: dict):
+        """Компания строки. None означает ВОПРОС ВЛАДЕЛЬЦУ, а не «по умолчанию».
 
-        В раздельном режиме таблица целиком наша — вопрос не стоит. В общей
-        решает колонка «Компания»: пустое значение считаем своим только для
-        компании по умолчанию, иначе строку без метки подхватили бы сразу все.
+        Одна компания на таблицу — вопрос не стоит, строка её. Несколько —
+        решает колонка «Компания» через алиасы из accounts.toml.
+
+        Пустая и незнакомая ячейка обрабатываются ОДИНАКОВО, и это осознанно:
+        в обоих случаях мы не знаем, чей это заказ, а цена неверной догадки —
+        сообщение клиенту одной компании от лица другой. Подставить сюда
+        компанию по умолчанию значит превратить забытую ячейку в чужое письмо.
         """
-        if not self.shared:
-            return True
-        mark = str(row.get(COMPANY_COLUMN, "") or "").strip().lower()
-        if not mark:
-            return self.code == DEFAULT_CODE
-        return mark in (self.code.lower(), str(getattr(self.account, "name", "")).lower())
+        if not self.multi:
+            return self.primary
+        # ищем среди ВСЕХ компаний, включая выключенные: строка «max» при
+        # неактивной компании MAX — это опознанная строка, а не загадка
+        return accounts_cfg.resolve_by_alias(row.get(COMPANY_COLUMN), self.accounts)
 
     async def loop(self) -> None:
         while True:
@@ -172,24 +192,43 @@ class SheetSync:
         writes: list[tuple[int, int, str]] = []   # (row, col, value) — проставить ID новым строкам
         id_col = header.index("ID") + 1 if "ID" in header else None
 
+        unresolved: list[tuple[int, str, str]] = []   # (строка, клиент, ячейка)
+
         # фаза 2: только БД, без сетевых вызовов внутри сессии
         async with Session() as s:
             for i, row in enumerate(rows, start=2):
-                if not self._row_is_mine(row):
-                    continue          # чужая компания в общей таблице
+                company = self.resolve_company(row)
+                if company is None:
+                    # Не знаем, чей это заказ. Пустую строку пропускаем молча —
+                    # она просто ещё не заполнена; заполненную выносим владельцу
+                    if str(row.get("Клиент", "")).strip() or _num(row.get("ID"), int):
+                        unresolved.append((i, str(row.get("Клиент", "")).strip(),
+                                           str(row.get(COMPANY_COLUMN, "") or "").strip()))
+                    continue
+
+                account_id = self.account_ids.get(company.code)
+                if account_id is None:
+                    log.error("компания %r есть в accounts.toml, но не заведена в БД — "
+                              "строка %s пропущена", company.code, i)
+                    continue
+
                 pid = _num(row.get("ID"), int)
                 proj = await s.get(Project, pid) if pid else None
-                if proj is not None and self.account_id and proj.account_id != self.account_id:
+                if proj is not None and proj.account_id != account_id:
                     # Проект уже принадлежит другой компании. Перетащить его
-                    # сюда молча — это увести заказ между юрлицами по опечатке
-                    # в колонке ID. Не трогаем и говорим вслух
-                    log.error("строка %s таблицы %s ссылается на проект %s чужой "
-                              "компании — пропущена", i, self.code, pid)
+                    # молча — это увести заказ между юрлицами по опечатке
+                    # в колонке ID или «Компания». Не трогаем и говорим вслух
+                    log.error("строка %s: проект %s принадлежит другой компании, "
+                              "а в колонке «%s» стоит %r — строка пропущена, "
+                              "проект не тронут",
+                              i, pid, COMPANY_COLUMN, row.get(COMPANY_COLUMN))
+                    unresolved.append((i, str(row.get("Клиент", "")).strip(),
+                                       f"{row.get(COMPANY_COLUMN)} (конфликт с проектом {pid})"))
                     continue
                 if proj is None:
                     if not str(row.get("Клиент", "")).strip():
                         continue
-                    proj = Project(account_id=self.account_id)
+                    proj = Project(account_id=account_id)
                     s.add(proj)
                     await s.flush()
                     if id_col:
@@ -207,8 +246,10 @@ class SheetSync:
                 if proj.status == "new" and proj.chat_ref:
                     proj.status = "briefing"
                 proj.updated_at = utcnow()
-                await _link_numeric_chat(s, proj)
+                await _link_numeric_chat(s, proj, company.transport)
             await s.commit()
+
+        await self._ask_about_unresolved(unresolved)
 
         # фаза 3: единственная запись в твою колонку — ID у новых строк,
         # без него бот не свяжет строку с проектом
@@ -216,6 +257,37 @@ class SheetSync:
             await asyncio.to_thread(
                 ws.batch_update,
                 [{"range": gspread.utils.rowcol_to_a1(r, c), "values": [[v]]} for r, c, v in writes])
+
+    async def _ask_about_unresolved(self, rows: list[tuple[int, str, str]]) -> None:
+        """Строки, чью компанию не опознали, — вопросом владельцу, одним списком.
+
+        Не по сообщению на строку: заполнил человек десяток заказов, не глядя
+        на колонку, — и получил бы десять уведомлений. И не молча: строка,
+        которую синк тихо пропускает, выглядит как «бот не работает», а на
+        самом деле её просто некому отдать.
+
+        Повторно про ту же строку не спрашиваем — синк крутится раз в минуту.
+        """
+        fresh = [r for r in rows if f"{r[0]}:{r[2]}" not in self._asked]
+        if not fresh:
+            return
+        for row in fresh:
+            self._asked.add(f"{row[0]}:{row[2]}")
+
+        known = ", ".join(sorted({a.title for a in self.accounts})) or "—"
+        lines = [f"  строка {i}: «{client or 'без клиента'}» — в колонке "
+                 f"«{COMPANY_COLUMN}» {('стоит ' + repr(cell)) if cell else 'пусто'}"
+                 for i, client, cell in fresh]
+        text = (f"Не понял, чьи это заказы, и поэтому не трогал их:\n"
+                + "\n".join(lines)
+                + f"\n\nДопустимые значения: {known}.\n"
+                  f"Угадывать не буду: ошибка тут — это сообщение клиенту "
+                  f"одной компании от лица другой.")
+        log.error("строк с неопознанной компанией: %s (владельцу отправлен список)",
+                  len(fresh))
+        notify = getattr(self.communicator, "notify_owner", None)
+        if notify is not None:
+            await notify(text)
 
     # ---------- БД → таблица ----------
 
@@ -234,10 +306,13 @@ class SheetSync:
 
         async with Session() as s:
             q = select(Project).where(Project.sheet_row.isnot(None))
-            if self.account_id:
-                # без этого фильтра синк разложил бы проекты одной компании
-                # по строкам таблицы другой: sheet_row у них свой на таблицу
-                q = q.where(Project.account_id == self.account_id)
+            mine = [i for i in (self.account_ids.get(a.code) for a in self.accounts)
+                    if i is not None]
+            if mine:
+                # Фильтр по компаниям ЭТОЙ таблицы. Без него синк разложил бы
+                # проекты чужой таблицы по своим строкам: sheet_row нумеруется
+                # внутри листа, и строка 7 у Qorsa и у Hustle — разные заказы
+                q = q.where(Project.account_id.in_(mine))
             projects = (await s.execute(q)).scalars().all()
             progress = await self._progress_map(s)
             waiting = await self._waiting_map(s)
@@ -285,10 +360,14 @@ class SheetSync:
         return {pid: f"{int(done or 0)}/{total}" for pid, total, done in rows}
 
 
-async def _link_numeric_chat(s, proj: Project) -> None:
+async def _link_numeric_chat(s, proj: Project, default_transport: str = "telegram") -> None:
     """Если менеджер вписал не @username, а готовый chat_id — привязываем сразу.
-    Для @username привязка случится по первому входящему сообщению."""
-    parsed = parse_chat_ref(proj.chat_ref or "")
+    Для @username привязка случится по первому входящему сообщению.
+
+    `default_transport` — основной мессенджер КОМПАНИИ проекта: без него
+    заказ компании MAX получил бы telegram-канал по умолчанию.
+    """
+    parsed = parse_chat_ref(proj.chat_ref or "", default_transport)
     if not parsed:
         return
     transport, handle = parsed
