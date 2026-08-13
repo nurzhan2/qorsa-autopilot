@@ -35,6 +35,7 @@ log = logging.getLogger("ingest")
 
 BIND_HINT = "/bind"
 DONE_HINT = "/done"
+CONFIRM_HINT = "/confirm"
 
 GROUP_TYPES = ("group", "supergroup", "chat")
 
@@ -153,6 +154,8 @@ class Ingest:
         if await self._maybe_bind_command(msg):
             return row
         if await self._maybe_done_command(msg):
+            return row
+        if await self._maybe_confirm_command(msg):
             return row
 
         if project_id is None:
@@ -368,6 +371,27 @@ class Ingest:
         else:
             body = "\n".join(f"  ✗ {d}" for d in defects)
             await self._warn_owner(f"Задача {parts[1]} НЕ принята:\n{body}")
+        return True
+
+    async def _maybe_confirm_command(self, msg: InboundMessage) -> bool:
+        """`/confirm 17` от владельца: закрыть задачу, которую машина не приняла.
+
+        Отдельная команда, а не флаг у `/done`, именно потому, что это другое
+        действие. `/done` — «я сделал, проверь». `/confirm` — «проверок,
+        которым можно верить, нет, закрываю под свою ответственность».
+        Смешать их значит стереть разницу, ради которой всё это заводилось.
+        """
+        text = (msg.text or "").strip()
+        if not text.startswith(CONFIRM_HINT) or str(msg.chat_id) != str(cfg.tg_owner):
+            return False
+        parts = text.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            await self._warn_owner(f"Не понял: «{text}». Формат — «{CONFIRM_HINT} 17».")
+            return True
+
+        from .manual import confirm
+        ok, message = await confirm(int(parts[1]))
+        await self._warn_owner(message)
         return True
 
     async def _report_unbound(self, msg: InboundMessage) -> None:

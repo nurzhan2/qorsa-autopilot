@@ -27,6 +27,7 @@ except (AttributeError, ValueError):
 
 from sqlalchemy import func, select                                   # noqa: E402
 
+from autopilot import checks                                       # noqa: E402
 from autopilot.config import cfg                                      # noqa: E402
 from autopilot.db import AccessItem, ChatMessage, Project, Session, Task, init_db  # noqa: E402
 from autopilot.planner import DETERMINISTIC_CHECKS, Planner           # noqa: E402
@@ -62,6 +63,36 @@ def show_tasks(tasks: list[dict]) -> None:
             selector = f" [{check['selector']}]" if check.get("selector") else ""
             expect = f" → {check['expect']}" if check.get("expect") else ""
             print(f"    {mark} {kind}: {detail}{selector}{expect}")
+            # критерий обязан ПАДАТЬ на состоянии «задача не сделана».
+            # Тот, что проходит на пустом проекте, создаёт видимость приёмки
+            why = checks.suspicious(check)
+            if why:
+                print(f"       ⚠ пройдёт и без этой задачи: {why}")
+
+
+def show_suspicious(tasks: list[dict]) -> None:
+    """Отдельным блоком — иначе тонет в общем выводе плана.
+
+    Это эвристика и подсказка человеку, а не запрет: код такие критерии
+    не выбрасывает. Смысл списка — показать, где зелёная приёмка ничего
+    не доказывает, ДО того, как по плану начнут работать.
+    """
+    rows = []
+    for t in tasks:
+        for check in t["acceptance"]:
+            why = checks.suspicious(check)
+            if why:
+                rows.append((t["title"], check.get("type"), why))
+
+    print(f"\n{LINE}\nКРИТЕРИИ, КОТОРЫЕ ПРОЙДУТ НА ПУСТОМ ПРОЕКТЕ ({len(rows)})\n{LINE}")
+    if not rows:
+        print("  (не нашлось — но эвристика ловит только грубые случаи)")
+        return
+    for title, kind, why in rows:
+        print(f"  ⚠ {title}")
+        print(f"      {kind}: {why}")
+    checked = sum(len(t["acceptance"]) for t in tasks)
+    print(f"\n  {len(rows)} из {checked} критериев ничего не доказывают")
 
 
 def show_graph(tasks: list[dict], order: list[str]) -> None:
@@ -92,9 +123,21 @@ def show_stats(stats: dict) -> None:
         share = count / total * 100 if total else 0
         print(f"    {EXEC_MARK.get(name, name):20s} {count:3d}  ({share:.0f}%)")
     verdict = "годится для автопилота" if stats["suitable"] else "МАЛОПРИГОДЕН для автопилота"
-    print(f"\n  автономно закрывается: {stats['auto_ratio'] * 100:.0f}% "
-          f"(порог {cfg.autonomy_min_ratio * 100:.0f}%) — {verdict}")
+    # Две цифры отвечают на разные вопросы, и одна без другой врёт.
+    # Пятнадцать мелких ручных задач против одной большой автоматической
+    # дают 7% по количеству и могут давать 70% по времени
+    print(f"\n  автономно закрывается:")
+    print(f"    по числу задач:  {stats['auto_ratio'] * 100:3.0f}%   "
+          f"({stats['autonomous']} из {total} задач)")
+    print(f"    по времени:      {stats['auto_ratio_time'] * 100:3.0f}%   "
+          f"({stats['minutes_auto']} из {stats['minutes']} мин)")
+    if not stats["minutes"]:
+        print("      (оценок времени в плане нет — вторая цифра не считается)")
+    print(f"\n  порог {cfg.autonomy_min_ratio * 100:.0f}%, берётся ЛУЧШАЯ из двух "
+          f"— {verdict}")
     print("  считается как задачи, которые агент и сделает, и проверит сам")
+    print("  (assisted не входит: там вердикт выносит модель, и такая задача\n"
+          "   не закрывается без подтверждения владельца)")
 
 
 def show_notes(notes: list[str]) -> None:
@@ -134,6 +177,7 @@ async def run(project_id: int) -> int:
 
     show_tasks(result["tasks"])
     show_graph(result["tasks"], result["order"])
+    show_suspicious(result["tasks"])
     show_notes(result["notes"])
     show_stats(result["stats"])
     print()

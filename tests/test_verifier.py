@@ -10,11 +10,11 @@ from sqlalchemy import select
 
 from autopilot import checks, manual
 from autopilot.db import Project, Session, Task
-from autopilot.fakes import FakeExecutor
+from autopilot.fakes import FakeExecutor, FakeVerifier
 from autopilot.manual import NEEDS_HUMAN
 from autopilot.planner import autonomy, classify
 from autopilot.scheduler import Scheduler
-from autopilot.verifier import Verifier
+from autopilot.verifier import Verdict, Verifier
 
 # страница с блоком, который дорисовывает скрипт: по сырому HTML его не видно
 JS_PAGE = (
@@ -77,24 +77,28 @@ async def test_no_checks_is_failure(db):
     v = Verifier()
 
     empty = await make_task(p.id, [])
-    ok, defects = await v.run(empty, p)
+    verdict = await v.run(empty, p)
+    ok, defects = verdict.ok, verdict.defects
     assert ok is False
     assert any("нет ни одной исполнимой проверки" in d for d in defects)
 
     unknown = await make_task(p.id, [{"type": "playwright_magic", "cmd": "x"}])
-    ok, defects = await v.run(unknown, p)
+    verdict = await v.run(unknown, p)
+    ok, defects = verdict.ok, verdict.defects
     assert ok is False
     assert any("неизвестный тип" in d for d in defects)
 
     # критерий без обязательного поля — тоже не проверка
     broken = await make_task(p.id, [{"type": "shell"}])
-    ok, defects = await v.run(broken, p)
+    verdict = await v.run(broken, p)
+    ok, defects = verdict.ok, verdict.defects
     assert ok is False
     assert any("не запустится" in d for d in defects)
 
     # human честно говорит, что машина не судья
     human = await make_task(p.id, [{"type": "human", "criteria": "нравится дизайн"}])
-    ok, defects = await v.run(human, p)
+    verdict = await v.run(human, p)
+    ok, defects = verdict.ok, verdict.defects
     assert ok is False
     assert any("human:" in d for d in defects)
 
@@ -189,14 +193,21 @@ def test_screenshot_class():
 # ---------- ручные задачи ----------
 
 class OkVerifier:
-    def __init__(self, ok=True, defects=None):
+    """Заглушка судьи. deterministic=1 по умолчанию — изображаем настоящую
+    проверку, а не «модель посмотрела и одобрила»: иначе тест про ручную
+    приёмку молча проверял бы совсем другой сценарий."""
+
+    def __init__(self, ok=True, defects=None, assisted_only=False):
         self.ok = ok
         self.defects = defects or ["критерий не прошёл"]
+        self.assisted_only = assisted_only
         self.calls = 0
 
     async def run(self, task, project):
         self.calls += 1
-        return (True, []) if self.ok else (False, list(self.defects))
+        det, ast = (0, 1) if self.assisted_only else (1, 0)
+        return Verdict(ok=self.ok, defects=[] if self.ok else list(self.defects),
+                       deterministic=det, assisted=ast)
 
 
 async def test_manual_task_verified(db):
@@ -272,3 +283,138 @@ def test_autonomy_by_time():
     # без оценок времени вторая цифра не выдумывается
     no_time = [{"verify_class": "auto", "executor": "claude_code", "estimate_min": 0}]
     assert autonomy(no_time)["auto_ratio_time"] == 0.0
+
+
+# ---------- assisted != детерминированная приёмка ----------
+
+def test_verdict_splits_evidence():
+    """Вердикт различает, КТО его вынес: код или модель."""
+    both = Verdict(ok=True, defects=[], deterministic=2, assisted=1)
+    assert both.confirmed is True and both.assisted_only is False
+
+    # одна модель и ничего больше — не приёмка
+    soft = Verdict(ok=True, defects=[], deterministic=0, assisted=3)
+    assert soft.confirmed is False and soft.assisted_only is True
+
+    # провал остаётся провалом при любом составе проверок
+    bad = Verdict(ok=False, defects=["сломано"], deterministic=1, assisted=1)
+    assert bad.confirmed is False and bad.assisted_only is False
+
+
+async def test_verifier_counts_by_source(db, tmp_path):
+    """Счётчики набираются из реестра, а не из головы."""
+    p = await make_project()
+    (tmp_path / "style.css").write_text("body{}", encoding="utf-8")
+    async with Session() as s:
+        pr = await s.get(Project, p.id)
+        pr.workspace = str(tmp_path)
+        await s.commit()
+        p = await s.get(Project, p.id)
+
+    task = await make_task(p.id, [
+        {"type": "file_exists", "path": "style.css"},
+        {"type": "dom", "url": JS_PAGE, "selector": "#static"},
+    ])
+    verdict = await Verifier().run(task, p)
+    assert verdict.deterministic == 2 and verdict.assisted == 0
+    assert verdict.confirmed is True
+
+
+async def test_assisted_only_task_is_not_closed_automatically(db):
+    """Задача, прошедшая только на слово модели, не становится done сама.
+
+    Это главное отличие фазы 5.1: раньше вердикт по скриншоту попадал
+    в статус задачи неотличимо от зелёного теста.
+    """
+    p = await make_project()
+    task = await make_task(p.id, [{"type": "screenshot", "url": "https://x/",
+                                   "criteria": "каталог в три колонки"}],
+                           verify_class="assisted")
+
+    comm = FakeCommunicator()
+    sched = Scheduler(FakeExecutor(), FakeVerifier(assisted_only=True), comm)
+    await sched.tick()
+    await sched.drain()
+
+    async with Session() as s:
+        row = await s.get(Task, task.id)
+    assert row.status == NEEDS_HUMAN, "assisted-приёмка закрыла задачу сама"
+    assert row.attempts == 0, "это не провал: пересобирать нечего"
+    assert manual.ASSISTED_ONLY in row.defects
+    assert manual.waits_for_confirmation(row) is True
+    # и клиенту про готовность не рапортуем, пока владелец не подтвердил
+    assert not comm.done, "отчёт клиенту ушёл до подтверждения"
+    # зато владельцу сказали, что от него ждут решения
+    assert any(f"/confirm {task.id}" in n for n in comm.owner_notes)
+
+
+async def test_deterministic_pass_still_closes_task(db):
+    """Обратная сторона: настоящая проверка по-прежнему закрывает задачу сама."""
+    p = await make_project()
+    task = await make_task(p.id, [{"type": "shell", "cmd": "echo ok"}])
+
+    sched = Scheduler(FakeExecutor(), FakeVerifier(), FakeCommunicator())
+    await sched.tick()
+    await sched.drain()
+
+    async with Session() as s:
+        row = await s.get(Task, task.id)
+    assert row.status == "done"
+
+
+async def test_manual_submit_assisted_only_asks_for_confirmation(db):
+    """И для человека правило то же: его слово плюс мнение модели — не критерий."""
+    p = await make_project()
+    task = await make_task(p.id, [{"type": "llm", "criteria": "выглядит прилично"}],
+                           executor="manual", verify_class="assisted")
+
+    v = OkVerifier(ok=True, assisted_only=True)
+    ok, defects = await manual.submit(task.id, v)
+
+    assert ok is False, "приняли по одному мнению модели"
+    assert any("подтвердить" in d for d in defects)
+    async with Session() as s:
+        row = await s.get(Task, task.id)
+    assert row.status == NEEDS_HUMAN
+
+
+async def test_confirm_closes_task_and_records_who(db):
+    """Подтверждение владельца закрывает задачу, но остаётся в истории как
+    подтверждение, а не как пройденная приёмка."""
+    p = await make_project()
+    task = await make_task(p.id, [{"type": "llm", "criteria": "прилично"}],
+                           executor="manual", verify_class="assisted")
+    await manual.submit(task.id, OkVerifier(ok=True, assisted_only=True))
+
+    ok, message = await manual.confirm(task.id)
+    assert ok is True
+    async with Session() as s:
+        row = await s.get(Task, task.id)
+    assert row.status == "done"
+    assert "владельцем" in row.last_error, "не видно, что задачу закрыл человек"
+
+
+async def test_confirm_refuses_live_task(db):
+    """`/confirm` на работающей задаче — это прыжок через приёмку, а не приёмка."""
+    p = await make_project()
+    task = await make_task(p.id, [{"type": "shell", "cmd": "true"}])
+
+    ok, message = await manual.confirm(task.id)
+    assert ok is False
+    assert "подтверждать нечего" in message
+    async with Session() as s:
+        row = await s.get(Task, task.id)
+    assert row.status == "ready"
+
+
+def test_autonomy_counts_only_fully_autonomous():
+    """Проверяемая машиной задача, которую делают руками, автономной не является."""
+    tasks = [
+        {"verify_class": "auto", "executor": "claude_code", "estimate_min": 10},
+        # критерий машинный, но кликать в админке всё равно человеку
+        {"verify_class": "auto", "executor": "manual", "estimate_min": 10},
+    ]
+    stats = autonomy(tasks)
+    assert stats["autonomous"] == 1
+    assert stats["by_class"]["auto"] == 2, "по классу их двое, а автономна одна"
+    assert stats["auto_ratio"] == 0.5

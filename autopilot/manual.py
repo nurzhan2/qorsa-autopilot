@@ -28,6 +28,12 @@ log = logging.getLogger("manual")
 # статус задачи, которую машина принять не может и не притворяется
 NEEDS_HUMAN = "needs_human"
 
+# Задача прошла, но все проверки были assisted: вердикт вынесла модель.
+# Это не дефект работы — это дефект ДОКАЗАТЕЛЬСТВА, и закрывать по нему
+# задачу автоматически нельзя (см. verifier.Verdict)
+ASSISTED_ONLY = ("принять автоматически нечем: прошли только проверки с моделью "
+                 "(screenshot/llm), детерминированных нет — нужно твоё подтверждение")
+
 
 def needs_human(defects: list[str]) -> bool:
     """Провал из-за того, что проверять нечем, а не из-за плохого кода.
@@ -95,9 +101,22 @@ async def report(project_id: int | None = None) -> str:
         if t.project_id != current:
             current = t.project_id
             out.append(f"\n=== {titles.get(current, current)} ===")
-        flag = "  [ЖДЁТ РАЗБОРА]" if t.status == NEEDS_HUMAN else ""
-        out.append(describe(t) + flag)
+        out.append(describe(t) + _flag(t))
     return "\n".join(out).strip()
+
+
+def waits_for_confirmation(task: Task) -> bool:
+    """Задача ждёт не работы, а подтверждения: проверки прошли, но все assisted."""
+    return task.status == NEEDS_HUMAN and ASSISTED_ONLY in (task.defects or [])
+
+
+def _flag(task: Task) -> str:
+    if waits_for_confirmation(task):
+        # разница существенная: тут делать нечего, надо только решить
+        return f"\n    [ЖДЁТ ПОДТВЕРЖДЕНИЯ — проверено только моделью, /confirm {task.id}]"
+    if task.status == NEEDS_HUMAN:
+        return "\n    [ЖДЁТ РАЗБОРА]"
+    return ""
 
 
 async def submit(task_id: int, verifier) -> tuple[bool, list[str]]:
@@ -131,13 +150,58 @@ async def submit(task_id: int, verifier) -> tuple[bool, list[str]]:
                 reasons.append(f"{s_.kind}: {check.get('criteria')}")
         return False, (["принять нечем: исполнимых критериев нет"] + reasons)
 
-    ok, defects = await verifier.run(task, project)
-    await _set_status(task_id, "done" if ok else NEEDS_HUMAN, defects)
-    if ok:
-        log.info("задача %s принята: все критерии прошли", task_id)
-    else:
-        log.warning("задача %s не принята: %s", task_id, "; ".join(defects)[:300])
-    return ok, defects
+    verdict = await verifier.run(task, project)
+    if verdict.confirmed:
+        await _set_status(task_id, "done", verdict.defects)
+        log.info("задача %s принята: все критерии прошли (%s)", task_id, verdict.summary())
+        return True, []
+
+    if verdict.assisted_only:
+        # Работа, возможно, сделана хорошо — но доказательства этому нет.
+        # Отметка человека плюс мнение модели по-прежнему не критерий
+        await _set_status(task_id, NEEDS_HUMAN, [ASSISTED_ONLY])
+        log.warning("задача %s ждёт подтверждения владельца: %s",
+                    task_id, verdict.summary())
+        return False, [ASSISTED_ONLY, f"подтвердить: /confirm {task_id}"]
+
+    await _set_status(task_id, NEEDS_HUMAN, verdict.defects)
+    log.warning("задача %s не принята: %s", task_id, "; ".join(verdict.defects)[:300])
+    return False, verdict.defects
+
+
+async def confirm(task_id: int) -> tuple[bool, str]:
+    """Владелец берёт вердикт на себя и закрывает задачу.
+
+    Это НЕ приёмка машиной, и притворяться ею не надо: сюда попадают задачи,
+    которые машина закрыть отказалась — обычно потому, что все проверки
+    оказались assisted. Решение человека законно, но оно должно быть явным
+    действием и остаться в истории, а не выглядеть как зелёный тест.
+
+    Поэтому подтвердить можно только то, что действительно ждёт человека:
+    `/confirm` на живой задаче — это попытка перепрыгнуть приёмку, а не
+    закрыть её.
+    """
+    async with Session() as s:
+        task = await s.get(Task, task_id)
+        if task is None:
+            return False, f"нет задачи {task_id}"
+        if task.status == "done":
+            return True, f"задача {task_id} и так закрыта"
+        if task.status != NEEDS_HUMAN:
+            return False, (f"задача {task_id} в статусе {task.status!r}, а не "
+                           f"{NEEDS_HUMAN!r} — подтверждать нечего. "
+                           f"Отметить выполненной — /done {task_id}")
+        was = list(task.defects or [])
+        task.status = "done"
+        # что именно перекрыто рукой — иначе через месяц не отличишь
+        # подтверждённое от проверенного
+        task.last_error = "закрыто владельцем вручную; машина не приняла: " + \
+                          ("; ".join(was)[:400] or "причина не записана")
+        task.updated_at = utcnow()
+        await s.commit()
+    log.warning("задача %s закрыта подтверждением владельца, а не проверками: %s",
+                task_id, "; ".join(was)[:200])
+    return True, f"задача {task_id} закрыта под твою ответственность"
 
 
 async def _set_status(task_id: int, status: str, defects: list[str] | None = None) -> None:

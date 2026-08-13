@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses as dc
 import json
 import logging
 import os
@@ -12,7 +13,7 @@ from pathlib import Path
 import httpx
 
 from .checks import (DEFAULT_TIMEOUT_SEC, HUMAN_ONLY, REGISTRY, VIEWPORTS,
-                     is_runnable)
+                     is_runnable, spec)
 from .config import cfg
 from .db import Project, Run, Session, Task
 from .vault import anthropic_key, missing_secret_message
@@ -36,6 +37,47 @@ JUDGE_PROMPT = """Ты приёмщик работы. Твоя задача — 
 """
 
 SHELL_TIMEOUT_SEC = 600
+
+
+@dc.dataclass(frozen=True)
+class Verdict:
+    """Итог приёмки. Важно не только «прошло», но и ЧЕМ прошло.
+
+    `screenshot` и `llm` мы сами называем подсказкой: модель посмотрела на
+    картинку и сказала, что похоже на описанное. До этой правки такой вердикт
+    попадал в статус задачи неотличимо от зелёного теста — то есть оценка
+    модели по скриншоту приравнивалась к `npm run build` с кодом возврата 0.
+    Это неправда, и это ровно тот молчаливый пропуск, ради которого затевалась
+    вся фаза: задача выглядела принятой, хотя ничего детерминированного её
+    не проверяло.
+
+    Поэтому счётчики раздельные, а решение о статусе принимает вызывающий код
+    по двум свойствам ниже. Сам верификатор статусов не ставит: он сообщает
+    факты, последнее слово — за кодом, который эти факты читает.
+    """
+
+    ok: bool
+    defects: list[str]
+    # сколько проверок РЕАЛЬНО исполнено, по видам вердикта
+    deterministic: int = 0      # shell / http / file_exists / dom — судит код
+    assisted: int = 0           # screenshot / llm — судит модель
+
+    @property
+    def confirmed(self) -> bool:
+        """Прошла так, что машине можно верить: есть хоть одна проверка,
+        вердикт которой вынес код, а не модель. Только это закрывает задачу
+        автоматически."""
+        return self.ok and self.deterministic > 0
+
+    @property
+    def assisted_only(self) -> bool:
+        """Прошла, но целиком на слово модели. Не провал и не приёмка —
+        задача уходит владельцу на подтверждение."""
+        return self.ok and self.deterministic == 0 and self.assisted > 0
+
+    def summary(self) -> str:
+        return (f"детерминированных проверок: {self.deterministic}, "
+                f"с моделью: {self.assisted}")
 
 # Цены судьи за миллион токенов. Заданы руками: SDK их не отдаёт, а без них
 # стоимость приёмки не попадает в суточный бюджет. Держи в актуальном состоянии.
@@ -74,10 +116,13 @@ class Verifier:
             "human": self._check_human,
         }
 
-    async def run(self, task: Task, project: Project) -> tuple[bool, list[str]]:
+    async def run(self, task: Task, project: Project) -> Verdict:
         cwd = project.workspace or str(cfg.workspaces / f"p{project.id}")
         defects: list[str] = []
         executed = 0
+        # считаем раздельно: кто вынес вердикт — код или модель
+        deterministic = 0
+        assisted = 0
 
         for check in task.acceptance or []:
             if not isinstance(check, dict):
@@ -106,6 +151,14 @@ class Verifier:
             except Exception as e:
                 ok, msg = False, f"{kind}: {e}"
             executed += 1
+            # проверка исполнена — записываем, чьим вердиктом она закрыта.
+            # Считаем даже упавшую: счётчик отвечает на вопрос «чем эту задачу
+            # вообще проверяют», а не «что прошло»
+            s = spec(kind)
+            if s is not None and s.deterministic:
+                deterministic += 1
+            elif s is not None and s.assisted:
+                assisted += 1
             if not ok:
                 defects.append(msg)
 
@@ -114,7 +167,8 @@ class Verifier:
             # это «проверить нечем» — и оно не может считаться приёмкой
             defects.append("нет ни одной исполнимой проверки — принять задачу нечем")
 
-        return (not defects), defects
+        return Verdict(ok=not defects, defects=defects,
+                       deterministic=deterministic, assisted=assisted)
 
     # --- обёртки под единый контракт (check, cwd, task, project) ---
 

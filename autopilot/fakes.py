@@ -11,6 +11,7 @@ import logging
 import random
 
 from .db import Project, Task
+from .verifier import Verdict
 
 log = logging.getLogger("fake")
 
@@ -42,17 +43,29 @@ class FakeExecutor:
 
 
 class FakeVerifier:
-    """Приёмка без судьи: по умолчанию всё проходит."""
+    """Приёмка без судьи: по умолчанию всё проходит.
 
-    def __init__(self, ok: bool = True, defects: list[str] | None = None, delay: float = 0.0):
+    По умолчанию изображает ДЕТЕРМИНИРОВАННУЮ проверку (deterministic=1).
+    Иначе фейк молча воспроизводил бы режим «прошло только с моделью», и
+    задачи в тестах планировщика уходили бы в needs_human вместо done —
+    то есть фейк проверял бы не то, что от него хотят. Для самого этого
+    режима есть `assisted_only=True`.
+    """
+
+    def __init__(self, ok: bool = True, defects: list[str] | None = None,
+                 delay: float = 0.0, assisted_only: bool = False):
         self.ok = ok
         self.defects = defects or ["fake defect"]
         self.delay = delay
+        self.assisted_only = assisted_only
         self.calls: list[int] = []
 
-    async def run(self, task: Task, project: Project) -> tuple[bool, list[str]]:
+    async def run(self, task: Task, project: Project) -> Verdict:
         self.calls.append(task.id)
         log.info("приёмка: проект %s / задача %s", project.id, task.title)
         if self.delay:
             await asyncio.sleep(self.delay)
-        return (True, []) if self.ok else (False, list(self.defects))
+        det, ast = (0, 1) if self.assisted_only else (1, 0)
+        return Verdict(ok=self.ok,
+                       defects=[] if self.ok else list(self.defects),
+                       deterministic=det, assisted=ast)
