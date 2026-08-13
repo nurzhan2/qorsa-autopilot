@@ -6,14 +6,18 @@
     python scripts/brief_eval.py --list                 # что есть в базе
     python scripts/brief_eval.py --project 1            # прогнать и показать
     python scripts/brief_eval.py --project 1 --stub     # без вызова модели
-    python scripts/brief_eval.py --project 1 --save     # закрепить как эталон
-    python scripts/brief_eval.py --project 1 --compare  # сверить с эталоном
+    python scripts/brief_eval.py --project 1 --draft    # черновик эталона требований
 
 `--stub` подставляет вместо модели грубый детерминированный экстрактор.
 Он НЕ показывает качество модели — он прогоняет весь тракт (evidence, роли,
 запрет на деньги, доступы, вопросы) там, где ключа нет.
 
-Эталоны лежат в tests/fixtures/briefs/<project>.json.
+ЭТАЛОН — это список требований к чату, написанный РУКАМИ, в свободной форме:
+tests/fixtures/briefs/<project>.requirements.txt, одно требование в строке.
+Сверка отвечает на вопрос «покрыто ли требование хоть одним пунктом брифа»,
+а не «совпадает ли текст»: сравнивать свободные формулировки построчно
+бессмысленно, модель каждый раз пишет их иначе. Сопоставляет отдельный
+дешёвый вызов модели, вердикты — covered / partial / missing.
 """
 from __future__ import annotations
 
@@ -35,7 +39,8 @@ except (AttributeError, ValueError):
 from sqlalchemy import func, select                                    # noqa: E402
 
 from autopilot.brief import (LIST_FIELDS, ORIGIN_CONFIRMED, Brief,      # noqa: E402
-                             _msg_key, agreement)
+                             _msg_key, agreement, check_coverage,
+                             missing_items, parse_requirements)
 from autopilot.config import cfg                                       # noqa: E402
 from autopilot.db import ChatMessage, Project, Session, init_db        # noqa: E402
 from autopilot.vault import (anthropic_key, anthropic_key_source,      # noqa: E402
@@ -153,7 +158,22 @@ async def show_chat(project_id: int) -> list[ChatMessage]:
 
 
 def _mark(item: dict) -> str:
-    return "   ⚑ ПОДТВЕРЖДЁННОЕ ПРЕДЛОЖЕНИЕ" if item.get("origin") == ORIGIN_CONFIRMED else ""
+    bits = []
+    if item.get("origin") == ORIGIN_CONFIRMED:
+        bits.append("⚑ ПОДТВЕРЖДЁННОЕ ПРЕДЛОЖЕНИЕ")
+    if item.get("missing"):
+        bits.append("⧗ не подтверждён последним прогоном")
+    return ("   " + "  ".join(bits)) if bits else ""
+
+
+def _tag(item: dict) -> str:
+    """Приоритет и в скольких прогонах из N пункт встретился."""
+    bits = []
+    if item.get("priority"):
+        bits.append(item["priority"])
+    if item.get("samples"):
+        bits.append(f"прогонов {item['samples']}")
+    return f"  [{', '.join(bits)}]" if bits else ""
 
 
 def show_brief(data: dict) -> None:
@@ -169,7 +189,9 @@ def show_brief(data: dict) -> None:
         print(f"\n  {field.upper()} ({len(items)}):")
         for item in items:
             label = item.get("text") or f"{item.get('kind')}: {item.get('name')}"
-            print(f"    • {label}{_mark(item)}")
+            print(f"    • {label}{_tag(item)}{_mark(item)}")
+            if item.get("priority_reason"):
+                print(f"      модальность: {item['priority_reason']}")
             print(f"      evidence: {', '.join(item.get('evidence', []))}")
     if data.get("unreadable"):
         print(f"\n  НЕ ПРОЧИТАНО ({len(data['unreadable'])}):")
@@ -217,33 +239,64 @@ def show_dropped(project: Project) -> None:
         print("  (ничего — все пункты подтверждены словами клиента)")
 
 
-def compare(current: dict, golden: dict) -> int:
-    print(f"\n{LINE}\nСРАВНЕНИЕ С ЭТАЛОНОМ\n{LINE}")
-    diffs = 0
-    for field in ("goal",) + LIST_FIELDS:
-        if field == "goal":
-            a = (current.get("goal") or {}).get("text")
-            b = (golden.get("goal") or {}).get("text")
-            if a != b:
-                diffs += 1
-                print(f"  ≠ goal:\n      было:  {b}\n      стало: {a}")
-            continue
-        a = {(i.get("text") or i.get("name") or "").strip().lower()
-             for i in (current.get(field) or [])}
-        b = {(i.get("text") or i.get("name") or "").strip().lower()
-             for i in (golden.get(field) or [])}
-        for lost in sorted(b - a):
-            diffs += 1
-            print(f"  − {field}: пропало «{lost}»")
-        for added in sorted(a - b):
-            diffs += 1
-            print(f"  + {field}: появилось «{added}»")
-    if not diffs:
-        print("  совпадает с эталоном полностью")
-    return diffs
+VERDICT_MARK = {"covered": "✓", "partial": "~", "missing": "✗"}
 
 
-async def run(project_id: int, stub: bool, save: bool, do_compare: bool) -> int:
+def show_missing(data: dict) -> None:
+    """Пункты, которых не было в последнем прогоне. Мы их не выбрасываем."""
+    rows = missing_items(data)
+    print(f"\n{LINE}\n⧗ НЕ ПОДТВЕРЖДЕНЫ ПОСЛЕДНИМ ПРОГОНОМ ({len(rows)})\n{LINE}")
+    if not rows:
+        print("  (нет: всё, что было, подтвердилось снова)")
+        return
+    print("  Модель не вернула их в этот раз. Пункт остаётся в брифе: молча")
+    print("  терять требование нельзя, а убрать его может только отказ клиента")
+    print("  или ты сам.\n")
+    for field, item in rows:
+        label = item.get("text") or f"{item.get('kind')}: {item.get('name')}"
+        seen = item.get("seen_count", "?")
+        print(f"    • [{field}] {label}")
+        print(f"        видели раз: {seen}, впервые: {str(item.get('first_seen'))[:19]}")
+
+
+def show_coverage(results: list[dict]) -> int:
+    print(f"\n{LINE}\nПОКРЫТИЕ ЭТАЛОНА ({len(results)} требований)\n{LINE}")
+    if not results:
+        print("  (эталона нет — создать черновик: --draft)")
+        return 0
+    bad = 0
+    for r in results:
+        verdict = str(r.get("verdict", "partial"))
+        mark = VERDICT_MARK.get(verdict, "?")
+        if verdict != "covered":
+            bad += 1
+        print(f"  {mark} {r.get('requirement')}")
+        if r.get("matched"):
+            print(f"      → {r['matched']}")
+        if r.get("note") and verdict != "covered":
+            print(f"      причина: {r['note']}")
+    covered = len(results) - bad
+    print(f"\n  покрыто {covered} из {len(results)}")
+    return bad
+
+
+def draft_requirements(data: dict) -> str:
+    """Черновик эталона из текущего брифа — дальше правится руками."""
+    lines = ["# Требования к этому чату. Одно в строке, свободная форма.",
+             "# Это ЭТАЛОН: что обязано оказаться в ТЗ, а не что модель уже нашла.",
+             "# Правь руками — черновик собран из прогона и может быть неполным.",
+             ""]
+    goal = data.get("goal")
+    if isinstance(goal, dict) and goal.get("text"):
+        lines.append(goal["text"])
+    for field in ("deliverables", "constraints", "access_needed"):
+        for item in data.get(field) or []:
+            if isinstance(item, dict):
+                lines.append(item.get("text") or f"{item.get('kind')}: {item.get('name')}")
+    return "\n".join(lines) + "\n"
+
+
+async def run(project_id: int, stub: bool, draft: bool) -> int:
     await init_db()
     async with Session() as s:
         project = await s.get(Project, project_id)
@@ -266,7 +319,7 @@ async def run(project_id: int, stub: bool, save: bool, do_compare: bool) -> int:
         return 2
     else:
         print(f"\n[живая модель {cfg.brief_model}, ключ взят из: "
-              f"{anthropic_key_source()}]")
+              f"{anthropic_key_source()}, прогонов: {cfg.brief_samples}]")
         brief = Brief()
 
     # для eval всегда полный пересбор: смотреть надо на весь чат
@@ -283,23 +336,40 @@ async def run(project_id: int, stub: bool, save: bool, do_compare: bool) -> int:
 
     show_brief(data)
     show_confirmed(data)
+    show_missing(data)
     async with Session() as s:
         show_dropped(await s.get(Project, project_id))
 
-    fixture = FIXTURES / f"{project_id}.json"
-    if save:
+    fixture = FIXTURES / f"{project_id}.requirements.txt"
+    if draft:
         FIXTURES.mkdir(parents=True, exist_ok=True)
-        fixture.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"\nэталон сохранён: {fixture.relative_to(ROOT)}")
-    elif do_compare or fixture.exists():
-        if not fixture.exists():
-            print(f"\nэталона нет: {fixture.relative_to(ROOT)} (создать: --save)")
-        else:
-            golden = json.loads(fixture.read_text(encoding="utf-8"))
-            if compare(data, golden):
-                return 1
+        fixture.write_text(draft_requirements(data), encoding="utf-8")
+        print(f"\nчерновик эталона: {fixture.relative_to(ROOT)} — поправь руками")
+        print()
+        return 0
+
+    if not fixture.exists():
+        print(f"\nэталона нет: {fixture.relative_to(ROOT)} (создать черновик: --draft)")
+        print()
+        return 0
+
+    requirements = parse_requirements(fixture.read_text(encoding="utf-8"))
+    if stub:
+        print(f"\nэталон есть ({len(requirements)} требований), но сверка требует "
+              f"модели — в режиме --stub пропущена")
+        print()
+        return 0
+
+    try:
+        results = await check_coverage(requirements, data)
+    except Exception as e:
+        # бриф уже собран и показан выше — терять его из-за сверки нельзя
+        print(f"\nсверка с эталоном не выполнена: {e}", file=sys.stderr)
+        print()
+        return 0
+    bad = show_coverage(results)
     print()
-    return 0
+    return 1 if bad else 0
 
 
 async def show_projects() -> int:
@@ -320,12 +390,16 @@ def main() -> int:
     ap.add_argument("--project", type=int)
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--stub", action="store_true", help="без вызова модели")
-    ap.add_argument("--save", action="store_true", help="сохранить результат как эталон")
-    ap.add_argument("--compare", action="store_true", help="сверить с эталоном")
+    ap.add_argument("--draft", action="store_true",
+                    help="записать черновик эталонного списка требований")
+    ap.add_argument("--samples", type=int, default=None,
+                    help="сколько раз собрать бриф (перекрывает BRIEF_SAMPLES)")
     args = ap.parse_args()
+    if args.samples is not None:
+        cfg.brief_samples = args.samples
     if args.list or not args.project:
         return asyncio.run(show_projects())
-    return asyncio.run(run(args.project, args.stub, args.save, args.compare))
+    return asyncio.run(run(args.project, args.stub, args.draft))
 
 
 if __name__ == "__main__":
