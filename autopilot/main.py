@@ -61,7 +61,7 @@ def build_stack():
     return Executor(), Verifier()
 
 
-def build_transports(accounts) -> list:
+def build_transports(companies) -> list:
     """По одному подключению на КОМПАНИЮ и мессенджер.
 
     Токен берётся из vault по имени из `bot_token_ref` — в accounts.toml
@@ -71,21 +71,28 @@ def build_transports(accounts) -> list:
     from .vault import resolve_secret
 
     transports = []
-    for acc in accounts:
+    for acc in companies:
         token, where = resolve_secret(acc.bot_token_ref) if acc.bot_token_ref else (None, "")
         if token:
             transports.append(TelegramTransport(token=token, account=acc.code))
-            log.info("Telegram поднят для %s (%s), токен из: %s", acc.code, acc.name, where)
+            log.info("подключение поднято: %s (%s), токен из: %s",
+                     accounts.label(acc.code, "telegram"), acc.title, where)
         else:
-            log.warning("%s: нет токена по ссылке %r — Telegram для этой компании "
-                        "выключен", acc.code, acc.bot_token_ref)
+            log.warning("нет токена по ссылке %r — %s не поднят",
+                        acc.bot_token_ref, accounts.label(acc.code, "telegram"))
 
         if acc.max_token_ref:
             max_token, _ = resolve_secret(acc.max_token_ref)
             if max_token and cfg.max_mode == "polling":
                 transports.append(MaxTransport(token=max_token, account=acc.code))
+                log.info("подключение поднято: %s (%s)",
+                         accounts.label(acc.code, "max"), acc.title)
             elif max_token:
-                log.warning("MAX_MODE=%s — поллер не поднимаю, ждём webhook", cfg.max_mode)
+                log.warning("MAX_MODE=%s — поллер транспорта max не поднимаю, "
+                            "ждём webhook (%s)", cfg.max_mode, accounts.label(acc.code))
+            else:
+                log.warning("нет токена по ссылке %r — %s не поднят",
+                            acc.max_token_ref, accounts.label(acc.code, "max"))
     return transports
 
 
@@ -96,13 +103,13 @@ async def main() -> None:
     # и таблицы. Конфиг источник правды, таблица accounts — его зеркало
     companies = accounts.active()
     ids = await sync_accounts(companies)
-    log.info("компаний активно: %s (%s)", len(companies),
-             ", ".join(f"{a.code}={a.name}" for a in companies))
-    shared = accounts.shared_sheets(companies)
-    for sheet, codes in shared.items():
-        log.info("таблицу делят компании %s — строки различаются колонкой «Компания»",
-                 ", ".join(codes))
-
+    log.info("компаний активно: %s — %s", len(companies),
+             ", ".join(f"{a.code} ({a.title}, транспорт {a.transport})"
+                       for a in companies))
+    off = [a for a in accounts.load() if not a.active]
+    if off:
+        log.info("компании выключены (active=false): %s",
+                 ", ".join(f"{a.code} ({a.title})" for a in off))
     orphans = await recover_orphan_tasks()
     if orphans:
         log.warning("вернул в очередь %s задач, зависших в running после прошлого запуска", orphans)
@@ -116,16 +123,25 @@ async def main() -> None:
         asyncio.create_task(sched.run(), name="scheduler"),
         asyncio.create_task(communicator.pump(), name="pump"),
     ]
-    # свой синк на компанию: у каждой своя таблица (а если общая — свой
-    # фильтр по колонке «Компания»). Смешивать проекты нельзя ни в какую сторону
+    # Синк заводится на ФИЗИЧЕСКУЮ ТАБЛИЦУ, а не на компанию: у нас таблица
+    # одна на всех, и три поллера читали бы один лист втроём, споря друг с
+    # другом и втрое быстрее выбирая квоту Google
+    by_sheet: dict[str, list] = {}
     for acc in companies:
         if not sheets_configured(acc.sheet_id):
-            log.warning("%s: синк с таблицей выключен (нет sheet_id или файла %s)",
-                        acc.code, cfg.google_creds)
+            log.warning("синк с таблицей выключен для компании %s: нет sheet_id "
+                        "или файла %s", acc.code, cfg.google_creds)
             continue
-        sync = SheetSync(account=acc, account_id=ids.get(acc.code),
-                         shared=acc.sheet_id in shared)
-        tasks.append(asyncio.create_task(sync.loop(), name=f"sheets:{acc.code}"))
+        by_sheet.setdefault(acc.sheet_id, []).append(acc)
+
+    for sheet_id, group in by_sheet.items():
+        sync = SheetSync(accounts=group,
+                         account_ids={a.code: ids.get(a.code) for a in group},
+                         communicator=communicator)
+        name = "+".join(a.code for a in group)
+        log.info("синк таблицы: компании %s%s", name,
+                 " (различаются колонкой «Компания»)" if len(group) > 1 else "")
+        tasks.append(asyncio.create_task(sync.loop(), name=f"sheets:{name}"))
 
     if transports and not roles.owner_configured(companies):
         log.critical("ни у одной компании не задан владелец — ingest выключен. "

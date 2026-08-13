@@ -1,37 +1,64 @@
-# Компании владельца. Скопируй в accounts.toml и правь под себя.
+# Компании владельца. Четвёртая добавляется дописанным блоком [[account]],
+# правок кода не требуется.
 #
-# Третья компания добавляется ДОПИСАННЫМ блоком [[account]] — правок кода
-# не требуется. Если этого файла нет вовсе, система поднимает одну компанию
-# из .env (режим совместимости, код qorsa).
-#
-# ТОКЕНОВ ЗДЕСЬ НЕТ. bot_token_ref — это ИМЯ секрета в vault:
+# ТОКЕНОВ ЗДЕСЬ НЕТ: bot_token_ref / max_token_ref — ИМЕНА секретов в vault.
 #     python scripts/vault_cli.py add QORSA_BOT_TOKEN
-# Файл читается глазами и правится руками, ключам от ботов тут не место.
+#
+# code — ключ, он не совпадает с названием мессенджера НИКОГДА (код это
+# запрещает). display_name — как компанию зовут люди. sheet_alias — что
+# может стоять в колонке «Компания» и означать её же.
+#
+# Таблица одна общая на все компании: строку к компании привязывает
+# колонка «Компания». Пустая или незнакомая ячейка — не догадка,
+# а вопрос владельцу.
 
 [[account]]
-code = "qorsa"                      # стабильный ключ, по нему привязан проект
+code = "qorsa"
 name = "Qorsa Studio"
+display_name = "Qorsa Studio"
+sheet_alias = ["qorsa", "Qorsa", "Корса"]
+transport = "telegram"
 handle = "@qorsastudio"
-owner_tg_id = "7905565788"          # владелец В ЧАТАХ ЭТОЙ КОМПАНИИ
-bot_tg_id = ""                      # id самого бота, если известен
-bot_token_ref = "QORSA_BOT_TOKEN"   # имя секрета в vault, не значение
-sheet_id = ""                       # своя таблица заказов
+owner_tg_id = ""            # id владельца в чатах этой компании
+bot_token_ref = "QORSA_BOT_TOKEN"
+sheet_id = ""
 sheet_tab = "Заказы"
-signature = "Qorsa Studio"          # как бот подписывается клиенту
+signature = "Qorsa Studio"
 active = true
 
 [[account]]
 code = "hustle"
 name = "Hustle Design"
+display_name = "Hustle Design"
+sheet_alias = ["hustle", "Hustle", "Хасл"]
+transport = "telegram"
 handle = "@hustle_design"
-owner_tg_id = "8649452219"
-bot_tg_id = ""
+owner_tg_id = ""            # id владельца в чатах этой компании
 bot_token_ref = "HUSTLE_BOT_TOKEN"
 sheet_id = ""
 sheet_tab = "Заказы"
 signature = "Hustle Design"
 active = true
 
-# Одна общая таблица на обе компании — законный режим: поставь один и тот же
-# sheet_id обеим и заведи в таблице колонку «Компания». Синк тогда фильтрует
-# строки по ней. По умолчанию таблицы РАЗДЕЛЬНЫЕ.
+# Компания называется MAX и работает в мессенджере MAX. Код НАМЕРЕННО другой:
+# «max» — это транспорт, и совпадение сделало бы пару (компания, транспорт)
+# неразличимой на глаз. В таблице и в общении она остаётся «MAX».
+#
+# active = false: токена нет и взять его негде — MAX пускает на платформу
+# только верифицированные юрлица РФ. Это внешняя блокировка на стороне
+# владельца, а не недоделка в коде. Ниже плейсхолдеры: заполнить, когда
+# верификация пройдёт, и переключить active.
+[[account]]
+code = "maxru"
+name = "MAX"
+display_name = "MAX"
+sheet_alias = ["max", "МАКС", "Max", "макс"]
+transport = "max"
+handle = ""
+owner_max_id = ""                  # id владельца в MAX — дать позже
+bot_max_id = ""
+max_token_ref = "MAXRU_MAX_TOKEN"  # секрет заведём, когда будет токен
+sheet_id = ""
+sheet_tab = "Заказы"
+signature = "MAX"
+active = false

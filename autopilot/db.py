@@ -67,6 +67,15 @@ class Account(Base):
     # server_default у всех строковых: миграция вставляет компанию по умолчанию
     # сырым SQL, где питоновские default= не работают
     name: Mapped[str] = mapped_column(String(200), default="", server_default=text("''"))
+    # как компанию зовут люди — в таблице и в общении с клиентом
+    display_name: Mapped[str] = mapped_column(String(200), default="",
+                                              server_default=text("''"))
+    # что может стоять в колонке «Компания» и означать эту компанию
+    sheet_alias: Mapped[list] = mapped_column(JSON, default=list,
+                                              server_default=text("'[]'"))
+    # основной мессенджер: новый проект получает канал без догадок
+    transport: Mapped[str] = mapped_column(String(16), default="telegram",
+                                           server_default=text("'telegram'"))
     handle: Mapped[str] = mapped_column(String(64), default="", server_default=text("''"))
     owner_tg_id: Mapped[str] = mapped_column(String(32), default="", server_default=text("''"))
     owner_max_id: Mapped[str] = mapped_column(String(32), default="", server_default=text("''"))
@@ -77,6 +86,19 @@ class Account(Base):
     signature: Mapped[str] = mapped_column(String(200), default="", server_default=text("''"))
     active: Mapped[bool] = mapped_column(default=True, server_default=text("1"))
     updated_at: Mapped[dt.datetime] = mapped_column(default=utcnow, server_default=text("CURRENT_TIMESTAMP"))
+
+    # Строка БД и объект из accounts.toml должны быть взаимозаменяемы: код
+    # выше по стеку берёт компанию то из конфига, то из базы и не обязан
+    # знать, что именно ему досталось. Разъедутся — получим AttributeError
+    # в проде, а не в тесте
+    @property
+    def title(self) -> str:
+        return str(self.display_name or self.name)
+
+    @property
+    def aliases(self) -> tuple[str, ...]:
+        out = [self.code, self.name, self.display_name, *(self.sheet_alias or [])]
+        return tuple(str(x) for x in out if str(x or "").strip())
 
 
 class Project(Base):
@@ -356,6 +378,9 @@ async def sync_accounts(accounts) -> dict[str, int]:
                 row = Account(code=acc.code)
                 s.add(row)
             row.name = acc.name
+            row.display_name = getattr(acc, "display_name", "") or acc.name
+            row.sheet_alias = list(getattr(acc, "sheet_alias", ()) or ())
+            row.transport = getattr(acc, "transport", "telegram")
             row.handle = acc.handle
             row.owner_tg_id = str(acc.owner_tg_id or "")
             row.owner_max_id = str(acc.owner_max_id or "")

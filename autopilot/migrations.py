@@ -265,6 +265,25 @@ async def m006_accounts(conn) -> None:
                  after, default_code)
 
 
+async def m007_company_naming(conn) -> None:
+    """Компания получает своё имя для людей, алиасы и основной мессенджер.
+
+    Понадобилось, когда завелась компания «MAX», работающая в мессенджере MAX:
+    код у неё обязан отличаться от названия транспорта (`maxru`), а называться
+    в таблице и в общении она должна как называется. Отсюда display_name
+    отдельно от code, и sheet_alias — что человек может написать в колонке.
+    """
+    await ensure_tables(conn)
+    await _add_column(conn, "accounts", "display_name", "VARCHAR(200) DEFAULT ''")
+    await _add_column(conn, "accounts", "sheet_alias", "JSON")
+    await _add_column(conn, "accounts", "transport", "VARCHAR(16) DEFAULT 'telegram'")
+    # у уже заведённых компаний display_name пуст — подставляем имя,
+    # иначе они пропадут из подсказки «допустимые значения»
+    await conn.execute(text(
+        "UPDATE accounts SET display_name = name "
+        "WHERE display_name IS NULL OR display_name = ''"))
+
+
 MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline: схема фазы 1", m001_baseline),
     (2, "ingest: переписка, транспорты, привязка чатов", m002_ingest),
@@ -272,6 +291,7 @@ MIGRATIONS: list[tuple[int, str, object]] = [
     (4, "planner: классы проверяемости, исполнитель, зависимости", m004_planner),
     (5, "verifier: доля автономности по времени", m005_verifier),
     (6, "мультиаккаунтность: компании, проект принадлежит одной", m006_accounts),
+    (7, "компания: имя для людей, алиасы таблицы, основной мессенджер", m007_company_naming),
 ]
 
 

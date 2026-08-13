@@ -35,13 +35,53 @@ CONFIG_NAME = "accounts.toml"
 # Он же — единственная компания в режиме совместимости с .env
 DEFAULT_CODE = "qorsa"
 
+# Имена мессенджеров. Кодом компании ни одно из них быть не может — см.
+# Account.__post_init__. Список продублирован здесь намеренно: тащить сюда
+# импорт транспортов значит завести цикл (transports -> db -> config).
+# Расхождение с настоящими транспортами ловит тест, как у реестра проверок.
+TRANSPORT_NAMES = frozenset({"telegram", "max"})
+
+
+def label(account_code, transport_name=None) -> str:
+    """Как называть пару в логах: всегда со словами «компания» и «транспорт».
+
+    Компания MAX работает в мессенджере MAX, и строка вида `max/max` или даже
+    `maxru/max` без подписей заставляет каждый раз вспоминать, что здесь что.
+    Слово в логе стоит ноль, а его отсутствие — вечер разбирательств в том,
+    какой именно «max» отвалился.
+    """
+    who = f"компания {account_code or '?'}"
+    return f"{who}, транспорт {transport_name}" if transport_name else who
+
+
+def normalize_alias(value) -> str:
+    """Приводит написание к сравнимому виду: регистр, ё/е, пробелы, дефисы.
+
+    «МАКС», «Макс» и «max» должны означать одно и то же, иначе человек,
+    заполняющий таблицу руками, будет получать «незнакомая компания»
+    за регистр буквы.
+    """
+    text = str(value or "").strip().lower().replace("ё", "е")
+    return " ".join(text.replace("-", " ").replace("_", " ").split())
+
 
 @dc.dataclass(frozen=True)
 class Account:
     """Одна компания. Неизменяемая: конфиг перечитывается целиком."""
 
-    code: str                      # qorsa | hustle | ... — стабильный ключ
+    code: str                      # qorsa | hustle | maxru — стабильный КЛЮЧ
     name: str                      # как компания называется для людей
+    # Как её называют в таблице и в общении. У компании MAX это «MAX» —
+    # совпадает с названием мессенджера, и это нормально ровно потому,
+    # что ключ (code) у неё другой
+    display_name: str = ""
+    # Что может стоять в колонке «Компания» и означать эту компанию.
+    # Люди пишут «макс», «Max», «MAX» — в ключ это превращать нельзя,
+    # ключ должен быть один и стабильный
+    sheet_alias: tuple[str, ...] = ()
+    # Основной мессенджер компании. Нужен, чтобы новый проект получал канал
+    # без догадок: у MAX-компании клиенты в MAX, а не в Telegram
+    transport: str = "telegram"
     owner_tg_id: str = ""          # владелец В ЧАТАХ ЭТОЙ КОМПАНИИ
     owner_max_id: str = ""
     bot_tg_id: str = ""            # id самого бота: его реплики не идут в ТЗ
@@ -59,6 +99,44 @@ class Account:
             raise ValueError("у компании должен быть code")
         if not str(self.name).strip():
             raise ValueError(f"у компании {self.code!r} должно быть name")
+        # КЛЮЧЕВОЕ ПРАВИЛО. Компания называется «MAX» и работает в мессенджере
+        # MAX — если разрешить ей code="max", то `account="max"` и
+        # `transport="max"` станут неразличимы на глаз в логах, в ключах
+        # транспортов (account, transport) и в колонке таблицы. Цена ошибки
+        # тут не косметическая: перепутанная пара — это письмо клиенту одной
+        # компании от лица другой. Поэтому имя мессенджера кодом быть не может
+        if str(self.code).strip().lower() in TRANSPORT_NAMES:
+            raise ValueError(
+                f"code={self.code!r} совпадает с названием транспорта. "
+                f"Компания и мессенджер — разные сущности, и различать их "
+                f"надо на уровне идентификатора, а не по контексту. "
+                f"Возьми, например, {self.code}ru")
+        if str(self.transport).strip().lower() not in TRANSPORT_NAMES:
+            raise ValueError(
+                f"компания {self.code!r}: transport={self.transport!r} — "
+                f"нет такого мессенджера, есть {sorted(TRANSPORT_NAMES)}")
+
+    @property
+    def title(self) -> str:
+        """Как показывать людям: в таблице, клиенту, в отчётах."""
+        return str(self.display_name or self.name)
+
+    @property
+    def aliases(self) -> tuple[str, ...]:
+        """Всё, чем эту компанию могут назвать в колонке «Компания».
+
+        Код, имя и display_name попадают сюда сами: заставлять человека
+        дублировать их в sheet_alias — способ однажды забыть и получить
+        «незнакомая компания» на своей же строке.
+        """
+        out = [self.code, self.name, self.display_name, *self.sheet_alias]
+        seen, result = set(), []
+        for item in out:
+            key = normalize_alias(item)
+            if key and key not in seen:
+                seen.add(key)
+                result.append(str(item))
+        return tuple(result)
 
     @property
     def owner_ids(self) -> dict[str, str]:
@@ -111,7 +189,13 @@ def _one(raw: dict) -> Account:
         # а компания синкалась бы не в ту таблицу
         raise ValueError(f"компания {raw.get('code')!r}: непонятные поля {sorted(unknown)}")
     data = {k: raw[k] for k in raw if k in known}
-    data.setdefault("signature", str(data.get("name", "")))
+    data.setdefault("signature", str(data.get("display_name") or data.get("name", "")))
+    # TOML отдаёт список, а датакласс заморожен — приводим к кортежу
+    if "sheet_alias" in data:
+        alias = data["sheet_alias"]
+        if isinstance(alias, str):
+            alias = [alias]
+        data["sheet_alias"] = tuple(str(a) for a in alias)
     return Account(**data)
 
 
@@ -149,6 +233,40 @@ def by_code(code: str, path: Path | None = None) -> Account | None:
         if a.code == str(code):
             return a
     return None
+
+
+def alias_map(accounts: list[Account]) -> dict[str, Account]:
+    """{нормализованный алиас: компания}. Столкновения — ошибка, а не «последний выигрывает».
+
+    Если две компании объявили один и тот же алиас, то строка таблицы с этим
+    значением принадлежит непонятно кому. Тихо отдать её той, что была позже
+    в списке, — это ровно тот способ отправить письмо не тому клиенту, ради
+    предотвращения которого всё это и делается.
+    """
+    out: dict[str, Account] = {}
+    for acc in accounts:
+        for raw in acc.aliases:
+            key = normalize_alias(raw)
+            if key in out and out[key].code != acc.code:
+                raise ValueError(
+                    f"алиас {raw!r} объявлен и у компании {out[key].code!r}, "
+                    f"и у {acc.code!r} — строку таблицы с таким значением "
+                    f"невозможно отнести к одной из них")
+            out[key] = acc
+    return out
+
+
+def resolve_by_alias(value, accounts: list[Account]) -> Account | None:
+    """Ячейка колонки «Компания» -> компания. None, если не опознали.
+
+    None здесь — это ВОПРОС ВЛАДЕЛЬЦУ, а не повод подставить компанию
+    по умолчанию. Пустая ячейка и опечатка неотличимы от «строку завели
+    второпях», и в обоих случаях догадка стоит письма не тому клиенту.
+    """
+    key = normalize_alias(value)
+    if not key:
+        return None
+    return alias_map(accounts).get(key)
 
 
 def shared_sheets(accounts: list[Account]) -> dict[str, list[str]]:
