@@ -80,6 +80,11 @@ def reply(goal="сделать интернет-магазин", goal_ev=("1",),
         "confidence": 0.9, "unreadable": [],
     }
     data.update(fields)
+    # с фазы 3.3 модальность у deliverables обязательна по схеме;
+    # тестам, которым она не важна, проставляем must
+    for item in data["deliverables"]:
+        if isinstance(item, dict):
+            item.setdefault("priority", "must")
     return json.dumps(data, ensure_ascii=False)
 
 
@@ -310,18 +315,23 @@ async def test_access_items_created(db, monkeypatch):
         n = (await s.execute(select(func.count()).select_from(AccessItem))).scalar_one()
     assert n == 3, "пункты доступа задвоились"
 
-    # Пункт исчез из брифа — помечается stale, но verified не сбрасывается.
-    # Только на ПОЛНОМ пересборе: инкремент видит не всю переписку и не может
-    # отвечать за то, чего в его окне нет
+    # Модель не вернула часть пунктов в очередном прогоне. С фазы 3.3 это НЕ
+    # повод их терять: бриф накапливает, пункт остаётся с пометкой missing,
+    # а пункт чеклиста продолжает считаться нужным
     monkeypatch.setattr(cfg, "brief_full_rebuild_every", 1)
     await add_msg(p.id, "3", "и ещё вот", roles.CLIENT)
-    await Brief(client=FakeAnthropic(reply(access_needed=[access[1]]))).build(await _reload(p))
+    data = await Brief(client=FakeAnthropic(reply(access_needed=[access[1]]))).build(
+        await _reload(p))
+
+    names = {i["name"]: i for i in data["access_needed"]}
+    assert names["Домен"].get("missing") is True, "пропавший пункт должен быть помечен"
+    assert names["Репозиторий"].get("missing") is None
 
     async with Session() as s:
         rows = {i.name: i for i in (await s.execute(select(AccessItem))).scalars()}
     assert rows["Панель Beget"].status == "verified"
     assert rows["Панель Beget"].stale is False, "проверенный доступ нельзя ронять в stale"
-    assert rows["Домен"].stale is True
+    assert rows["Домен"].stale is False, "пункт не выброшен, а лишь не подтверждён прогоном"
     assert rows["Репозиторий"].stale is False
 
 

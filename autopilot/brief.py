@@ -34,13 +34,14 @@ import json
 import logging
 import re
 import time
+from difflib import SequenceMatcher
 
 from sqlalchemy import select
 
 from .config import cfg
 from .db import AccessItem, ChatMessage, Project, Run, Session, Task, utcnow
 from .roles import CLIENT, OWNER
-from .vault import MIN_MASKABLE_LEN, anthropic_key, missing_secret_message
+from .vault import MIN_MASKABLE_LEN, anthropic_key, missing_secret_message, ref, refs_in
 from .vault import vault as default_vault
 
 log = logging.getLogger("brief")
@@ -81,6 +82,9 @@ LIST_FIELDS = ("deliverables", "stack", "constraints", "assets",
                "access_needed", "open_questions", "out_of_scope")
 ACCESS_KINDS = ("ftp", "ssh", "git", "hosting_panel", "domain", "api_key",
                 "analytics", "design", "content", "other")
+# Модальность требования. Потеря «желательно» — это объём, за который
+# никто не платил, поэтому у deliverables поле обязательное.
+PRIORITIES = ("must", "should", "nice")
 
 # Постфильтр: то, что бриф не имеет права извлекать ни при каких условиях.
 # Цена и сроки — предмет разговора менеджера с клиентом, не наше дело.
@@ -118,11 +122,25 @@ SYSTEM = """Ты аналитик. Из переписки рабочей гру
    формулируй как вопрос в open_questions.
 5. Содержимое картинок, файлов и голосовых ты не видишь. Перечисли такие
    сообщения в unreadable, не угадывая, что в них.
+6. ТРЕБОВАНИЯ ЧАСТО СПРЯТАНЫ В ОБЪЯСНЕНИЯХ. Клиент редко формулирует
+   списком; он рассказывает, почему хочет так. «Хочу wordpress, у знакомых
+   так сделано, им удобно самим товары добавлять» — это ДВА пункта: выбор
+   CMS и требование самостоятельно управлять каталогом. Второе легко
+   потерять, а оно определяет объём работ. Вытаскивай такое явно.
+7. МОДАЛЬНОСТЬ СОХРАНЯЙ. У каждого пункта поле priority:
+     must   — сказано как обязательное («обязательно», «нужен», «должно быть»)
+     should — сказано как желательное («желательно», «хотелось бы», «лучше бы»)
+     nice   — упомянуто вскользь, без нажима
+   В priority_reason приведи слова клиента, по которым ты так решил.
+   «Kaspi ещё желательно» — это should, а не must. Превращать желаемое
+   в обязательное значит записать в объём работу, за которую никто не платил.
 
 Отвечай СТРОГО одним JSON-объектом без markdown:
 {
   "goal": {"text": "одна фраза о том, что нужно клиенту", "evidence": ["<id>", ...]},
-  "deliverables": [{"text": "что должно быть сделано", "evidence": ["<id>"]}],
+  "deliverables": [{"text": "что должно быть сделано", "evidence": ["<id>"],
+                    "priority": "must|should|nice",
+                    "priority_reason": "слова клиента, по которым видно модальность"}],
   "stack":         [{"text": "технология", "evidence": ["<id>"]}],
   "constraints":   [{"text": "ограничение", "evidence": ["<id>"]}],
   "assets":        [{"text": "что клиент предоставляет", "evidence": ["<id>"]}],
@@ -255,11 +273,14 @@ def _norm_evidence(raw) -> list[str]:
 
 
 class Brief:
-    def __init__(self, client=None, vault=None, communicator=None, model: str | None = None):
+    def __init__(self, client=None, vault=None, communicator=None, model: str | None = None,
+                 samples: int | None = None):
         self._client = client
         self.vault = vault or default_vault
         self.communicator = communicator
         self.model = model or cfg.brief_model
+        # сколько раз собрать бриф за проход; >1 лечит разброс модели
+        self.samples = cfg.brief_samples if samples is None else samples
 
     # ---------- сбор материала ----------
 
@@ -384,6 +405,11 @@ class Brief:
                         errors.append(f"{f}[{i}].kind должен быть одним из {ACCESS_KINDS}")
                 elif not isinstance(item.get("text"), str) or not item["text"].strip():
                     errors.append(f"{f}[{i}].text обязателен")
+                # Модальность требуем только у deliverables: именно там живёт
+                # объём работ, и именно его нельзя раздувать молча
+                if f == "deliverables" and item.get("priority") not in PRIORITIES:
+                    errors.append(
+                        f"{f}[{i}].priority обязателен и должен быть одним из {PRIORITIES}")
         conf = data.get("confidence")
         if not isinstance(conf, (int, float)) or not 0 <= float(conf) <= 1:
             errors.append("confidence должен быть числом от 0 до 1")
@@ -545,24 +571,38 @@ class Brief:
         window = messages if full else fresh
         prompt = self.build_prompt(project, window, None if full else previous)
 
-        try:
-            data = await self._attempt(prompt, project)
-        except SecretLeak as e:
-            log.critical("проект %s: %s — запрос к модели НЕ отправлен", project.id, e)
-            await self._escalate(project, f"бриф остановлен: {e}")
-            return None
-        except BriefFailed as e:
-            log.error("проект %s: бриф не собран — %s", project.id, e)
-            await self._escalate(project, f"бриф не собран: {e}")
-            return None
+        samples: list[dict] = []
+        dropped: list[str] = []
+        rounds = max(1, self.samples)
+        for i in range(rounds):
+            try:
+                raw = await self._attempt(prompt, project)
+            except SecretLeak as e:
+                log.critical("проект %s: %s — запрос к модели НЕ отправлен", project.id, e)
+                await self._escalate(project, f"бриф остановлен: {e}")
+                return None
+            except BriefFailed as e:
+                if samples:
+                    # один прогон из нескольких сорвался — работаем на остальных
+                    log.warning("проект %s: прогон %s/%s не удался: %s",
+                                project.id, i + 1, rounds, e)
+                    continue
+                log.error("проект %s: бриф не собран — %s", project.id, e)
+                await self._escalate(project, f"бриф не собран: {e}")
+                return None
 
-        data, dropped = self.apply_evidence(data, messages)
+            checked, drops = self.apply_evidence(raw, messages)
+            dropped.extend(drops)
+            samples.append(checked)
+
         for reason in dropped:
             log.warning("проект %s: выброшен пункт — %s", project.id, reason)
-        data = self.collect_unreadable(data, messages)
 
-        if previous and not full:
-            data = merge(previous, data)
+        data = merge_samples(samples)
+        data = self.collect_unreadable(data, messages)
+        # Накапливаем ВСЕГДА, а не только на инкременте: модель недетерминирована,
+        # и полный пересбор точно так же теряет пункты между прогонами
+        data = accumulate(previous, data)
 
         await self._persist(project, data, messages, dropped, full=full)
         return data
@@ -630,12 +670,29 @@ class Brief:
         project.brief = payload
         project.brief_ready = ready
 
-        await self.sync_access_items(project, data, full=full)
+        await self.sync_access_items(project, data, full=full, messages=messages)
         log.info("проект %s: бриф обновлён, confidence=%.2f, вопросов=%d, готов=%s",
                  project.id, data.get("confidence", 0),
                  len(data.get("open_questions") or []), ready)
 
-    async def sync_access_items(self, project: Project, data: dict, full: bool = True) -> None:
+    @staticmethod
+    def _already_sent(messages: list[ChatMessage]) -> dict[str, list[str]]:
+        """Сообщения, в которых клиент уже прислал доступ.
+
+        Признак прямой: перехватчик секретов оставил в тексте `{{SECRET:...}}`.
+        Если пункт чеклиста ссылается на такое сообщение, доступ уже у нас,
+        и заводить его в статусе `needed` — значит просить второй раз то,
+        что клиент прислал десять сообщений назад.
+        """
+        out: dict[str, list[str]] = {}
+        for m in messages:
+            names = refs_in(m.text or "")
+            if names:
+                out[_msg_key(m)] = names
+        return out
+
+    async def sync_access_items(self, project: Project, data: dict, full: bool = True,
+                                messages: list[ChatMessage] | None = None) -> None:
         """Пункты доступа из брифа. Дубли не плодим, verified не сбрасываем.
 
         `stale` проставляем ТОЛЬКО после полного пересбора. При инкрементальном
@@ -649,22 +706,54 @@ class Brief:
             if key[1]:
                 wanted[key] = item
 
+        sent = self._already_sent(messages or [])
+
         async with Session() as s:
             existing = (await s.execute(
                 select(AccessItem).where(AccessItem.project_id == project.id))).scalars().all()
-            by_key = {(i.kind.lower(), i.name.strip().lower()): i for i in existing}
+
+            def find_existing(kind: str, name: str):
+                """Ищем нечётко: модель называет один и тот же доступ
+                по-разному, а точное сравнение плодило по строке на прогон.
+                Чеклист держит полосу build — засорять его нельзя."""
+                probe = {"kind": kind, "name": name}
+                for row in existing:
+                    if same_item({"kind": row.kind, "name": row.name}, probe):
+                        return row
+                return None
 
             for key, item in wanted.items():
-                current = by_key.get(key)
-                if current is None:
-                    s.add(AccessItem(project_id=project.id, kind=key[0],
-                                     name=str(item.get("name")).strip(),
-                                     status="needed", source="brief"))
-                elif current.stale:
-                    current.stale = False       # вернулся в бриф — снова актуален
+                current = find_existing(key[0], str(item.get("name") or ""))
+                # доступ уже приходил в чат — заводим сразу как полученный
+                secret_names: list[str] = []
+                for ref_key in item.get("evidence") or []:
+                    secret_names.extend(sent.get(str(ref_key), []))
+                received = bool(secret_names)
 
-            for key, current in by_key.items():
-                if not full or key in wanted or current.source != "brief":
+                if current is None:
+                    s.add(AccessItem(
+                        project_id=project.id, kind=key[0],
+                        name=str(item.get("name")).strip(),
+                        status="received" if received else "needed",
+                        secret_ref=ref(secret_names[0]) if secret_names else None,
+                        note="прислан в переписке" if received else "",
+                        source="brief"))
+                else:
+                    if current.stale:
+                        current.stale = False   # вернулся в бриф — снова актуален
+                    if received and current.status == "needed":
+                        # клиент прислал доступ уже после создания пункта
+                        current.status = "received"
+                        current.secret_ref = current.secret_ref or ref(secret_names[0])
+                        current.note = current.note or "прислан в переписке"
+
+            for current in existing:
+                key = (current.kind.lower(), current.name.strip().lower())
+                still_wanted = any(
+                    same_item({"kind": current.kind, "name": current.name},
+                              {"kind": k[0], "name": str(v.get("name") or "")})
+                    for k, v in wanted.items())
+                if not full or still_wanted or current.source != "brief":
                     continue
                 # пункт пропал из брифа. Проверенный доступ не трогаем:
                 # клиент его уже дал, и терять это нельзя
@@ -673,26 +762,288 @@ class Brief:
             await s.commit()
 
 
-def merge(previous: dict, fresh: dict) -> dict:
-    """Инкрементальное обновление не должно терять уже подтверждённые пункты."""
+def item_text(item: dict) -> str:
+    return str(item.get("text") or item.get("name") or "").strip()
+
+
+def item_key(item: dict) -> str:
+    """Ключ для сопоставления пунктов между прогонами."""
+    return item_text(item).lower()
+
+
+# Модель каждый раз формулирует иначе: «Корзина», «Корзина для оформления
+# заказа», «Корзина и оформление заказа покупателем самостоятельно» — это
+# один и тот же пункт. Сопоставление по точному тексту раздувало бриф втрое.
+SIMILAR_ENOUGH = 0.75
+# при пересечении evidence порог мягче: ссылка на то же сообщение —
+# сильный довод, что речь об одном требовании
+SIMILAR_WITH_EVIDENCE = 0.55
+
+
+# Короткая формулировка целиком входит в длинную («Корзина» и «Корзина для
+# оформления заказа») — это один пункт. Порог длины нужен, чтобы обрубок
+# вроде «оплата» не склеивал оплату картой с оплатой через Kaspi.
+# Вхождение проверяется только для КОРОТКОЙ строки внутри длинной,
+# поэтому «оплата картой» и «оплата через Kaspi» остаются разными.
+CONTAINED_MIN_LEN = 6
+
+
+def same_item(a: dict, b: dict) -> bool:
+    from .groups import normalize
+    # Вид доступа проверяем ПЕРВЫМ: домен и панель хостинга — разные пункты,
+    # даже если названы одинаково
+    if a.get("kind") and b.get("kind") and a["kind"] != b["kind"]:
+        return False
+
+    ta, tb = normalize(item_text(a)), normalize(item_text(b))
+    if not ta or not tb:
+        return False
+    if ta == tb:
+        return True
+
+    short, long = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if len(short) >= CONTAINED_MIN_LEN and short in long:
+        return True
+
+    ev_a, ev_b = set(a.get("evidence") or []), set(b.get("evidence") or [])
+    shared = ev_a & ev_b
+    same_evidence = bool(ev_a) and ev_a == ev_b
+
+    # Два пункта чеклиста одного вида, ссылающиеся на одно сообщение, — это
+    # один доступ, как бы по-разному модель его ни назвала
+    if same_evidence and a.get("kind") and a.get("kind") == b.get("kind"):
+        return True
+    # Подтверждённое предложение опознаётся парой «предложение + согласие».
+    # Одинаковая пара — одно и то же согласованное решение
+    if (same_evidence and a.get("origin") == ORIGIN_CONFIRMED
+            and b.get("origin") == ORIGIN_CONFIRMED):
+        return True
+
+    ratio = SequenceMatcher(None, ta, tb).ratio()
+    if ratio >= SIMILAR_ENOUGH:
+        return True
+
+    # Порядок слов модель тасует свободно: «оплата картой онлайн» и
+    # «онлайн-оплата банковской картой» — одно и то же. Посимвольное сравнение
+    # этого не видит, поэтому смотрим ещё и на пересечение слов
+    wa = {w for w in ta.split() if len(w) > 2}
+    wb = {w for w in tb.split() if len(w) > 2}
+    if wa and wb:
+        overlap = len(wa & wb) / min(len(wa), len(wb))
+        if overlap >= 0.85:
+            return True
+        if overlap >= 0.7 and shared:
+            return True
+
+    return ratio >= SIMILAR_WITH_EVIDENCE and bool(shared)
+
+
+def _pick_priority(variants: list[dict]) -> tuple[str | None, str]:
+    """Модальность по большинству прогонов. Расхождение показываем явно:
+    молча выбрать сильную — это раздуть объём, слабую — потерять требование."""
+    votes: dict[str, int] = {}
+    reasons: dict[str, str] = {}
+    for v in variants:
+        prio = v.get("priority")
+        if prio in PRIORITIES:
+            votes[prio] = votes.get(prio, 0) + 1
+            reasons.setdefault(prio, str(v.get("priority_reason") or ""))
+    if not votes:
+        return None, ""
+    best = max(votes, key=lambda k: (votes[k], -PRIORITIES.index(k)))
+    reason = reasons.get(best, "")
+    if len(votes) > 1:
+        spread = ", ".join(f"{k}×{n}" for k, n in sorted(votes.items()))
+        reason = f"{reason} [модальность расходится между прогонами: {spread}]".strip()
+    return best, reason
+
+
+def _fold(variants: list[dict]) -> dict:
+    """Схлопывает разные формулировки одного пункта в одну запись."""
+    base = dict(max(variants, key=lambda v: len(item_text(v))))
+    evidence: list[str] = []
+    for v in variants:
+        for e in v.get("evidence") or []:
+            if e not in evidence:
+                evidence.append(e)
+    base["evidence"] = evidence
+    prio, reason = _pick_priority(variants)
+    if prio:
+        base["priority"] = prio
+        if reason:
+            base["priority_reason"] = reason
+    if any(v.get("origin") == ORIGIN_CONFIRMED for v in variants):
+        base["origin"] = ORIGIN_CONFIRMED
+    if any(v.get("rejected") for v in variants):
+        base["rejected"] = True
+    return base
+
+
+def merge_samples(samples: list[dict]) -> dict:
+    """Объединяет N независимых прогонов модели по одному и тому же чату.
+
+    Пункт входит в итог, если встретился хотя бы в одном прогоне. Модель
+    недетерминирована: на живом чате два прогона подряд дали разный состав
+    брифа, и потерянное требование не попало бы в план вообще.
+    Сколько раз пункт встретился — видно в поле `samples`.
+    """
+    if not samples:
+        return empty_brief()
+    if len(samples) == 1:
+        out = dict(samples[0])
+        total = 1
+    else:
+        out = dict(samples[0])
+        total = len(samples)
+
+    for field in LIST_FIELDS:
+        buckets: list[list[dict]] = []
+        for data in samples:
+            seen_here: list[int] = []
+            for item in data.get(field) or []:
+                if not isinstance(item, dict) or not item_text(item):
+                    continue
+                # сравниваем со ВСЕМИ формулировками группы, а не только с
+                # первой: похожесть нетранзитивна, и A~B, B~C при A≁C
+                # разваливало один пункт на два
+                spot = next((i for i, group in enumerate(buckets)
+                             if any(same_item(existing, item) for existing in group)), None)
+                if spot is None:
+                    buckets.append([item])
+                    seen_here.append(len(buckets) - 1)
+                else:
+                    buckets[spot].append(item)
+                    if spot not in seen_here:
+                        seen_here.append(spot)
+        folded = []
+        for group in buckets:
+            # считаем ПРОГОНЫ, а не варианты формулировок внутри одного прогона
+            hits = sum(1 for data in samples
+                       if any(isinstance(i, dict)
+                              and any(same_item(existing, i) for existing in group)
+                              for i in (data.get(field) or [])))
+            item = _fold(group)
+            item["samples"] = f"{hits}/{total}"
+            folded.append(item)
+        out[field] = folded
+
+    goal = next((d.get("goal") for d in samples if d.get("goal")), None)
+    out["goal"] = dict(goal) if goal else None
+    if out["goal"]:
+        hits = sum(1 for d in samples if d.get("goal"))
+        out["goal"]["samples"] = f"{hits}/{total}"
+    # confidence берём минимальную: разброс сам по себе повод не спешить
+    out["confidence"] = min(float(d.get("confidence") or 0.0) for d in samples)
+    unreadable: list[dict] = []
+    seen_u = set()
+    for data in samples:
+        for u in data.get("unreadable") or []:
+            key = str(u.get("message_id") or "").rsplit(":", 1)[-1]
+            if key and key not in seen_u:
+                seen_u.add(key)
+                unreadable.append(u)
+    out["unreadable"] = unreadable
+    return out
+
+
+def accumulate(previous: dict | None, fresh: dict, now: str | None = None) -> dict:
+    """Бриф НАКАПЛИВАЕТ пункты, а не перезаписывается.
+
+    Пункт, попавший в бриф хотя бы раз, молча не исчезает: если в новом
+    прогоне его нет, он остаётся с пометкой `missing`. Потерянный отказ
+    вернётся сам, а вот потерянное требование просто не попадёт в план,
+    и этого никто не заметит.
+
+    Единственный автоматический путь удаления — явный отказ клиента
+    (пункт уезжает в out_of_scope в apply_evidence). Всё остальное убирает
+    человек руками.
+    """
+    stamp = now or utcnow().isoformat()
     out = dict(fresh)
-    if not out.get("goal") and previous.get("goal"):
-        out["goal"] = previous["goal"]
-    for f in LIST_FIELDS:
-        seen = set()
-        merged = []
-        for item in (previous.get(f) or []) + (out.get(f) or []):
-            if not isinstance(item, dict):
+    previous = previous or {}
+
+    for field in LIST_FIELDS:
+        fresh_list = [dict(i) for i in (fresh.get(field) or [])
+                      if isinstance(i, dict) and item_text(i)]
+        old_list = [dict(i) for i in (previous.get(field) or [])
+                    if isinstance(i, dict) and item_text(i)]
+        # сопоставляем нечётко: между прогонами формулировка гуляет,
+        # и по точному совпадению старый пункт выглядел бы пропавшим
+        fresh_items = {item_key(i): i for i in fresh_list}
+        old_items = {item_key(i): i for i in old_list}
+        pair: dict[str, dict] = {}
+        for old in old_list:
+            match = next((f for f in fresh_list if same_item(old, f)), None)
+            if match is not None:
+                pair[item_key(old)] = match
+
+        rejected_items = [i for i in (fresh.get("out_of_scope") or [])
+                          if isinstance(i, dict) and i.get("rejected")]
+        rejected = {item_key(i) for i in rejected_items}
+
+        # Порядок сохраняем прежний: сначала то, что уже было (в исходном
+        # порядке), потом новое. Бриф читают глазами, и перетасовка списка
+        # на каждом прогоне мешает заметить, что именно изменилось.
+        result: list[dict] = []
+        used: set[int] = set()
+        for old in old_list:
+            key = item_key(old)
+            match = pair.get(key)
+            if match is not None:
+                match["first_seen"] = old.get("first_seen") or stamp
+                match["last_seen"] = stamp
+                match["seen_count"] = int(old.get("seen_count") or 0) + 1
+                match.pop("missing", None)
+                result.append(match)
+                used.add(id(match))
+            elif field == "open_questions" or any(same_item(old, r) for r in rejected_items):
+                continue        # закрытый вопрос и отвергнутый пункт не возвращаем
+            else:
+                kept = dict(old)
+                kept["missing"] = True      # видно в brief_eval отдельным блоком
+                kept.setdefault("first_seen", stamp)
+                kept.setdefault("seen_count", 1)
+                result.append(kept)
+
+        for item in fresh_list:
+            if id(item) in used:
                 continue
-            key = (str(item.get("text") or item.get("name") or "")).strip().lower()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            merged.append(item)
-        out[f] = merged
-    # open_questions — исключение: закрытые вопросы возвращать не надо
-    out["open_questions"] = fresh.get("open_questions") or []
-    out["confidence"] = float(fresh.get("confidence") or previous.get("confidence") or 0.0)
+            item["first_seen"] = stamp
+            item["last_seen"] = stamp
+            item["seen_count"] = 1
+            item.pop("missing", None)
+            result.append(item)
+        out[field] = result
+
+    goal = fresh.get("goal") or previous.get("goal")
+    if goal:
+        goal = dict(goal)
+        old_goal = previous.get("goal") or {}
+        goal["first_seen"] = old_goal.get("first_seen") or stamp
+        goal["last_seen"] = stamp if fresh.get("goal") else old_goal.get("last_seen", stamp)
+        goal["seen_count"] = int(old_goal.get("seen_count") or 0) + (1 if fresh.get("goal") else 0)
+        if not fresh.get("goal"):
+            goal["missing"] = True
+    out["goal"] = goal
+    out["confidence"] = float(fresh.get("confidence") or 0.0)
+    return out
+
+
+def merge(previous: dict, fresh: dict) -> dict:
+    """Совместимость: инкрементальное обновление = накопление."""
+    return accumulate(previous, fresh)
+
+
+def missing_items(data: dict) -> list[tuple[str, dict]]:
+    """Пункты, которых не было в последнем прогоне, но которые мы не выбрасываем."""
+    out = []
+    goal = data.get("goal")
+    if isinstance(goal, dict) and goal.get("missing"):
+        out.append(("goal", goal))
+    for field in LIST_FIELDS:
+        for item in data.get(field) or []:
+            if isinstance(item, dict) and item.get("missing"):
+                out.append((field, item))
     return out
 
 
@@ -759,3 +1110,119 @@ class BriefRunner:
             if questions:
                 await self.communicator.ask_questions(project, questions)
         return touched
+
+
+# ---------- сверка с эталонным списком требований ----------
+
+COVERAGE_SYSTEM = """Ты проверяешь полноту технического задания.
+
+Тебе дают список ТРЕБОВАНИЙ, написанных человеком в свободной форме, и
+список ПУНКТОВ собранного ТЗ. Для каждого требования реши, покрыто ли оно
+хотя бы одним пунктом.
+
+Сверяй по смыслу, а не по словам: «оплата картой» и «онлайн-оплата через
+эквайринг» — одно и то же. Но «каталог» и «каталог с фильтрами по бренду» —
+разное, если требование говорит именно про фильтры.
+
+Вердикты:
+  covered   — требование явно покрыто, укажи пункт
+  missing   — в ТЗ этого нет
+  partial   — покрыто частично или формулировка спорная, объясни чем именно
+
+Отвечай СТРОГО одним JSON-объектом без markdown:
+{"results": [{"requirement": "<текст требования как дан>",
+              "verdict": "covered|missing|partial",
+              "matched": "<пункт ТЗ или пусто>",
+              "note": "<коротко, почему>"}]}"""
+
+
+def brief_lines(data: dict) -> list[str]:
+    """Плоский список пунктов брифа для сверки."""
+    lines = []
+    goal = data.get("goal")
+    if isinstance(goal, dict) and goal.get("text"):
+        lines.append(f"[цель] {goal['text']}")
+    for field in LIST_FIELDS:
+        for item in data.get(field) or []:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text") or f"{item.get('kind')}: {item.get('name')}"
+            mark = " (ОТСУТСТВОВАЛ В ПОСЛЕДНЕМ ПРОГОНЕ)" if item.get("missing") else ""
+            prio = f" [{item['priority']}]" if item.get("priority") else ""
+            lines.append(f"[{field}]{prio} {text}{mark}")
+    return lines
+
+
+def parse_requirements(text: str) -> list[str]:
+    """Эталон пишется руками: одно требование в строке, `#` — комментарий."""
+    out = []
+    for raw in (text or "").splitlines():
+        line = raw.strip().lstrip("-*• ").strip()
+        if not line or line.startswith("#"):
+            continue
+        out.append(line)
+    return out
+
+
+async def check_coverage(requirements: list[str], data: dict, client=None,
+                         model: str | None = None) -> list[dict]:
+    """Покрыто ли каждое требование эталона хотя бы одним пунктом брифа.
+
+    Отдельный дешёвый вызов: сверять свободный текст построчно бессмысленно,
+    а модель это делает по смыслу. Возвращает список вердиктов.
+    """
+    if not requirements:
+        return []
+    if client is None:
+        key = anthropic_key()
+        if not key:
+            raise BriefFailed(missing_secret_message("ANTHROPIC_API_KEY"))
+        from anthropic import AsyncAnthropic
+        client = AsyncAnthropic(api_key=key)
+
+    prompt = ("# ТРЕБОВАНИЯ\n" + "\n".join(f"- {r}" for r in requirements)
+              + "\n\n# ПУНКТЫ ТЗ\n" + "\n".join(f"- {line}" for line in brief_lines(data)))
+    assert_no_secrets(prompt)
+
+    # Сверка идёт ПОСЛЕ того, как бриф уже собран и оплачен. Уронить прогон
+    # из-за обрыва связи на дешёвом контрольном вызове — обиднее всего,
+    # поэтому пробуем несколько раз и в крайнем случае честно говорим,
+    # что сверка не состоялась.
+    import asyncio
+    resp = None
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            resp = await client.messages.create(
+                model=model or cfg.coverage_model, max_tokens=2000,
+                system=COVERAGE_SYSTEM, messages=[{"role": "user", "content": prompt}])
+            break
+        except Exception as e:
+            last_error = e
+            log.warning("сверка покрытия, попытка %s не удалась: %s", attempt, e)
+            if attempt < 3:
+                await asyncio.sleep(2 * attempt)
+    if resp is None:
+        log.error("сверка покрытия не состоялась: %s", last_error)
+        return [{"requirement": r, "verdict": "partial",
+                 "note": f"сверка не выполнена: {last_error}"} for r in requirements]
+
+    raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        log.warning("сверка покрытия вернула не-JSON: %r", raw[:300])
+        return [{"requirement": r, "verdict": "partial",
+                 "note": "сверка не разобралась"} for r in requirements]
+
+    results = parsed.get("results") if isinstance(parsed, dict) else None
+    if not isinstance(results, list):
+        return [{"requirement": r, "verdict": "partial", "note": "нет поля results"}
+                for r in requirements]
+
+    usage = getattr(resp, "usage", None)
+    if usage is not None:
+        log.info("сверка покрытия: вход %s, выход %s токенов",
+                 getattr(usage, "input_tokens", 0), getattr(usage, "output_tokens", 0))
+    return [r for r in results if isinstance(r, dict)]

@@ -122,6 +122,11 @@ class Config:
     brief_max_questions = _i("BRIEF_MAX_QUESTIONS", 3)
     # на сколько сообщений вперёд ищем согласие клиента на предложение владельца
     confirm_window = _i("CONFIRM_WINDOW", 3)
+    # сколько раз собирать бриф за один проход. >1 дорого, но лечит разброс
+    # модели: пункт входит в итог, если встретился хотя бы в одном прогоне
+    brief_samples = _i("BRIEF_SAMPLES", 1)
+    # дешёвая модель для сверки брифа с эталонным списком требований
+    coverage_model = os.getenv("COVERAGE_MODEL", "claude-haiku-4-5-20251001")
 
 
 cfg = Config()
