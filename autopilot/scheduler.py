@@ -13,7 +13,7 @@ from sqlalchemy import select, update
 
 from .config import cfg
 from .db import AccessItem, Project, Session, Task, decayed_units, spent_today, utcnow
-from .manual import ASSISTED_ONLY, NEEDS_HUMAN, needs_human
+from .manual import NEEDS_HUMAN, needs_human, unproven_note
 
 log = logging.getLogger("sched")
 
@@ -230,9 +230,10 @@ class Scheduler:
                     await self._set_status(task.id, "done")
                     await self.communicator.on_task_done(task, project)
                     await self._maybe_finish(project.id)
-                elif verdict.assisted_only:
-                    # Прошло, но вердикт вынесла модель. Автоматически закрыть
-                    # такую задачу — значит приравнять её оценку к зелёному тесту
+                elif verdict.unproven:
+                    # Прошло, но доказательства нет: судила модель либо
+                    # критерии оказались пустышками. Закрыть такую задачу —
+                    # значит приравнять её к зелёному тесту
                     await self._needs_confirmation(task, project, verdict)
                 else:
                     await self._on_fail(lane, task, project, verdict.defects)
@@ -259,26 +260,28 @@ class Scheduler:
             self.running[lane] -= 1
 
     async def _needs_confirmation(self, task: Task, project: Project, verdict) -> None:
-        """Задача сделана и проверки прошли — но все они assisted.
+        """Задача сделана и проверки прошли — но ничего не доказали.
 
         Это не провал: повторять сборку бессмысленно, агент ничего не чинил бы.
-        И не приёмка: единственное доказательство — мнение модели о скриншоте.
+        И не приёмка: доказательством было либо мнение модели, либо критерий,
+        который прошёл бы и на невыполненной задаче.
         Поэтому попытка НЕ засчитывается, задача просто ждёт живого решения.
         """
+        note = unproven_note(verdict)
         async with Session() as s:
             t = await s.get(Task, task.id)
             if t is None:
                 return
             t.status = NEEDS_HUMAN
-            t.defects = [ASSISTED_ONLY]
+            t.defects = [note]
             t.updated_at = utcnow()
             await s.commit()
         log.warning("задача %s ждёт подтверждения: %s (%s)",
                     task.id, task.title, verdict.summary())
         notify = getattr(self.communicator, "notify_owner", None)
         if notify is not None:
-            await notify(f"Задача {task.id} «{task.title}» сделана, но проверена "
-                         f"только моделью ({verdict.summary()}).\n"
+            await notify(f"Задача {task.id} «{task.title}» сделана, но приёмка "
+                         f"ничего не доказала — {verdict.why_unproven()}.\n"
                          f"Посмотреть — /show {task.id}, подтвердить — /confirm {task.id}")
 
     async def _on_fail(self, lane: str, task: Task, project: Project, defects: list[str]) -> None:

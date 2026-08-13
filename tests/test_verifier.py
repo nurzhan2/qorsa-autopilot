@@ -14,7 +14,7 @@ from autopilot.fakes import FakeExecutor, FakeVerifier
 from autopilot.manual import NEEDS_HUMAN
 from autopilot.planner import autonomy, classify
 from autopilot.scheduler import Scheduler
-from autopilot.verifier import Verdict, Verifier
+from autopilot.verifier import Verdict, Verifier, parse_judge_json
 
 # страница с блоком, который дорисовывает скрипт: по сырому HTML его не видно
 JS_PAGE = (
@@ -290,15 +290,15 @@ def test_autonomy_by_time():
 def test_verdict_splits_evidence():
     """Вердикт различает, КТО его вынес: код или модель."""
     both = Verdict(ok=True, defects=[], deterministic=2, assisted=1)
-    assert both.confirmed is True and both.assisted_only is False
+    assert both.confirmed is True and both.unproven is False
 
     # одна модель и ничего больше — не приёмка
     soft = Verdict(ok=True, defects=[], deterministic=0, assisted=3)
-    assert soft.confirmed is False and soft.assisted_only is True
+    assert soft.confirmed is False and soft.unproven is True
 
     # провал остаётся провалом при любом составе проверок
     bad = Verdict(ok=False, defects=["сломано"], deterministic=1, assisted=1)
-    assert bad.confirmed is False and bad.assisted_only is False
+    assert bad.confirmed is False and bad.unproven is False
 
 
 async def test_verifier_counts_by_source(db, tmp_path):
@@ -340,7 +340,7 @@ async def test_assisted_only_task_is_not_closed_automatically(db):
         row = await s.get(Task, task.id)
     assert row.status == NEEDS_HUMAN, "assisted-приёмка закрыла задачу сама"
     assert row.attempts == 0, "это не провал: пересобирать нечего"
-    assert manual.ASSISTED_ONLY in row.defects
+    assert any(d.startswith(manual.NEEDS_CONFIRMATION) for d in row.defects)
     assert manual.waits_for_confirmation(row) is True
     # и клиенту про готовность не рапортуем, пока владелец не подтвердил
     assert not comm.done, "отчёт клиенту ушёл до подтверждения"
@@ -418,3 +418,113 @@ def test_autonomy_counts_only_fully_autonomous():
     assert stats["autonomous"] == 1
     assert stats["by_class"]["auto"] == 2, "по классу их двое, а автономна одна"
     assert stats["auto_ratio"] == 0.5
+
+
+# ---------- подозрительные критерии не считаются доказательством ----------
+
+def test_verdict_suspicious_is_not_evidence():
+    """Пустышка исполнена кодом, но доказательством не является."""
+    v = Verdict(ok=True, defects=[], deterministic=0, assisted=1, suspicious=1)
+    assert v.confirmed is False and v.unproven is True
+    assert "пройдут и без этой задачи" in v.why_unproven()
+    assert "проверок с моделью" in v.why_unproven()
+
+
+async def test_suspicious_deterministic_does_not_close_task(db, tmp_path):
+    """`http 200` на корне рядом со скриншотом больше не закрывает задачу.
+
+    Ровно тот случай, что нашёлся на живом плане: детерминированная проверка
+    перевешивала assisted по факту наличия, хотя не доказывала ничего.
+    """
+    p = await make_project()
+    async with Session() as s:
+        pr = await s.get(Project, p.id)
+        pr.workspace = str(tmp_path)
+        await s.commit()
+        p = await s.get(Project, p.id)
+
+    # единственная детерминированная проверка — селектор, который есть везде
+    task = await make_task(p.id, [{"type": "dom", "url": JS_PAGE, "selector": "body"}])
+    verdict = await Verifier().run(task, p)
+
+    assert verdict.ok is True, "проверка сама по себе проходит"
+    assert verdict.suspicious == 1 and verdict.deterministic == 0
+    assert verdict.confirmed is False, "пустышка закрыла задачу"
+    assert verdict.unproven is True
+
+
+async def test_suspicious_only_task_goes_to_confirmation(db):
+    """Задача с одними пустышками ждёт подтверждения, а не уходит в done."""
+    p = await make_project()
+    task = await make_task(p.id, [{"type": "http", "url": "https://x/"}])
+
+    comm = FakeCommunicator()
+    sched = Scheduler(FakeExecutor(), FakeVerifier(suspicious_only=True), comm)
+    await sched.tick()
+    await sched.drain()
+
+    async with Session() as s:
+        row = await s.get(Task, task.id)
+    assert row.status == NEEDS_HUMAN
+    assert row.attempts == 0
+    assert manual.waits_for_confirmation(row) is True
+    assert not comm.done
+
+
+async def test_one_real_check_still_counts(db, tmp_path):
+    """Обратная сторона: непустая детерминированная проверка рядом с пустышкой
+    доказательством остаётся."""
+    p = await make_project()
+    (tmp_path / "style.css").write_text("body{}", encoding="utf-8")
+    async with Session() as s:
+        pr = await s.get(Project, p.id)
+        pr.workspace = str(tmp_path)
+        await s.commit()
+        p = await s.get(Project, p.id)
+
+    task = await make_task(p.id, [
+        {"type": "dom", "url": JS_PAGE, "selector": "body"},        # пустышка
+        {"type": "file_exists", "path": "style.css"},               # настоящая
+    ])
+    verdict = await Verifier().run(task, p)
+    assert verdict.deterministic == 1 and verdict.suspicious == 1
+    assert verdict.confirmed is True
+
+
+# ---------- судья, начинающий ответ прозой ----------
+
+def test_judge_json_plain():
+    data, extracted = parse_judge_json('{"verdict": "PASS", "defects": []}')
+    assert data["verdict"] == "PASS" and extracted is False
+
+    data, extracted = parse_judge_json('```json\n{"verdict": "FAIL"}\n```')
+    assert data["verdict"] == "FAIL" and extracted is False
+
+
+def test_judge_json_after_prose():
+    """Живой случай с проекта 2: сначала объяснение, потом вердикт."""
+    raw = ("I need to analyze the diff provided, but I notice the diff is empty.\n"
+           "Since no diff was provided, I cannot verify.\n\n"
+           '{"verdict": "FAIL", "defects": ["нет изменений"]}')
+    data, extracted = parse_judge_json(raw)
+    assert extracted is True, "вердикт был в ответе, но не прочитан"
+    assert data["verdict"] == "FAIL"
+    assert data["defects"] == ["нет изменений"]
+
+
+def test_judge_json_braces_inside_strings():
+    """Скобка внутри текста дефекта не обрывает объект."""
+    raw = 'ответ: {"verdict": "FAIL", "defects": ["сломан } тут", "и \\" кавычка"]}'
+    data, extracted = parse_judge_json(raw)
+    assert extracted is True
+    assert data["defects"] == ["сломан } тут", 'и " кавычка']
+
+
+def test_judge_json_truncated_stays_unreadable():
+    """Оборванный на max_tokens ответ выдумывать не будем: это по-прежнему FAIL."""
+    raw = 'I cannot verify.\n{"verdict": "FAIL", "defects": ['
+    data, extracted = parse_judge_json(raw)
+    assert data is None and extracted is False
+
+    assert parse_judge_json("")[0] is None
+    assert parse_judge_json("совсем без json")[0] is None

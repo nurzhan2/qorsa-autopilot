@@ -14,6 +14,7 @@ import httpx
 
 from .checks import (DEFAULT_TIMEOUT_SEC, HUMAN_ONLY, REGISTRY, VIEWPORTS,
                      is_runnable, spec)
+from .checks import suspicious as suspicious_reason
 from .config import cfg
 from .db import Project, Run, Session, Task
 from .vault import anthropic_key, missing_secret_message
@@ -61,28 +62,115 @@ class Verdict:
     # сколько проверок РЕАЛЬНО исполнено, по видам вердикта
     deterministic: int = 0      # shell / http / file_exists / dom — судит код
     assisted: int = 0           # screenshot / llm — судит модель
+    # детерминированные, но помеченные checks.suspicious(): исполнены и,
+    # возможно, пройдены — однако доказательством не считаются
+    suspicious: int = 0
 
     @property
     def confirmed(self) -> bool:
         """Прошла так, что машине можно верить: есть хоть одна проверка,
-        вердикт которой вынес код, а не модель. Только это закрывает задачу
-        автоматически."""
+        вердикт которой вынес код, а не модель, и которая при этом что-то
+        доказывает. Только это закрывает задачу автоматически."""
         return self.ok and self.deterministic > 0
 
     @property
-    def assisted_only(self) -> bool:
-        """Прошла, но целиком на слово модели. Не провал и не приёмка —
-        задача уходит владельцу на подтверждение."""
-        return self.ok and self.deterministic == 0 and self.assisted > 0
+    def unproven(self) -> bool:
+        """Прошла, но доказательства нет.
+
+        Два способа сюда попасть, и оба одинаково пусты:
+        * все проверки assisted — вердикт вынесла модель;
+        * все детерминированные проверки подозрительные — они пройдут и
+          на невыполненной задаче, то есть не проверяют ничего.
+
+        Не провал и не приёмка: задача уходит владельцу на подтверждение.
+        """
+        return self.ok and self.deterministic == 0
+
+    def why_unproven(self) -> str:
+        """Чем именно приёмка оказалась пустой — владельцу это решать."""
+        parts = []
+        if self.assisted:
+            parts.append(f"проверок с моделью: {self.assisted}")
+        if self.suspicious:
+            parts.append(f"критериев, которые пройдут и без этой задачи: "
+                         f"{self.suspicious}")
+        if not parts:
+            parts.append("исполнимых проверок нет")
+        return "; ".join(parts)
 
     def summary(self) -> str:
-        return (f"детерминированных проверок: {self.deterministic}, "
-                f"с моделью: {self.assisted}")
+        out = (f"детерминированных проверок: {self.deterministic}, "
+               f"с моделью: {self.assisted}")
+        if self.suspicious:
+            out += f", пустышек: {self.suspicious}"
+        return out
+
 
 # Цены судьи за миллион токенов. Заданы руками: SDK их не отдаёт, а без них
 # стоимость приёмки не попадает в суточный бюджет. Держи в актуальном состоянии.
 PRICE_IN = float(os.getenv("JUDGE_PRICE_IN_USD_PER_MTOK", "3") or 3)
 PRICE_OUT = float(os.getenv("JUDGE_PRICE_OUT_USD_PER_MTOK", "15") or 15)
+
+
+def parse_judge_json(raw: str) -> tuple[dict | None, bool]:
+    """Вердикт судьи из ответа модели. Возвращает (данные, пришлось_извлекать).
+
+    Судья просит СТРОГО JSON, но живая модель регулярно начинает с прозы:
+    «diff is empty, I cannot verify…» — и только потом выдаёт объект. Поймано
+    на прогоне по проекту 2. Строгий `json.loads` по всей строке на этом
+    падал, и код честно ставил FAIL «вердикт не разобран».
+
+    Направление безопасное, но это ЛОЖНЫЙ FAIL: он не находит дефект, а гонит
+    задачу на повтор и дальше в эскалацию на ровном месте. Поэтому объект
+    вырезается из текста.
+
+    Часть FAIL при этом станет PASS — но только те, где модель вердикт
+    вынесла, а мы его не прочитали. Флаг во втором элементе нужен, чтобы было
+    видно, как часто это происходит: если часто — чинить надо промпт судьи,
+    а не парсер.
+    """
+    text = (raw or "").replace("```json", "").replace("```", "").strip()
+    if not text:
+        return None, False
+    try:
+        data = json.loads(text)
+        return (data if isinstance(data, dict) else None), False
+    except ValueError:
+        pass
+
+    # Ищем первый сбалансированный объект. Скобки внутри строк не считаем,
+    # иначе дефект с "}" в тексте оборвёт объект на середине
+    start = text.find("{")
+    while start != -1:
+        depth, in_str, escaped = 0, False, False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        data = json.loads(text[start:i + 1])
+                    except ValueError:
+                        break          # не тот объект — пробуем следующий «{»
+                    if isinstance(data, dict):
+                        return data, True
+                    break
+        start = text.find("{", start + 1)
+    # оборванный ответ (упёрлись в max_tokens) сюда и попадает: закрывающей
+    # скобки просто нет, и выдумывать её мы не будем
+    return None, False
 
 
 class Verifier:
@@ -123,6 +211,7 @@ class Verifier:
         # считаем раздельно: кто вынес вердикт — код или модель
         deterministic = 0
         assisted = 0
+        suspicious = 0
 
         for check in task.acceptance or []:
             if not isinstance(check, dict):
@@ -156,7 +245,14 @@ class Verifier:
             # вообще проверяют», а не «что прошло»
             s = spec(kind)
             if s is not None and s.deterministic:
-                deterministic += 1
+                # Детерминированная — но доказывает ли она хоть что-нибудь?
+                # `http 200` на корне сайта проходит и на пустом хостинге:
+                # засчитывать её за доказательство значит закрывать задачу
+                # по критерию, который не заметил бы её невыполнения
+                if suspicious_reason(check):
+                    suspicious += 1
+                else:
+                    deterministic += 1
             elif s is not None and s.assisted:
                 assisted += 1
             if not ok:
@@ -168,7 +264,8 @@ class Verifier:
             defects.append("нет ни одной исполнимой проверки — принять задачу нечем")
 
         return Verdict(ok=not defects, defects=defects,
-                       deterministic=deterministic, assisted=assisted)
+                       deterministic=deterministic, assisted=assisted,
+                       suspicious=suspicious)
 
     # --- обёртки под единый контракт (check, cwd, task, project) ---
 
@@ -296,10 +393,11 @@ class Verifier:
             messages=[{"role": "user", "content": content}])
         await self._charge(task, project, resp, time.monotonic() - t0)
         raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        try:
-            data = json.loads(raw)
-        except Exception:
+        data, extracted = parse_judge_json(raw)
+        if extracted:
+            log.warning("судья по снимку начал ответ прозой, вердикт извлечён "
+                        "из текста (задача %s)", getattr(task, "id", "?"))
+        if data is None:
             return False, f"screenshot: судья вернул не-JSON: {raw[:200]!r}"
         if str(data.get("verdict")).upper() == "PASS":
             return True, ""
@@ -353,10 +451,13 @@ class Verifier:
         await self._charge(task, project, resp, time.monotonic() - t0)
 
         raw = "".join(b.text for b in resp.content if b.type == "text")
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        try:
-            data = json.loads(raw)
-        except Exception:
+        data, extracted = parse_judge_json(raw)
+        if extracted:
+            # считаем такие случаи: если их много, чинить надо промпт судьи,
+            # а не парсер — модель систематически не слушает «СТРОГО JSON»
+            log.warning("судья начал ответ прозой, вердикт извлечён из текста "
+                        "(задача %s): %r", task.id, raw[:200])
+        if data is None:
             # молча засчитывать PASS нельзя: непрочитанный вердикт — это не приёмка
             log.warning("судья вернул не-JSON для задачи %s: %r", task.id, raw[:300])
             return False, "судья не ответил: вердикт не разобран"

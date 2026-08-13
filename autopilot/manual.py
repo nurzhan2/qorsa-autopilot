@@ -28,11 +28,17 @@ log = logging.getLogger("manual")
 # статус задачи, которую машина принять не может и не притворяется
 NEEDS_HUMAN = "needs_human"
 
-# Задача прошла, но все проверки были assisted: вердикт вынесла модель.
-# Это не дефект работы — это дефект ДОКАЗАТЕЛЬСТВА, и закрывать по нему
-# задачу автоматически нельзя (см. verifier.Verdict)
-ASSISTED_ONLY = ("принять автоматически нечем: прошли только проверки с моделью "
-                 "(screenshot/llm), детерминированных нет — нужно твоё подтверждение")
+# Задача прошла, но доказательства нет: либо вердикт вынесла модель, либо
+# все детерминированные критерии оказались пустышками. Это не дефект работы —
+# это дефект ДОКАЗАТЕЛЬСТВА, и закрывать по нему задачу нельзя.
+# Метка стабильная: по её началу опознаётся ожидание подтверждения,
+# а причина дописывается следом и меняется свободно (см. verifier.Verdict)
+NEEDS_CONFIRMATION = "принять автоматически нечем"
+
+
+def unproven_note(verdict) -> str:
+    return (f"{NEEDS_CONFIRMATION}: {verdict.why_unproven()} — "
+            f"нужно твоё подтверждение")
 
 
 def needs_human(defects: list[str]) -> bool:
@@ -106,14 +112,15 @@ async def report(project_id: int | None = None) -> str:
 
 
 def waits_for_confirmation(task: Task) -> bool:
-    """Задача ждёт не работы, а подтверждения: проверки прошли, но все assisted."""
-    return task.status == NEEDS_HUMAN and ASSISTED_ONLY in (task.defects or [])
+    """Задача ждёт не работы, а решения: проверки прошли, но ничего не доказали."""
+    return task.status == NEEDS_HUMAN and any(
+        str(d).startswith(NEEDS_CONFIRMATION) for d in (task.defects or []))
 
 
 def _flag(task: Task) -> str:
     if waits_for_confirmation(task):
         # разница существенная: тут делать нечего, надо только решить
-        return f"\n    [ЖДЁТ ПОДТВЕРЖДЕНИЯ — проверено только моделью, /confirm {task.id}]"
+        return f"\n    [ЖДЁТ ПОДТВЕРЖДЕНИЯ — приёмка ничего не доказала, /confirm {task.id}]"
     if task.status == NEEDS_HUMAN:
         return "\n    [ЖДЁТ РАЗБОРА]"
     return ""
@@ -156,13 +163,14 @@ async def submit(task_id: int, verifier) -> tuple[bool, list[str]]:
         log.info("задача %s принята: все критерии прошли (%s)", task_id, verdict.summary())
         return True, []
 
-    if verdict.assisted_only:
+    if verdict.unproven:
         # Работа, возможно, сделана хорошо — но доказательства этому нет.
         # Отметка человека плюс мнение модели по-прежнему не критерий
-        await _set_status(task_id, NEEDS_HUMAN, [ASSISTED_ONLY])
+        note = unproven_note(verdict)
+        await _set_status(task_id, NEEDS_HUMAN, [note])
         log.warning("задача %s ждёт подтверждения владельца: %s",
                     task_id, verdict.summary())
-        return False, [ASSISTED_ONLY, f"подтвердить: /confirm {task_id}"]
+        return False, [note, f"подтвердить: /confirm {task_id}"]
 
     await _set_status(task_id, NEEDS_HUMAN, verdict.defects)
     log.warning("задача %s не принята: %s", task_id, "; ".join(verdict.defects)[:300])
