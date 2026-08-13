@@ -146,10 +146,34 @@ async def m003_group_roles(conn) -> None:
         "ON chat_participants (transport, chat_id, sender_id)"))
 
 
+async def m004_planner(conn) -> None:
+    """Фаза 4: план задач с проверяемой приёмкой."""
+    await ensure_tables(conn)
+    await _add_column(conn, "tasks", "deliverable_ref", "VARCHAR")
+    await _add_column(conn, "tasks", "verify_class", "VARCHAR(10) DEFAULT 'human'")
+    await _add_column(conn, "tasks", "executor", "VARCHAR(12) DEFAULT 'manual'")
+    await _add_column(conn, "tasks", "depends_on", "JSON")
+    await _add_column(conn, "tasks", "estimate_min", "INTEGER DEFAULT 0")
+    await _add_column(conn, "tasks", "risk", "VARCHAR")
+    await _add_column(conn, "tasks", "orphaned", "BOOLEAN DEFAULT 0")
+    await _add_column(conn, "projects", "autonomy_ratio", "FLOAT DEFAULT 0")
+    await _add_column(conn, "projects", "planned_at", "DATETIME")
+
+    # Задачи, заведённые до фазы 4 (демо и руками), ничего не знают о классах.
+    # Считаем их пригодными для агента: иначе демо перестанет работать,
+    # а это единственный способ посмотреть на планировщик вживую
+    await conn.execute(text("""
+        UPDATE tasks SET verify_class = 'auto', executor = 'claude_code'
+        WHERE verify_class IS NULL OR verify_class = '' OR verify_class = 'human'
+    """))
+    await conn.execute(text("UPDATE tasks SET depends_on = '[]' WHERE depends_on IS NULL"))
+
+
 MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline: схема фазы 1", m001_baseline),
     (2, "ingest: переписка, транспорты, привязка чатов", m002_ingest),
     (3, "группы: роли участников, готовность брифа", m003_group_roles),
+    (4, "planner: классы проверяемости, исполнитель, зависимости", m004_planner),
 ]
 
 

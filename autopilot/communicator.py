@@ -287,7 +287,7 @@ class Communicator:
             log.debug("проект %s: вопросы уже задавали недавно", project.id)
             return None
 
-        body = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions[:cfg.brief_max_questions]))
+        body = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions[:cfg.brief_questions_per_message]))
         text = ("Чтобы точно собрать ТЗ, не хватает нескольких деталей:\n" + body)
         return await self.draft(project, text, kind="brief_questions", force_route=TO_CLIENT)
 

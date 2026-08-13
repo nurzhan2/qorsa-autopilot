@@ -61,6 +61,10 @@ class Project(Base):
     client_replied_at: Mapped[dt.datetime | None] = mapped_column(default=None)
     # бриф собран, уверенности хватает, открытых вопросов нет — третий гейт build
     brief_ready: Mapped[bool] = mapped_column(default=False, server_default=text("0"))
+    # доля задач, которые система может закрыть без человека. Считается
+    # планировщиком и нужна ДО начала работы, а не после
+    autonomy_ratio: Mapped[float] = mapped_column(default=0.0, server_default=text("0"))
+    planned_at: Mapped[dt.datetime | None] = mapped_column(default=None)
 
     # new -> briefing -> active -> review -> done | blocked | blocked_access (см. CLAUDE.md)
     status: Mapped[str] = mapped_column(String(20), default="new")
@@ -95,6 +99,21 @@ class Task(Base):
 
     # pending -> ready -> running -> done | escalated
     status: Mapped[str] = mapped_column(String(15), default="ready")
+
+    # --- планирование (фаза 4) ---
+    # откуда взялась задача: текст пункта брифа. Без него задача — выдумка
+    deliverable_ref: Mapped[str | None] = mapped_column(default=None)
+    # чем проверяем результат: auto | assisted | human
+    verify_class: Mapped[str] = mapped_column(String(10), default="human",
+                                              server_default=text("'human'"))
+    # кто делает: claude_code | manual | external
+    executor: Mapped[str] = mapped_column(String(12), default="manual",
+                                          server_default=text("'manual'"))
+    depends_on: Mapped[list] = mapped_column(JSON, default=list)
+    estimate_min: Mapped[int] = mapped_column(default=0, server_default=text("0"))
+    risk: Mapped[str] = mapped_column(default="")
+    # требование исчезло из брифа — задачу не удаляем, а показываем человеку
+    orphaned: Mapped[bool] = mapped_column(default=False, server_default=text("0"))
     attempts: Mapped[int] = mapped_column(default=0)
     cc_session_id: Mapped[str | None] = mapped_column(default=None)
     defects: Mapped[list[str]] = mapped_column(JSON, default=list)

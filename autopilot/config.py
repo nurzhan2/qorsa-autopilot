@@ -119,7 +119,10 @@ class Config:
     brief_full_rebuild_every = _i("BRIEF_FULL_REBUILD_EVERY", 50)
     brief_context_messages = _i("BRIEF_CONTEXT_MESSAGES", 80)
     brief_max_attempts = _i("BRIEF_MAX_ATTEMPTS", 2)
-    brief_max_questions = _i("BRIEF_MAX_QUESTIONS", 3)
+    # сколько вопросов держим в брифе всего
+    brief_max_questions = _i("BRIEF_MAX_QUESTIONS", 8)
+    # и сколько отдаём клиенту за один раз: список из восьми он не читает
+    brief_questions_per_message = _i("BRIEF_QUESTIONS_PER_MESSAGE", 3)
     # на сколько сообщений вперёд ищем согласие клиента на предложение владельца
     confirm_window = _i("CONFIRM_WINDOW", 3)
     # сколько раз собирать бриф за один проход. >1 дорого, но лечит разброс
@@ -127,6 +130,12 @@ class Config:
     brief_samples = _i("BRIEF_SAMPLES", 1)
     # дешёвая модель для сверки брифа с эталонным списком требований
     coverage_model = os.getenv("COVERAGE_MODEL", "claude-haiku-4-5-20251001")
+
+    # --- planner.py ---
+    plan_model = os.getenv("PLAN_MODEL", "") or os.getenv("JUDGE_MODEL", "claude-sonnet-4-6")
+    plan_max_attempts = _i("PLAN_MAX_ATTEMPTS", 2)
+    # ниже этой доли auto-задач проект малопригоден для автопилота
+    autonomy_min_ratio = _f("AUTONOMY_MIN_RATIO", 0.5)
 
 
 cfg = Config()

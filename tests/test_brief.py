@@ -85,6 +85,11 @@ def reply(goal="сделать интернет-магазин", goal_ev=("1",),
     for item in data["deliverables"]:
         if isinstance(item, dict):
             item.setdefault("priority", "must")
+    # с фазы 4 у вопроса обязательно blocking; по умолчанию считаем
+    # блокирующим — так тесты фаз 3.x сохраняют прежний смысл
+    for item in data["open_questions"]:
+        if isinstance(item, dict):
+            item.setdefault("blocking", True)
     return json.dumps(data, ensure_ascii=False)
 
 
