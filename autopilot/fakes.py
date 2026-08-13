@@ -53,11 +53,13 @@ class FakeVerifier:
     """
 
     def __init__(self, ok: bool = True, defects: list[str] | None = None,
-                 delay: float = 0.0, assisted_only: bool = False):
+                 delay: float = 0.0, assisted_only: bool = False,
+                 suspicious_only: bool = False):
         self.ok = ok
         self.defects = defects or ["fake defect"]
         self.delay = delay
         self.assisted_only = assisted_only
+        self.suspicious_only = suspicious_only
         self.calls: list[int] = []
 
     async def run(self, task: Task, project: Project) -> Verdict:
@@ -65,7 +67,12 @@ class FakeVerifier:
         log.info("приёмка: проект %s / задача %s", project.id, task.title)
         if self.delay:
             await asyncio.sleep(self.delay)
-        det, ast = (0, 1) if self.assisted_only else (1, 0)
+        det, ast, susp = 1, 0, 0
+        if self.assisted_only:
+            det, ast = 0, 1
+        elif self.suspicious_only:
+            # детерминированные проверки есть, но все — пустышки
+            det, susp = 0, 1
         return Verdict(ok=self.ok,
                        defects=[] if self.ok else list(self.defects),
-                       deterministic=det, assisted=ast)
+                       deterministic=det, assisted=ast, suspicious=susp)
