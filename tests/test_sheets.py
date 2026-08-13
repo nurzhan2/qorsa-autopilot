@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gspread
+from sqlalchemy import select
 from conftest import make_project, make_tasks, make_account
 
 from autopilot import sheets
@@ -118,3 +119,125 @@ async def test_pull_touches_only_id_column(db, monkeypatch):
     assert proj.ready_for_work is True
     assert proj.sheet_row == 2
     assert proj.account_id == acc.id, "новый проект остался без компании"
+
+
+# ---------- подготовка к первому живому прогону ----------
+
+def test_parse_chat_ref_all_three_forms():
+    """Три формата, которыми заполняется «Чат клиента»."""
+    from autopilot.ingest import parse_chat_ref
+
+    assert parse_chat_ref("tg:@username") == ("telegram", "@username")
+    assert parse_chat_ref("max:@username") == ("max", "@username")
+    # без префикса — основной мессенджер компании, по умолчанию telegram
+    assert parse_chat_ref("@username") == ("telegram", "@username")
+    assert parse_chat_ref("@username", "max") == ("max", "@username")
+
+    # пробелы и регистр префикса не мешают
+    assert parse_chat_ref("  TG:@username  ") == ("telegram", "@username")
+    assert parse_chat_ref("Max:@username") == ("max", "@username")
+    # числовой id — тоже законная форма
+    assert parse_chat_ref("12345") == ("telegram", "12345")
+
+    # пусто — это не адрес, а его отсутствие
+    for empty in ("", "   ", None):
+        assert parse_chat_ref(empty) is None
+
+
+async def test_row_without_chat_does_not_break_sync(db, monkeypatch):
+    """Строка без «Чат клиента» не ломает синк и не заводит проект.
+
+    Флаг SHEET_REQUIRE_CHAT включён по умолчанию: иначе первая же запись
+    проставила бы ID во все строки листа разом.
+    """
+    acc = await make_account()
+    base = {c: "" for c in HEADER}
+    ws = FakeWorksheet(records=[
+        {**base, "Клиент": "С чатом", "Заказ": "лендинг", "Чат клиента": "tg:@ivan"},
+        {**base, "Клиент": "Без чата", "Заказ": "второй"},
+        {**base, "Клиент": "Тоже без", "Заказ": "третий"},
+    ])
+    monkeypatch.setattr(sheets, "_client", lambda *a, **k: ws)
+
+    sync = sheets.SheetSync(account=acc, account_id=acc.id)
+    await sync._pull()          # не падает
+
+    async with Session() as s:
+        rows = (await s.execute(select(Project))).scalars().all()
+    assert [r.client for r in rows] == ["С чатом"], "завели проект по строке без чата"
+    # и в таблицу ушёл ровно один ID, а не три
+    assert len(ws.batches) == 1
+
+
+async def test_require_chat_off_takes_everything(db, monkeypatch):
+    """Флаг снят — работает как раньше, подхватываются все строки."""
+    acc = await make_account()
+    base = {c: "" for c in HEADER}
+    ws = FakeWorksheet(records=[
+        {**base, "Клиент": "С чатом", "Заказ": "лендинг", "Чат клиента": "@ivan"},
+        {**base, "Клиент": "Без чата", "Заказ": "второй"},
+    ])
+    monkeypatch.setattr(sheets, "_client", lambda *a, **k: ws)
+
+    await sheets.SheetSync(account=acc, account_id=acc.id,
+                           require_chat=False)._pull()
+
+    async with Session() as s:
+        rows = (await s.execute(select(Project))).scalars().all()
+    assert len(rows) == 2
+
+
+async def test_existing_project_updates_without_chat(db, monkeypatch):
+    """Флаг ограничивает ЗАВЕДЕНИЕ проектов, а не обновление уже заведённых.
+
+    Иначе заказ, у которого чат стёрли, замер бы навсегда со старыми данными.
+    """
+    acc = await make_account()
+    project = await make_project(title="старое имя", tg_chat_id=None)
+    base = {c: "" for c in HEADER}
+    ws = FakeWorksheet(records=[
+        {**base, "ID": str(project.id), "Клиент": "клиент", "Заказ": "новое имя"},
+    ])
+    monkeypatch.setattr(sheets, "_client", lambda *a, **k: ws)
+
+    await sheets.SheetSync(account=acc, account_id=acc.id)._pull()
+
+    async with Session() as s:
+        row = await s.get(Project, project.id)
+    assert row.title == "новое имя"
+
+
+async def test_handle_chat_ref_is_not_bound_automatically(db, monkeypatch):
+    """`@username` не привязывается к чату сам — только числовой id.
+
+    Bot API не резолвит @username приватного пользователя, так что привязка
+    случается по первому входящему сообщению. Гадать нельзя: не тот chat_id —
+    это переписка не с тем человеком.
+    """
+    from autopilot.db import ProjectChat
+
+    acc = await make_account()
+    base = {c: "" for c in HEADER}
+    ws = FakeWorksheet(records=[
+        {**base, "Клиент": "Юлия", "Заказ": "Сайт на Тильде",
+         "Чат клиента": "@yulshatohina"},
+        {**base, "Клиент": "Числовой", "Заказ": "второй", "Чат клиента": "555111"},
+    ])
+    monkeypatch.setattr(sheets, "_client", lambda *a, **k: ws)
+
+    await sheets.SheetSync(account=acc, account_id=acc.id)._pull()
+
+    async with Session() as s:
+        chats = (await s.execute(select(ProjectChat))).scalars().all()
+        projects = {p.id: p.client for p in
+                    (await s.execute(select(Project))).scalars().all()}
+    bound = {projects[c.project_id] for c in chats}
+    assert bound == {"Числовой"}, "@username привязали, не дождавшись сообщения"
+
+
+def test_bot_columns_do_not_touch_human():
+    """Колонка «Стоимость $» добавлена боту и не пересекается с твоими."""
+    assert "Стоимость $" in sheets.BOT
+    assert not (set(sheets.HUMAN) & set(sheets.BOT))
+    # порядок колонок в листе значения не имеет: gspread ищет по названию
+    assert "Статус" in sheets.HUMAN and "Стадия заказа" in sheets.BOT

@@ -73,6 +73,14 @@ class Config:
     sheet_tab = os.getenv("SHEET_TAB", "Заказы")
     google_creds = os.getenv("GOOGLE_CREDS", str(ROOT / "service_account.json"))
     sheet_sync_sec = _i("SHEET_SYNC_SEC", 60)
+    # Заводить проект только для строк с заполненным «Чат клиента».
+    #
+    # По умолчанию ВКЛЮЧЕНО, и это осознанно. Без него первая же запись
+    # проставила бы ID во все строки листа разом — массовая правка, которую
+    # потом откатывать руками. С ним заказы подхватываются по одному, ровно
+    # по мере того, как в них появляется чат: до этого момента боту всё равно
+    # нечего делать с заказом, писать по нему некуда.
+    sheet_require_chat = _b("SHEET_REQUIRE_CHAT", True)
 
     tg_token = os.getenv("TG_BOT_TOKEN", "")
     tg_owner = os.getenv("TG_OWNER_CHAT_ID", "")       # я, техчасть
