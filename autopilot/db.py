@@ -64,6 +64,9 @@ class Project(Base):
     # доля задач, которые система может закрыть без человека. Считается
     # планировщиком и нужна ДО начала работы, а не после
     autonomy_ratio: Mapped[float] = mapped_column(default=0.0, server_default=text("0"))
+    # та же доля, но по времени: мелких ручных задач может быть много,
+    # а времени они занимать мало — и наоборот
+    autonomy_ratio_time: Mapped[float] = mapped_column(default=0.0, server_default=text("0"))
     planned_at: Mapped[dt.datetime | None] = mapped_column(default=None)
 
     # new -> briefing -> active -> review -> done | blocked | blocked_access (см. CLAUDE.md)
@@ -97,7 +100,7 @@ class Task(Base):
     prompt: Mapped[str] = mapped_column(default="")
     acceptance: Mapped[list[dict]] = mapped_column(JSON, default=list)
 
-    # pending -> ready -> running -> done | escalated
+    # pending -> ready -> running -> done | escalated | needs_human
     status: Mapped[str] = mapped_column(String(15), default="ready")
 
     # --- планирование (фаза 4) ---

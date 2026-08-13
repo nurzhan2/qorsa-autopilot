@@ -169,11 +169,18 @@ async def m004_planner(conn) -> None:
     await conn.execute(text("UPDATE tasks SET depends_on = '[]' WHERE depends_on IS NULL"))
 
 
+async def m005_verifier(conn) -> None:
+    """Фаза 5: вторая цифра автономности."""
+    await ensure_tables(conn)
+    await _add_column(conn, "projects", "autonomy_ratio_time", "FLOAT DEFAULT 0")
+
+
 MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline: схема фазы 1", m001_baseline),
     (2, "ingest: переписка, транспорты, привязка чатов", m002_ingest),
     (3, "группы: роли участников, готовность брифа", m003_group_roles),
     (4, "planner: классы проверяемости, исполнитель, зависимости", m004_planner),
+    (5, "verifier: доля автономности по времени", m005_verifier),
 ]
 
 
