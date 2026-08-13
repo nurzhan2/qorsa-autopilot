@@ -37,6 +37,7 @@ from sqlalchemy import select
 
 from .brief import (BriefFailed, SecretLeak, assert_no_secrets, item_text,
                     same_item)
+from . import checks
 from .config import cfg
 from .db import AccessItem, Project, Run, Session, Task, utcnow
 from .vault import anthropic_key, missing_secret_message
@@ -47,24 +48,12 @@ log = logging.getLogger("plan")
 VERIFY_CLASSES = ("auto", "assisted", "human")
 EXECUTORS = ("claude_code", "manual", "external")
 
-# Проверки, которые выполняет код без участия человека и модели.
-# Ровно они и дают право называться auto — см. verifier.py.
-DETERMINISTIC_CHECKS = ("shell", "http", "file_exists", "dom")
-# Проверки, где вердикт выносит модель. Подсказка, не приговор.
-ASSISTED_CHECKS = ("llm", "screenshot")
-KNOWN_CHECKS = DETERMINISTIC_CHECKS + ASSISTED_CHECKS + ("human",)
-
-# Обязательные поля у каждого вида проверки: без них проверка не запустится,
-# а значит она не проверка, а обещание
-CHECK_FIELDS = {
-    "shell": ("cmd",),
-    "http": ("url",),
-    "file_exists": ("path",),
-    "dom": ("url", "selector"),
-    "llm": ("criteria",),
-    "screenshot": ("url",),
-    "human": ("criteria",),
-}
+# Типы проверок берутся из общего реестра. Планировщик не вправе выдать тип,
+# которого верификатор не умеет, — именно на этом разрыве приёмка однажды
+# проходила вообще без проверок.
+DETERMINISTIC_CHECKS = checks.DETERMINISTIC
+ASSISTED_CHECKS = checks.ASSISTED
+KNOWN_CHECKS = checks.KNOWN
 
 # Признаки того, что работа лежит вне репозитория и агенту недоступна
 MANUAL_HINTS = (
@@ -73,7 +62,7 @@ MANUAL_HINTS = (
     "загрузить через", "залить через", "настроить в кабинете",
 )
 
-SYSTEM = """Ты технический директор. Из готового ТЗ ты собираешь план работ.
+SYSTEM_TEMPLATE = """Ты технический директор. Из готового ТЗ ты собираешь план работ.
 
 Твоя главная задача — НЕ придумать красивые задачи, а честно сказать, что
 из этого можно проверить машиной, а что нельзя.
@@ -84,15 +73,20 @@ SYSTEM = """Ты технический директор. Из готового 
    пункта, из которого задача взялась. Задача без deliverable_ref будет
    выброшена: план не должен содержать работы, которую никто не просил.
 
-2. acceptance — это КОД, который выполнится, а не пожелание. Типы:
-     shell        {"type":"shell","cmd":"npm run build"}            — команда, код возврата 0
-     http         {"type":"http","url":"https://.../","expect":200} — запрос и ожидаемый статус
-     file_exists  {"type":"file_exists","path":"wp-content/..."}    — файл на месте
-     dom          {"type":"dom","url":"...","selector":".filter"}   — селектор есть на странице
-     llm          {"type":"llm","criteria":"..."}                   — судит модель по дифу
-     human        {"type":"human","criteria":"..."}                 — судит человек глазами
+2. acceptance — это КОД, который выполнится, а не пожелание. Только эти типы,
+   другие верификатор исполнить не сможет:
+{CHECKS}
    Не выдумывай проверку, которой не будет. «Сайт работает» — это не проверка.
-   «curl -f https://site/ отдаёт 200» — проверка.
+
+   ГЛАВНОЕ ПРАВИЛО КРИТЕРИЯ: он обязан ПАДАТЬ на состоянии «эта задача не
+   выполнена, всё остальное на месте». Критерий, который проходит на пустом
+   проекте, бесполезен.
+     ПЛОХО: задача «установить WooCommerce», критерий http https://site/ → 200
+            (главная отдаёт 200 и без WooCommerce — критерий пройдёт всегда)
+     ХОРОШО: dom https://site/cart/ селектор .woocommerce-cart
+            (на сайте без WooCommerce страницы корзины нет)
+   Проверяй каждый критерий этим вопросом: «а если задачу не делать, он
+   упадёт?». Если нет — критерий негодный, придумай другой.
 
 3. verify_class — честная оценка:
      auto     — среди acceptance есть shell/http/file_exists/dom
@@ -132,6 +126,8 @@ SYSTEM = """Ты технический директор. Из готового 
   ]
 }"""
 
+SYSTEM = SYSTEM_TEMPLATE.replace("{CHECKS}", checks.prompt_reference())
+
 
 class PlanFailed(RuntimeError):
     """Модель не смогла отдать валидный план."""
@@ -143,19 +139,7 @@ class CycleInPlan(RuntimeError):
 
 # ---------- проверки, которые делает КОД ----------
 
-def valid_checks(acceptance) -> list[dict]:
-    """Оставляет только те проверки, которые действительно можно выполнить."""
-    out = []
-    for check in acceptance or []:
-        if not isinstance(check, dict):
-            continue
-        kind = str(check.get("type") or "")
-        if kind not in KNOWN_CHECKS:
-            continue
-        if not all(str(check.get(f) or "").strip() for f in CHECK_FIELDS[kind]):
-            continue        # проверка без обязательного поля не запустится
-        out.append(check)
-    return out
+valid_checks = checks.valid_checks
 
 
 def classify(task: dict, declared: str | None = None) -> str:
@@ -241,19 +225,36 @@ def topological_order(tasks: list[dict]) -> list[str]:
 
 
 def autonomy(tasks: list[dict]) -> dict:
-    """Доля работы, которую система закроет без человека."""
+    """Доля работы, которую система закроет без человека.
+
+    Две цифры, и они говорят разное. По ЧИСЛУ задач пятнадцать мелких ручных
+    против одной большой автоматической дают 7%, хотя по времени картина
+    может быть обратной. Поэтому считаем и по количеству, и по estimate_min.
+    """
     total = len(tasks) or 1
+    minutes_total = sum(int(t.get("estimate_min") or 0) for t in tasks)
     by_class = {c: sum(1 for t in tasks if t["verify_class"] == c) for c in VERIFY_CLASSES}
     by_executor = {e: sum(1 for t in tasks if t["executor"] == e) for e in EXECUTORS}
-    # автономно закрывается только то, что агент и сделает, и проверит
-    autonomous = sum(1 for t in tasks
-                     if t["verify_class"] == "auto" and t["executor"] == "claude_code")
+
+    def is_autonomous(t: dict) -> bool:
+        # автономно закрывается только то, что агент и сделает, и проверит
+        return t["verify_class"] == "auto" and t["executor"] == "claude_code"
+
+    autonomous = sum(1 for t in tasks if is_autonomous(t))
+    minutes_auto = sum(int(t.get("estimate_min") or 0) for t in tasks if is_autonomous(t))
+    ratio = autonomous / total
+    ratio_time = (minutes_auto / minutes_total) if minutes_total else 0.0
     return {
         "tasks": len(tasks),
+        "minutes": minutes_total,
+        "minutes_auto": minutes_auto,
         "by_class": by_class,
         "by_executor": by_executor,
-        "auto_ratio": round(autonomous / total, 2),
-        "suitable": autonomous / total >= cfg.autonomy_min_ratio,
+        "auto_ratio": round(ratio, 2),
+        "auto_ratio_time": round(ratio_time, 2),
+        # берём лучшую из двух: если по времени автопилот закрывает половину,
+        # проект имеет смысл, даже когда мелких ручных задач много
+        "suitable": max(ratio, ratio_time) >= cfg.autonomy_min_ratio,
     }
 
 
@@ -557,9 +558,11 @@ class Planner:
             p = await s.get(Project, project.id)
             if p is not None:
                 p.autonomy_ratio = stats["auto_ratio"]
+                p.autonomy_ratio_time = stats["auto_ratio_time"]
                 p.planned_at = utcnow()
-                p.last_action = (f"план: {stats['tasks']} задач, "
-                                 f"автономно {stats['auto_ratio'] * 100:.0f}%")
+                p.last_action = (f"план: {stats['tasks']} задач, автономно "
+                                 f"{stats['auto_ratio'] * 100:.0f}% задач / "
+                                 f"{stats['auto_ratio_time'] * 100:.0f}% времени")
                 p.updated_at = utcnow()
             await s.commit()
         log.info("проект %s: план записан — %s задач, автономность %.0f%%",
@@ -577,7 +580,8 @@ class Planner:
 
     async def _notify(self, project: Project, stats: dict) -> None:
         body = (f"Проект {project.id} «{project.title}»: автономно закрывается "
-                f"{stats['auto_ratio'] * 100:.0f}% задач при пороге "
+                f"{stats['auto_ratio'] * 100:.0f}% задач и "
+                f"{stats['auto_ratio_time'] * 100:.0f}% времени при пороге "
                 f"{cfg.autonomy_min_ratio * 100:.0f}%.\n"
                 f"Классы: {stats['by_class']}\nИсполнители: {stats['by_executor']}\n"
                 f"Решай, браться ли за проект на автопилоте.")

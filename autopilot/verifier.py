@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import time
+from pathlib import Path
 
 import httpx
 
+from .checks import (DEFAULT_TIMEOUT_SEC, HUMAN_ONLY, REGISTRY, VIEWPORTS,
+                     is_runnable)
 from .config import cfg
 from .db import Project, Run, Session, Task
 from .vault import anthropic_key, missing_secret_message
@@ -55,31 +59,197 @@ class Verifier:
                         "пропускается" if self.judge_optional else "будет валить задачи",
                         missing_secret_message("ANTHROPIC_API_KEY"))
 
+    # Тип проверки -> метод. Покрытие реестра проверяется тестом:
+    # разрыв между тем, что планировщик выдаёт, и тем, что верификатор
+    # умеет, однажды уже дал «приёмку без единой проверки».
+    @property
+    def handlers(self) -> dict:
+        return {
+            "shell": self._check_shell,
+            "http": self._check_http,
+            "file_exists": self._check_file_exists,
+            "dom": self._check_dom,
+            "screenshot": self._check_screenshot,
+            "llm": self._check_llm,
+            "human": self._check_human,
+        }
+
     async def run(self, task: Task, project: Project) -> tuple[bool, list[str]]:
         cwd = project.workspace or str(cfg.workspaces / f"p{project.id}")
         defects: list[str] = []
+        executed = 0
 
         for check in task.acceptance or []:
             if not isinstance(check, dict):
                 defects.append(f"кривой критерий приёмки: {check!r}")
                 continue
-            kind = check.get("type")
-            try:
-                if kind == "shell":
-                    ok, msg = await self._shell(check["cmd"], cwd)
-                elif kind == "http":
-                    ok, msg = await self._http(check["url"], int(check.get("expect", 200)))
-                elif kind == "llm":
-                    ok, msg = await self._judge(check.get("criteria", ""), cwd, task, project)
+            kind = str(check.get("type") or "")
+            handler = self.handlers.get(kind)
+            if handler is None:
+                # Раньше здесь стоял пропуск, и задача с одними неизвестными
+                # критериями объявлялась принятой. Молчаливый пропуск проверки —
+                # худший режим этой системы: он выглядит как успех
+                defects.append(f"неизвестный тип проверки {kind!r} — приёмка невозможна")
+                continue
+            if not is_runnable(check):
+                if kind in HUMAN_ONLY:
+                    defects.append(f"human: {check.get('criteria') or 'нужен человек'}")
                 else:
-                    log.warning("неизвестный тип проверки %r в задаче %s — пропускаю", kind, task.id)
-                    ok, msg = True, ""
+                    missing = [f for f in REGISTRY[kind].required
+                               if not str(check.get(f) or "").strip()]
+                    defects.append(f"{kind}: нет обязательных полей {missing} — "
+                                   f"проверка не запустится")
+                continue
+
+            try:
+                ok, msg = await handler(check, cwd, task, project)
             except Exception as e:
                 ok, msg = False, f"{kind}: {e}"
+            executed += 1
             if not ok:
                 defects.append(msg)
 
+        if executed == 0:
+            # Ни одной исполнимой проверки. Это не «нечего проверять»,
+            # это «проверить нечем» — и оно не может считаться приёмкой
+            defects.append("нет ни одной исполнимой проверки — принять задачу нечем")
+
         return (not defects), defects
+
+    # --- обёртки под единый контракт (check, cwd, task, project) ---
+
+    async def _check_shell(self, check, cwd, task, project):
+        return await self._shell(check["cmd"], cwd)
+
+    async def _check_http(self, check, cwd, task, project):
+        return await self._http(check["url"], int(check.get("expect", 200) or 200))
+
+    async def _check_llm(self, check, cwd, task, project):
+        return await self._judge(check.get("criteria", ""), cwd, task, project)
+
+    async def _check_human(self, check, cwd, task, project):
+        """Человеческая проверка машиной не выполняется — и не притворяется."""
+        return False, f"human: {check.get('criteria') or 'нужна проверка глазами'}"
+
+    # --- новые типы ---
+
+    async def _check_file_exists(self, check, cwd, task, project):
+        """Файл на месте. Путь строго внутри каталога проекта.
+
+        Без песочницы критерий `../../etc/passwd` проходил бы всегда,
+        а `C:/Windows/win.ini` превращал бы приёмку в фикцию.
+        """
+        root = Path(cwd).resolve()
+        raw = str(check.get("path") or "")
+        candidate = (root / raw).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            return False, (f"file_exists: путь {raw!r} выходит за пределы каталога "
+                           f"проекта — такой критерий не проверяется")
+        if candidate.exists():
+            return True, ""
+        near = ", ".join(sorted(p.name for p in candidate.parent.iterdir())[:8]) \
+            if candidate.parent.exists() else "каталога нет"
+        return False, f"file_exists: нет {raw}. Рядом: {near}"
+
+    async def _check_dom(self, check, cwd, task, project):
+        """Селектор на живой странице. Через headless-браузер, а не разбор HTML:
+        половина верстки сегодня дорисовывается скриптами, и по сырому
+        HTML такой проверки не сделать."""
+        url = str(check.get("url") or "")
+        selector = str(check.get("selector") or "")
+        need = int(check.get("min_count", 1) or 1)
+        timeout = float(check.get("timeout", DEFAULT_TIMEOUT_SEC) or DEFAULT_TIMEOUT_SEC)
+
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            return False, ("dom: playwright не установлен — проверка невыполнима "
+                           "(pip install playwright && playwright install chromium)")
+
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch()
+                try:
+                    page = await browser.new_page()
+                    page.set_default_timeout(timeout * 1000)
+                    await page.goto(url, wait_until="networkidle",
+                                    timeout=timeout * 1000)
+                    count = await page.locator(selector).count()
+                    if count >= need:
+                        return True, ""
+                    title = (await page.title())[:80]
+                    body = (await page.inner_text("body"))[:200].replace("\n", " ")
+                    return False, (f"dom: {url} — селектор {selector!r} найден {count} раз, "
+                                   f"нужно {need}. Заголовок: {title!r}. "
+                                   f"Начало страницы: {body!r}")
+                finally:
+                    await browser.close()
+        except Exception as e:
+            return False, f"dom: {url} не проверить — {type(e).__name__}: {e}"
+
+    async def _check_screenshot(self, check, cwd, task, project):
+        """Снимки на трёх ширинах и вердикт модели по описанию критерия.
+
+        Это assisted-проверка: модель видит картинку и говорит, похоже ли на
+        описанное. Приговором такой вердикт не считается — но он ловит
+        разъехавшуюся вёрстку, которую селектором не поймать.
+        """
+        url = str(check.get("url") or "")
+        criteria = str(check.get("criteria") or "")
+        timeout = float(check.get("timeout", DEFAULT_TIMEOUT_SEC) or DEFAULT_TIMEOUT_SEC)
+
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            return False, "screenshot: playwright не установлен — проверка невыполнима"
+        if self.client is None:
+            return False, ("screenshot: судить снимок нечем — "
+                           + missing_secret_message("ANTHROPIC_API_KEY").splitlines()[0])
+
+        shots: list[tuple[str, bytes]] = []
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch()
+                try:
+                    for width, height in VIEWPORTS:
+                        page = await browser.new_page(viewport={"width": width,
+                                                                "height": height})
+                        page.set_default_timeout(timeout * 1000)
+                        await page.goto(url, wait_until="networkidle",
+                                        timeout=timeout * 1000)
+                        shots.append((f"{width}px", await page.screenshot(full_page=False)))
+                        await page.close()
+                finally:
+                    await browser.close()
+        except Exception as e:
+            return False, f"screenshot: {url} не снять — {type(e).__name__}: {e}"
+
+        content = [{"type": "text",
+                    "text": (f"Критерий: {criteria}\n\nНиже снимки одной страницы на трёх "
+                             f"ширинах. Ответь СТРОГО JSON: "
+                             f'{{"verdict":"PASS|FAIL","reason":"коротко"}}')}]
+        for label, png in shots:
+            content.append({"type": "text", "text": f"Ширина {label}:"})
+            content.append({"type": "image",
+                            "source": {"type": "base64", "media_type": "image/png",
+                                       "data": base64.b64encode(png).decode()}})
+
+        t0 = time.monotonic()
+        resp = await self.client.messages.create(
+            model=cfg.judge_model, max_tokens=800,
+            messages=[{"role": "user", "content": content}])
+        await self._charge(task, project, resp, time.monotonic() - t0)
+        raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return False, f"screenshot: судья вернул не-JSON: {raw[:200]!r}"
+        if str(data.get("verdict")).upper() == "PASS":
+            return True, ""
+        return False, f"screenshot: {data.get('reason') or 'не соответствует описанию'}"
 
     # --- уровень 1: детерминированные ---
 

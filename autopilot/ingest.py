@@ -34,6 +34,7 @@ from .transports.base import Backoff, InboundMessage, save_offset
 log = logging.getLogger("ingest")
 
 BIND_HINT = "/bind"
+DONE_HINT = "/done"
 
 GROUP_TYPES = ("group", "supergroup", "chat")
 
@@ -63,10 +64,13 @@ def parse_chat_ref(raw: str) -> tuple[str, str] | None:
 
 
 class Ingest:
-    def __init__(self, transports, communicator, scheduler=None):
+    def __init__(self, transports, communicator, scheduler=None, verifier=None):
         self.transports = {t.name: t for t in transports}
         self.communicator = communicator
         self.scheduler = scheduler
+        # тот же верификатор, что и у полосы verify: человек не должен
+        # проходить приёмку по более мягким правилам, чем агент
+        self.verifier = verifier
         # последний неопознанный чат — чтобы «/bind 7» без аргументов сработал
         self._last_unbound: tuple[str, str] | None = None
 
@@ -147,6 +151,8 @@ class Ingest:
                 return await self._existing(msg)
 
         if await self._maybe_bind_command(msg):
+            return row
+        if await self._maybe_done_command(msg):
             return row
 
         if project_id is None:
@@ -338,6 +344,31 @@ class Ingest:
         if ok:
             self._last_unbound = None
         return ok
+
+    async def _maybe_done_command(self, msg: InboundMessage) -> bool:
+        """`/done 17` от владельца: отметить ручную задачу и сразу проверить.
+
+        Ровно та же схема, что у агента: человек говорит «сделал», критерии
+        решают. 87% работы в реальном плане ручные, и без этой команды
+        система для них бесполезна.
+        """
+        text = (msg.text or "").strip()
+        if not text.startswith(DONE_HINT) or str(msg.chat_id) != str(cfg.tg_owner):
+            return False
+        parts = text.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            await self._warn_owner(f"Не понял: «{text}». Формат — «{DONE_HINT} 17».")
+            return True
+
+        from .manual import submit
+        from .verifier import Verifier
+        ok, defects = await submit(int(parts[1]), self.verifier or Verifier())
+        if ok:
+            await self._warn_owner(f"Задача {parts[1]} принята: критерии прошли.")
+        else:
+            body = "\n".join(f"  ✗ {d}" for d in defects)
+            await self._warn_owner(f"Задача {parts[1]} НЕ принята:\n{body}")
+        return True
 
     async def _report_unbound(self, msg: InboundMessage) -> None:
         """Сообщение сохранено, но чей оно — неизвестно. Спрашиваем владельца."""

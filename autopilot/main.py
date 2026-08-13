@@ -99,7 +99,7 @@ async def main() -> None:
         log.critical("OWNER_TG_ID не задан — ingest выключен. Без id владельца "
                      "его собственные реплики уедут в ТЗ как требования клиента")
     elif transports:
-        ingest = Ingest(transports, communicator, sched)
+        ingest = Ingest(transports, communicator, sched, verifier)
         tasks.append(asyncio.create_task(ingest.run(), name="ingest"))
     else:
         log.warning("ни один мессенджер не настроен — входящие не принимаются")

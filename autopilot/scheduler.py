@@ -13,6 +13,7 @@ from sqlalchemy import select, update
 
 from .config import cfg
 from .db import AccessItem, Project, Session, Task, decayed_units, spent_today, utcnow
+from .manual import NEEDS_HUMAN, needs_human
 
 log = logging.getLogger("sched")
 
@@ -260,6 +261,14 @@ class Scheduler:
                 return
             t.attempts += 1
             t.defects = defects
+            if needs_human(defects):
+                # Проверять нечем — агент это не починит, сколько ни повторяй.
+                # Задача уходит человеку сразу, а не после MAX_ATTEMPTS попыток
+                t.status = NEEDS_HUMAN
+                t.updated_at = utcnow()
+                await s.commit()
+                log.warning("задача %s ждёт человека: %s", t.id, "; ".join(defects)[:200])
+                return
             if t.attempts >= cfg.max_attempts:
                 t.status = "escalated"
                 p = await s.get(Project, project.id)
@@ -377,7 +386,8 @@ class Scheduler:
                 return
             left = (await s.execute(
                 select(Task.id).where(Task.project_id == project_id,
-                                      Task.status.notin_(("done", "escalated"))))).first()
+                                      Task.status.notin_(
+                                          ("done", "escalated", NEEDS_HUMAN))))).first()
             if left is not None:
                 return
             p.status = "review"
