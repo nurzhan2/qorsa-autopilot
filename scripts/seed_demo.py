@@ -86,13 +86,17 @@ async def main() -> None:
             for name, kind, st in access:
                 s.add(AccessItem(project_id=p.id, name=name, kind=kind, status=st))
             for i in range(n_build):
+                # с фазы 4 у задачи есть класс проверяемости и исполнитель;
+                # без них демо-задачи не попадут в build и смотреть будет не на что
                 s.add(Task(project_id=p.id, order_idx=i, lane="build",
                            title=f"шаг {i + 1}", prompt="демо-задача, реальной работы нет",
-                           status="ready"))
+                           status="ready", verify_class="auto", executor="claude_code",
+                           deliverable_ref="демо", depends_on=[]))
             for i in range(n_chat):
                 s.add(Task(project_id=p.id, order_idx=100 + i, lane="chat",
                            title=f"ответ клиенту {i + 1}", prompt="демо-сообщение",
-                           status="ready"))
+                           status="ready", verify_class="auto", executor="claude_code",
+                           deliverable_ref="демо", depends_on=[]))
             dl = deadline.isoformat() if deadline else "без дедлайна"
             waiting = [n for n, _, st in access if st != "verified"]
             why = ""

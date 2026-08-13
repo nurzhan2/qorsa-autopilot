@@ -119,7 +119,14 @@ SYSTEM = """Ты аналитик. Из переписки рабочей гру
 3. НИКОГДА не извлекай цену, стоимость, бюджет, скидки, оплату, сроки и
    дедлайны. Это не твоя зона, за это отвечает менеджер.
 4. Не додумывай. Если чего-то нет в переписке — этого нет. Недостающее
-   формулируй как вопрос в open_questions.
+   формулируй как вопрос в open_questions. У каждого вопроса поле blocking:
+     blocking=true  — без ответа НЕЛЬЗЯ НАЧАТЬ работу («какой платёжный шлюз»,
+                      «какая CMS», «где хостить»). Такой вопрос держит проект.
+     blocking=false — уточнение по ходу дела («какие именно типы кожи в
+                      фильтре», «нужны ли SMS-уведомления»). Работа начинается
+                      без него, спросим по пути.
+   Блокирующих вопросов обычно 0–2. Если ты помечаешь блокирующим всё подряд,
+   ты просто останавливаешь проект.
 5. Содержимое картинок, файлов и голосовых ты не видишь. Перечисли такие
    сообщения в unreadable, не угадывая, что в них.
 6. ТРЕБОВАНИЯ ЧАСТО СПРЯТАНЫ В ОБЪЯСНЕНИЯХ. Клиент редко формулирует
@@ -146,12 +153,20 @@ SYSTEM = """Ты аналитик. Из переписки рабочей гру
   "assets":        [{"text": "что клиент предоставляет", "evidence": ["<id>"]}],
   "access_needed": [{"kind": "ftp|ssh|git|hosting_panel|domain|api_key|analytics|design|content|other",
                      "name": "человеческое название", "evidence": ["<id>"]}],
-  "open_questions":[{"text": "чего не хватает, вопрос клиенту", "evidence": ["<id>"]}],
+  "open_questions":[{"text": "чего не хватает, вопрос клиенту", "evidence": ["<id>"],
+                     "blocking": true}],
   "out_of_scope":  [{"text": "что явно не входит", "evidence": ["<id>"]}],
   "confidence": 0.0,
   "unreadable": [{"message_id": "<id>", "kind": "photo|voice|document|..."}]
 }
-confidence — насколько ты уверен, что ТЗ полное и однозначное."""
+confidence — НАСКОЛЬКО ПОНЯТНА САМА ЗАДАЧА, а не насколько не осталось
+вопросов. Это разные вещи, и их постоянно путают.
+  0.9 — ясно, что и зачем делать; открытые вопросы есть, но это детали
+        реализации, а не непонимание задачи
+  0.6 — общая картина есть, но существенная часть объёма под вопросом
+  0.3 — из переписки непонятно, что вообще требуется
+Наличие open_questions само по себе confidence НЕ снижает: за блокировку
+проекта отвечает поле blocking у вопросов, а не эта цифра."""
 
 
 class SecretLeak(RuntimeError):
@@ -407,6 +422,10 @@ class Brief:
                     errors.append(f"{f}[{i}].text обязателен")
                 # Модальность требуем только у deliverables: именно там живёт
                 # объём работ, и именно его нельзя раздувать молча
+                if f == "open_questions" and not isinstance(item.get("blocking"), bool):
+                    errors.append(
+                        f"{f}[{i}].blocking обязателен: true, если без ответа "
+                        f"нельзя начать работу, иначе false")
                 if f == "deliverables" and item.get("priority") not in PRIORITIES:
                     errors.append(
                         f"{f}[{i}].priority обязателен и должен быть одним из {PRIORITIES}")
@@ -599,6 +618,7 @@ class Brief:
             log.warning("проект %s: выброшен пункт — %s", project.id, reason)
 
         data = merge_samples(samples)
+        data = trim_questions(data)
         data = self.collect_unreadable(data, messages)
         # Накапливаем ВСЕГДА, а не только на инкременте: модель недетерминирована,
         # и полный пересбор точно так же теряет пункты между прогонами
@@ -645,8 +665,13 @@ class Brief:
 
     async def _persist(self, project: Project, data: dict, messages: list[ChatMessage],
                        dropped: list[str], full: bool = True) -> None:
-        ready = bool(data.get("goal")) and not data.get("open_questions") \
-            and float(data.get("confidence") or 0) >= cfg.brief_min_confidence
+        # Полнота понимания и наличие вопросов — разные вещи. Проект держат
+        # только вопросы, без ответа на которые нельзя начать, и низкая
+        # уверенность в понимании задачи. Любое уточнение по ходу дела —
+        # не повод стоять
+        blockers = blocking_questions(data)
+        ready = (bool(data.get("goal")) and not blockers
+                 and float(data.get("confidence") or 0) >= cfg.brief_min_confidence)
 
         payload = {
             "brief": data,
@@ -671,9 +696,10 @@ class Brief:
         project.brief_ready = ready
 
         await self.sync_access_items(project, data, full=full, messages=messages)
-        log.info("проект %s: бриф обновлён, confidence=%.2f, вопросов=%d, готов=%s",
+        log.info("проект %s: бриф обновлён, confidence=%.2f, вопросов=%d "
+                 "(блокирующих %d), готов=%s",
                  project.id, data.get("confidence", 0),
-                 len(data.get("open_questions") or []), ready)
+                 len(data.get("open_questions") or []), len(blockers), ready)
 
     @staticmethod
     def _already_sent(messages: list[ChatMessage]) -> dict[str, list[str]]:
@@ -1051,15 +1077,36 @@ def is_ready(project: Project) -> bool:
     return bool(getattr(project, "brief_ready", False))
 
 
+def blocking_questions(data: dict) -> list[dict]:
+    """Вопросы, без ответа на которые нельзя начать работу."""
+    return [q for q in (data.get("open_questions") or [])
+            if isinstance(q, dict) and q.get("blocking")]
+
+
+def trim_questions(data: dict) -> dict:
+    """Не больше BRIEF_MAX_QUESTIONS штук, блокирующие впереди.
+
+    Объединение нескольких прогонов даёт по десятку почти одинаковых
+    уточнений; такой список никто не читает.
+    """
+    questions = [q for q in (data.get("open_questions") or []) if isinstance(q, dict)]
+    questions.sort(key=lambda q: (not q.get("blocking"), -int(q.get("seen_count") or 0)))
+    data["open_questions"] = questions[:cfg.brief_max_questions]
+    return data
+
+
 async def pending_questions(project: Project) -> list[str]:
     data = (project.brief or {}).get("brief") if isinstance(project.brief, dict) else None
     if not data:
         return []
-    questions = [str(q.get("text")) for q in (data.get("open_questions") or []) if q.get("text")]
+    # спрашиваем сперва то, что держит работу
+    ordered = sorted((q for q in (data.get("open_questions") or []) if isinstance(q, dict)),
+                     key=lambda q: not q.get("blocking"))
+    questions = [str(q.get("text")) for q in ordered if q.get("text")]
     if not questions and float(data.get("confidence") or 0) < cfg.brief_min_confidence:
         questions = ["Уточни, пожалуйста, что именно нужно сделать — из переписки "
                      "пока не складывается однозначная картина."]
-    return questions[:cfg.brief_max_questions]
+    return questions[:cfg.brief_questions_per_message]
 
 
 def question_cooldown() -> dt.timedelta:

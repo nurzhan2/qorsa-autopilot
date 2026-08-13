@@ -150,7 +150,15 @@ class Scheduler:
                 # и собранный бриф: строить по недопонятому ТЗ — способ
                 # сделать не то и потратить на это деньги
                 q = q.where(Project.brief_ready.is_(True))
+                # Класс проверяемости и исполнитель. Задачу, которую нельзя
+                # проверить машиной, агенту отдавать бессмысленно: он объявит
+                # её сделанной, а проверить это будет нечем
+                q = q.where(Task.verify_class != "human")
+                q = q.where(Task.executor == "claude_code")
+                # требование исчезло из ТЗ — задача ждёт решения человека
+                q = q.where(Task.orphaned.is_(False))
             rows = (await s.execute(q)).all()
+            done_titles = await self._done_titles(s, lane, rows)
 
         # ВАЖНО: rows — снимок, снятый до этой строки. Пока мы его фильтруем,
         # какая-то задача успевает доработать и выйти из inflight, оставшись в
@@ -166,10 +174,34 @@ class Scheduler:
                 continue
             if project.id in blocked:
                 continue          # чеклист доступов не закрыт
+            if lane == GATED_LANE and not self._deps_done(task, done_titles):
+                continue          # зависимости ещё не сделаны
             score = decayed_units(project.served_units, project.served_at, now) / weight(project)
             if best_score is None or score < best_score:
                 best, best_score = (task, project), score
         return best
+
+    @staticmethod
+    async def _done_titles(s, lane: str, rows) -> dict[int, set[str]]:
+        """Названия выполненных задач по проектам — для проверки зависимостей."""
+        if lane != GATED_LANE or not rows:
+            return {}
+        ids = {project.id for _, project in rows}
+        done = (await s.execute(
+            select(Task.project_id, Task.title)
+            .where(Task.project_id.in_(ids), Task.status == "done"))).all()
+        out: dict[int, set[str]] = {}
+        for pid, title in done:
+            out.setdefault(pid, set()).add((title or "").strip().lower())
+        return out
+
+    @staticmethod
+    def _deps_done(task: Task, done_titles: dict[int, set[str]]) -> bool:
+        deps = task.depends_on or []
+        if not deps:
+            return True
+        done = done_titles.get(task.project_id, set())
+        return all(str(d).strip().lower() in done for d in deps)
 
     # ---------- исполнение ----------
 

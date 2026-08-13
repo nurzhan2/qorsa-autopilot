@@ -38,6 +38,18 @@ log = logging.getLogger("main")
 install_log_masking()
 
 
+def sheets_configured() -> bool:
+    """Плейсхолдер из .env.example — не настройка.
+
+    `SHEET_ID=1AbC...` выглядит заданным, синк стартует и валится каждые
+    60 секунд с ERROR. Та же ловушка, что была с `sk-ant-...`.
+    """
+    from pathlib import Path
+
+    from .vault import _usable
+    return _usable(cfg.sheet_id) and Path(cfg.google_creds).exists()
+
+
 def build_stack():
     """Возвращает (executor, verifier). В DRY_RUN — заглушки вместо
     настоящего Claude Code и платного судьи."""
@@ -78,10 +90,11 @@ async def main() -> None:
         asyncio.create_task(sched.run(), name="scheduler"),
         asyncio.create_task(communicator.pump(), name="pump"),
     ]
-    if cfg.sheet_id:
+    if sheets_configured():
         tasks.append(asyncio.create_task(SheetSync().loop(), name="sheets"))
     else:
-        log.warning("SHEET_ID не задан — синк с таблицей выключен")
+        log.warning("синк с таблицей выключен: нет SHEET_ID или файла %s",
+                    cfg.google_creds)
     if transports and not roles.owner_configured():
         log.critical("OWNER_TG_ID не задан — ingest выключен. Без id владельца "
                      "его собственные реплики уедут в ТЗ как требования клиента")

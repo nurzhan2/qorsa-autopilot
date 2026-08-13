@@ -99,12 +99,18 @@ async def make_access(project_id: int, name: str = "FTP", kind: str = "ftp",
 
 
 async def make_tasks(project_id: int, n: int, lane: str = "build",
-                     status: str = "ready", start_idx: int = 0) -> list[int]:
+                     status: str = "ready", start_idx: int = 0,
+                     verify_class: str = "auto", executor: str = "claude_code",
+                     depends_on: list | None = None) -> list[int]:
+    """По умолчанию задачи пригодны для агента и машинно проверяемы —
+    тесты планировщика полос про распределение времени, а не про классы."""
     ids = []
     async with Session() as s:
         for i in range(n):
             t = Task(project_id=project_id, order_idx=start_idx + i, lane=lane,
-                     title=f"{lane} {i + 1}", status=status)
+                     title=f"{lane} {i + 1}", status=status,
+                     verify_class=verify_class, executor=executor,
+                     depends_on=list(depends_on or []))
             s.add(t)
             await s.flush()
             ids.append(t.id)
@@ -120,6 +126,7 @@ class FakeCommunicator:
         self.done: list[int] = []
         self.stages: list[int] = []
         self.reminders: list[tuple[int, int]] = []   # (project_id, сколько пунктов)
+        self.owner_notes: list[str] = []
 
     async def process(self, task, project) -> None:
         self.processed.append(project.id)
@@ -135,3 +142,6 @@ class FakeCommunicator:
 
     async def remind_access(self, project, items) -> None:
         self.reminders.append((project.id, len(items)))
+
+    async def notify_owner(self, text) -> None:
+        self.owner_notes.append(text)
