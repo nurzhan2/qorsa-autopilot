@@ -66,6 +66,15 @@ async def cmd_done(task_id: int) -> int:
     return 1
 
 
+async def cmd_confirm(task_id: int) -> int:
+    await init_db()
+    ok, message = await manual.confirm(task_id)
+    print(message)
+    if ok:
+        print("записано как закрытое ТОБОЙ, а не проверками — так и останется в истории")
+    return 0 if ok else 2
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="ручные задачи проекта")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -75,12 +84,17 @@ def main() -> int:
     p_show.add_argument("task_id", type=int)
     p_done = sub.add_parser("done", help="отметить выполненной и проверить")
     p_done.add_argument("task_id", type=int)
+    p_conf = sub.add_parser(
+        "confirm", help="закрыть задачу под свою ответственность (assisted-приёмка)")
+    p_conf.add_argument("task_id", type=int)
     args = ap.parse_args()
 
     if args.cmd == "list":
         return asyncio.run(cmd_list(args.project))
     if args.cmd == "show":
         return asyncio.run(cmd_show(args.task_id))
+    if args.cmd == "confirm":
+        return asyncio.run(cmd_confirm(args.task_id))
     return asyncio.run(cmd_done(args.task_id))
 
 

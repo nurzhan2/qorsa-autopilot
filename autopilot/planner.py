@@ -246,6 +246,9 @@ def autonomy(tasks: list[dict]) -> dict:
     ratio_time = (minutes_auto / minutes_total) if minutes_total else 0.0
     return {
         "tasks": len(tasks),
+        # именно автономные, а не by_class["auto"]: задача может быть
+        # проверяемой машиной, но выполняться руками в чужой админке
+        "autonomous": autonomous,
         "minutes": minutes_total,
         "minutes_auto": minutes_auto,
         "by_class": by_class,
