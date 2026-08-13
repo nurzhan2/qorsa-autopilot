@@ -170,6 +170,21 @@ async def resolve_project(chat_id: str, explicit: int | None) -> int | None:
     return row.project_id if row else None
 
 
+async def account_of_project(project_id: int | None):
+    """Компания проекта. Нет проекта — компания по умолчанию из конфига."""
+    from autopilot import accounts as accounts_cfg
+    from autopilot.db import Account, Project as P
+    code = accounts_cfg.DEFAULT_CODE
+    if project_id:
+        async with Session() as s:
+            proj = await s.get(P, int(project_id))
+            if proj is not None:
+                row = await s.get(Account, proj.account_id)
+                if row is not None:
+                    code = row.code
+    return accounts_cfg.by_code(code) or accounts_cfg.load()[0]
+
+
 async def run(path: Path, project_id: int | None, chat_id: str | None, dry: bool,
               client_id: str | None = None, owner_id: str | None = None) -> int:
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -180,6 +195,9 @@ async def run(path: Path, project_id: int | None, chat_id: str | None, dry: bool
         return 2
 
     await init_db()
+    # Компания импортируемого чата: от неё зависит, чей id считается владельцем.
+    # Берём у проекта, если он известен, иначе компанию по умолчанию
+    account = await account_of_project(project_id)
     project_id = await resolve_project(chat, project_id)
     print(f"чат {chat}, сообщений в файле: {len(messages)}, проект: {project_id or '—'}")
 
@@ -228,9 +246,9 @@ async def run(path: Path, project_id: int | None, chat_id: str | None, dry: bool
         forced = resolve_role(sender)
         if forced is not None:
             sender_role = forced
-            await roles.remember(TRANSPORT, chat, sender, str(msg.get("from") or ""))
+            await roles.remember(account, TRANSPORT, chat, sender, str(msg.get("from") or ""))
         else:
-            sender_role = await roles.remember(TRANSPORT, chat, sender,
+            sender_role = await roles.remember(account, TRANSPORT, chat, sender,
                                                str(msg.get("from") or ""))
 
         if dry:

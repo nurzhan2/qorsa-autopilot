@@ -1,17 +1,20 @@
-"""Кто есть кто в групповом чате.
+"""Кто есть кто в чате. Роль зависит от КОМПАНИИ, а не только от id.
 
 Участников трое: **клиент, владелец и бот**. Менеджер и владелец — один
 человек с одного аккаунта, поэтому роль `manager` по умолчанию не занята
 никем: `MANAGER_TG_ID` работает алиасом `OWNER_TG_ID`.
 
-Механизм ролей сохранён целиком. Если менеджер когда-нибудь отделится и
-сядет в группу со своего аккаунта — `MANAGER_SEPARATE=1`, и всё заработает
-как раньше, без правок кода.
+**Почему роль считается парой (компания, отправитель).** У владельца два
+юрлица и два аккаунта. В чатах Qorsa владелец — это id Qorsa Studio;
+в чатах Hustle тот же самый id не владелец, а посторонний. Глобальный
+`OWNER_TG_ID` этой разницы не видел: он объявлял бы владельцем оба id
+в обеих компаниях сразу. Практический вред конкретный — реплики одного
+юрлица, попавшие в чат другого, переставали бы считаться клиентскими
+и вылетали бы из ТЗ. Или наоборот: собственные слова уезжали бы в бриф
+как требования клиента.
 
-Роль — не косметика: бриф строится по словам КЛИЕНТА, и чужая реплика,
-попавшая в ТЗ, превращается в требование, которого клиент не выдвигал.
 Ошибиться в сторону «клиент» безопаснее: пункт всё равно проверяется
-по evidence.
+по evidence. Поэтому незнакомый id — клиент, как и раньше.
 """
 from __future__ import annotations
 
@@ -28,22 +31,25 @@ CLIENT, MANAGER, OWNER, BOT = "client", "manager", "owner", "bot"
 ROLES = (CLIENT, MANAGER, OWNER, BOT)
 
 
-def known_ids(transport: str) -> dict[str, str]:
-    """{sender_id: role} из .env для конкретного мессенджера.
+def known_ids(account, transport: str = "telegram") -> dict[str, str]:
+    """{sender_id: role} для конкретной компании и мессенджера.
 
     Менеджерский id по умолчанию отображается в OWNER: это один и тот же
     человек. Отдельная роль включается MANAGER_SEPARATE=1.
     """
+    if account is None:
+        return {}
     manager_role = MANAGER if cfg.manager_separate else OWNER
-    if transport == "max":
-        pairs = ((cfg.owner_max_id, OWNER), (cfg.manager_max_id, manager_role),
-                 (cfg.bot_max_id, BOT))
-    else:
-        pairs = ((cfg.owner_tg_id, OWNER), (cfg.manager_tg_id, manager_role),
-                 (cfg.bot_tg_id, BOT))
+    owner_id = account.owner_ids.get(transport, "")
+    bot_id = account.bot_ids.get(transport, "")
+
+    # Менеджер пока общий на все компании: отдельного юрлица у него нет.
+    # Когда появится — переедет в accounts.toml тем же полем, что owner
+    manager_id = cfg.manager_max_id if transport == "max" else cfg.manager_tg_id
+
     out: dict[str, str] = {}
-    for i, role in pairs:
-        key = str(i).strip()
+    for value, role in ((owner_id, OWNER), (manager_id, manager_role), (bot_id, BOT)):
+        key = str(value or "").strip()
         if not key:
             continue
         # владелец выигрывает: если один и тот же id указан и там и там,
@@ -54,23 +60,39 @@ def known_ids(transport: str) -> dict[str, str]:
     return out
 
 
-def owner_configured() -> bool:
-    """Без id владельца система не отличит себя от клиента."""
-    return bool(str(cfg.owner_tg_id).strip() or str(cfg.owner_max_id).strip())
-
-
-def role_of(transport: str, sender_id: str | None) -> str:
+def role_of(account, sender_id: str | None, transport: str = "telegram") -> str:
+    """Роль отправителя В ЧАТАХ ЭТОЙ КОМПАНИИ."""
     if not sender_id:
         return CLIENT
-    return known_ids(transport).get(str(sender_id), CLIENT)
+    return known_ids(account, transport).get(str(sender_id), CLIENT)
 
 
-async def remember(transport: str, chat_id: str, sender_id: str | None,
+def owner_configured(accounts) -> bool:
+    """Хоть у одной активной компании должен быть указан владелец.
+
+    Без этого система не отличит свои реплики от клиентских, и собственные
+    слова уедут в ТЗ как требования. Дешевле не запуститься.
+    """
+    return any(a.owner_configured() for a in (accounts or []))
+
+
+def unconfigured(accounts) -> list[str]:
+    """Коды компаний без владельца — их называем в сообщении об ошибке."""
+    return [a.code for a in (accounts or []) if not a.owner_configured()]
+
+
+async def remember(account, transport: str, chat_id: str, sender_id: str | None,
                    display_name: str = "") -> str:
-    """Заносит участника в chat_participants и возвращает его роль."""
-    role = role_of(transport, sender_id)
+    """Заносит участника в chat_participants и возвращает его роль.
+
+    `account` — компания, которой принадлежит чат. Один и тот же человек
+    в чатах разных компаний может иметь разные роли, и это не ошибка,
+    а ровно то поведение, ради которого функция принимает компанию.
+    """
+    role = role_of(account, sender_id, transport)
     if not sender_id:
         return role
+    code = getattr(account, "code", "") or ""
     async with Session() as s:
         row = (await s.execute(
             select(ChatParticipant).where(
@@ -82,11 +104,13 @@ async def remember(transport: str, chat_id: str, sender_id: str | None,
                                   sender_id=str(sender_id), role=role,
                                   display_name=display_name or ""))
             await s.commit()
-            log.info("новый участник %s:%s — %s (%s)", transport, chat_id, sender_id, role)
+            log.info("новый участник %s:%s — %s (%s, компания %s)",
+                     transport, chat_id, sender_id, role, code)
             return role
-        # роль могли переопределить в .env уже после первого сообщения
+        # роль могли переопределить в конфиге уже после первого сообщения
         if row.role != role:
-            log.info("участник %s сменил роль %s -> %s", sender_id, row.role, role)
+            log.info("участник %s сменил роль %s -> %s (компания %s)",
+                     sender_id, row.role, role, code)
             row.role = role
         if display_name and row.display_name != display_name:
             row.display_name = display_name

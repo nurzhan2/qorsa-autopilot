@@ -65,8 +65,19 @@ def parse_chat_ref(raw: str) -> tuple[str, str] | None:
 
 
 class Ingest:
-    def __init__(self, transports, communicator, scheduler=None, verifier=None):
-        self.transports = {t.name: t for t in transports}
+    def __init__(self, transports, communicator, scheduler=None, verifier=None,
+                 accounts=None):
+        # Ключ — пара (компания, мессенджер): «telegram» теперь несколько,
+        # по одному боту на юрлицо, и по имени они схлопывались бы в один
+        self.transports = {(str(getattr(t, "account", "qorsa")), t.name): t
+                           for t in transports}
+        # {code: Account} — по ней ingest узнаёт, кто владелец В ЭТОМ чате.
+        # Список не задан — берём из конфига: тесты и одиночная установка
+        # не должны требовать явной передачи компаний
+        if accounts is None:
+            from . import accounts as accounts_cfg
+            accounts = accounts_cfg.active()
+        self.accounts = {a.code: a for a in accounts}
         self.communicator = communicator
         self.scheduler = scheduler
         # тот же верификатор, что и у полосы verify: человек не должен
@@ -75,33 +86,70 @@ class Ingest:
         # последний неопознанный чат — чтобы «/bind 7» без аргументов сработал
         self._last_unbound: tuple[str, str] | None = None
 
+    def account_of(self, transport):
+        """Компания, чей это бот. Роль владельца считается относительно неё.
+
+        Транспорт без компании (фейки в тестах, одиночная установка) —
+        берём единственную; если их несколько, угадывать нельзя.
+        """
+        code = str(getattr(transport, "account", "") or "")
+        if code in self.accounts:
+            return self.accounts[code]
+        if len(self.accounts) == 1:
+            return next(iter(self.accounts.values()))
+        return None
+
     # ---------- запуск ----------
 
     async def run(self) -> None:
-        if not roles.owner_configured():
+        if not roles.owner_configured(self.accounts.values()):
             # Без id владельца система примет собственные реплики за слова
             # клиента и потащит их в ТЗ как требования. Это хуже, чем не
             # работать вовсе, поэтому падаем сразу и громко.
-            log.critical("OWNER_TG_ID (или OWNER_MAX_ID) не задан — ingest не запускается: "
+            log.critical("ни у одной компании не задан владелец — ingest не запускается: "
                          "без него владелец неотличим от клиента")
-            raise RuntimeError("OWNER_TG_ID не задан")
+            raise RuntimeError("владелец не задан ни в одной компании")
+        blind = roles.unconfigured(self.accounts.values())
+        if blind:
+            # Одна компания без владельца — это не повод не работать остальным,
+            # но её чаты будут считать владельца клиентом. Говорим громко
+            log.error("компании без owner_tg_id: %s — их собственные реплики "
+                      "уедут в ТЗ как требования клиента", ", ".join(blind))
         if not self.transports:
             log.warning("ни один транспорт не настроен — ingest не поднимается")
             return
-        await asyncio.gather(*(self._loop(t) for t in self.transports.values()))
+        # return_exceptions: падение одного подключения не должно снимать
+        # остальные. Внутри _loop стоит вечный цикл с переподключением, так
+        # что сюда исключение доходит только при отмене или совсем уж
+        # неожиданной поломке — и даже тогда второй бот продолжает работать
+        results = await asyncio.gather(
+            *(self._loop(t) for t in self.transports.values()), return_exceptions=True)
+        for (account, name), res in zip(self.transports, results):
+            if isinstance(res, Exception) and not isinstance(res, asyncio.CancelledError):
+                log.error("поллер %s/%s остановлен: %s", account, name, res)
+
+    # Пауза после того, как poll() ВЕРНУЛСЯ штатно. По контракту он висит
+    # вечно, но если транспорт всё же вернул управление (кончился фейковый
+    # поток, сервер закрыл поток апдейтов), цикл уходит на новый виток без
+    # единого await и съедает ядро целиком, заодно застопорив event loop —
+    # то есть и второй бот вместе с собой. Поймано на тесте двух подключений.
+    IDLE_PAUSE_SEC = 0.05
 
     async def _loop(self, transport) -> None:
         backoff = Backoff()
         while True:
             try:
-                log.info("поллер %s запущен", transport.name)
+                log.info("поллер %s/%s запущен",
+                         getattr(transport, "account", "?"), transport.name)
                 async for msg in transport.poll():
                     await self.handle(transport, msg)
                     backoff.reset()
+                await asyncio.sleep(self.IDLE_PAUSE_SEC)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("поллер %s упал, переподключаюсь", transport.name)
+                log.exception("поллер %s/%s упал, переподключаюсь",
+                              getattr(transport, "account", "?"), transport.name)
                 await backoff.sleep()
 
     # ---------- обработка одного сообщения ----------
@@ -119,7 +167,9 @@ class Ingest:
             # апдейта безопасна (дедуп по индексу), а вечный цикл на ядовитом
             # сообщении — нет
             if msg.cursor:
-                await save_offset(transport.name, msg.cursor)
+                # offset — на КОМПАНИЮ: у каждой свой бот и свой поток
+                await save_offset(transport.name, msg.cursor,
+                                  str(getattr(transport, 'account', 'qorsa')))
         return row
 
     async def _store_new(self, transport, msg: InboundMessage) -> ChatMessage:
@@ -129,8 +179,9 @@ class Ingest:
         text, secret_names = scrub(msg.text, project_id=project_id, chat_id=msg.chat_id)
 
         # роль решает, попадут ли слова в бриф: реплики менеджера в ТЗ не идут
-        sender_role = await roles.remember(msg.transport, msg.chat_id, msg.sender_id,
-                                           msg.sender_name)
+        account = self.account_of(transport)
+        sender_role = await roles.remember(account, msg.transport, msg.chat_id,
+                                           msg.sender_id, msg.sender_name)
 
         row = ChatMessage(
             transport=msg.transport, chat_id=msg.chat_id, tg_message_id=msg.message_id,

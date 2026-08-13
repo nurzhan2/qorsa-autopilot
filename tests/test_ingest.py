@@ -7,7 +7,7 @@ from __future__ import annotations
 import datetime as dt
 
 import pytest
-from conftest import add_chat, make_project
+from conftest import add_chat, make_project, make_account
 from cryptography.fernet import Fernet
 from sqlalchemy import func, select
 
@@ -258,7 +258,9 @@ async def test_unbound_chat(db):
 async def test_bind_by_username(db):
     """@username из колонки менеджера превращается в chat_id по первому сообщению."""
     async with Session() as s:
-        p = Project(client="к", title="сайт", chat_ref="tg:@ivan", ready_for_work=True)
+        acc = await make_account()
+        p = Project(account_id=acc.id, client="к", title="сайт",
+                    chat_ref="tg:@ivan", ready_for_work=True)
         s.add(p)
         await s.commit()
 

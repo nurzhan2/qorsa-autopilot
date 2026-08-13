@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from typing import Any
 
 from sqlalchemy import (JSON, DateTime, ForeignKey, Index, String, TypeDecorator, text,
@@ -9,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from .config import cfg
+
+log_db = logging.getLogger("db")
 
 UTC = dt.timezone.utc
 
@@ -46,11 +49,45 @@ class Base(DeclarativeBase):
     type_annotation_map = {dt.datetime: UtcDateTime}
 
 
+class Account(Base):
+    """Компания владельца: Qorsa Studio, Hustle Design, дальше по списку.
+
+    Строка тут — зеркало блока из `accounts.toml`, а не источник правды:
+    конфиг правится руками, а таблица нужна затем, чтобы у проекта был
+    честный внешний ключ, а у отчётов — join без чтения файла.
+    Синхронизируется на старте по `code`.
+
+    Токен бота хранится НЕ здесь: в `bot_token_ref` лежит имя секрета
+    в vault (см. accounts.py).
+    """
+    __tablename__ = "accounts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True)
+    # server_default у всех строковых: миграция вставляет компанию по умолчанию
+    # сырым SQL, где питоновские default= не работают
+    name: Mapped[str] = mapped_column(String(200), default="", server_default=text("''"))
+    handle: Mapped[str] = mapped_column(String(64), default="", server_default=text("''"))
+    owner_tg_id: Mapped[str] = mapped_column(String(32), default="", server_default=text("''"))
+    owner_max_id: Mapped[str] = mapped_column(String(32), default="", server_default=text("''"))
+    bot_token_ref: Mapped[str] = mapped_column(String(64), default="", server_default=text("''"))
+    sheet_id: Mapped[str] = mapped_column(String(128), default="", server_default=text("''"))
+    sheet_tab: Mapped[str] = mapped_column(String(64), default="Заказы",
+                                           server_default=text("'Заказы'"))
+    signature: Mapped[str] = mapped_column(String(200), default="", server_default=text("''"))
+    active: Mapped[bool] = mapped_column(default=True, server_default=text("1"))
+    updated_at: Mapped[dt.datetime] = mapped_column(default=utcnow, server_default=text("CURRENT_TIMESTAMP"))
+
+
 class Project(Base):
     """Проект = один заказ = одна строка в Google-таблице."""
     __tablename__ = "projects"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    # Проект ВСЕГДА принадлежит ровно одной компании. Не nullable намеренно:
+    # проект без компании невозможно ни синкать в таблицу, ни ответить по нему
+    # клиенту — непонятно, с какого бота. Лучше отказ на вставке, чем сирота
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
     sheet_row: Mapped[int | None] = mapped_column(default=None)
 
     client: Mapped[str] = mapped_column(String(200), default="")
@@ -122,7 +159,7 @@ class Task(Base):
     defects: Mapped[list[str]] = mapped_column(JSON, default=list)
     last_error: Mapped[str] = mapped_column(default="")
     cost_usd: Mapped[float] = mapped_column(default=0.0)
-    updated_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(default=utcnow, server_default=text("CURRENT_TIMESTAMP"))
 
 
 class ProjectChat(Base):
@@ -190,9 +227,16 @@ class ChatMessage(Base):
 
 
 class TransportState(Base):
-    """Offset поллера. Живёт в БД, поэтому рестарт не теряет и не дублирует."""
+    """Offset поллера. Живёт в БД, поэтому рестарт не теряет и не дублирует.
+
+    Ключ составной: у каждой компании свой бот, свой поток апдейтов и свой
+    offset. С общим ключом по имени транспорта два бота затирали бы позицию
+    друг друга — и половина сообщений уезжала бы в никуда при каждом рестарте.
+    """
     __tablename__ = "transport_state"
 
+    account: Mapped[str] = mapped_column(String(32), primary_key=True,
+                                         server_default=text("'qorsa'"))
     transport: Mapped[str] = mapped_column(String(16), primary_key=True)
     offset: Mapped[str | None] = mapped_column(default=None)
     updated_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
@@ -291,6 +335,75 @@ async def init_db() -> None:
     живая переписка с клиентами, и «удали БД» перестало быть вариантом."""
     from .migrations import migrate      # поздний импорт: migrations импортирует db
     await migrate()
+
+
+async def sync_accounts(accounts) -> dict[str, int]:
+    """Переносит компании из accounts.toml в таблицу. Возвращает {code: id}.
+
+    Конфиг — источник правды, таблица — его зеркало ради внешнего ключа
+    у проекта. Компанию, пропавшую из конфига, НЕ удаляем: на неё ссылаются
+    живые проекты, и удаление оборвало бы связь. Помечаем неактивной.
+    """
+    codes = {}
+    async with Session() as s:
+        existing = {a.code: a for a in
+                    (await s.execute(select(Account))).scalars().all()}
+        seen = set()
+        for acc in accounts:
+            seen.add(acc.code)
+            row = existing.get(acc.code)
+            if row is None:
+                row = Account(code=acc.code)
+                s.add(row)
+            row.name = acc.name
+            row.handle = acc.handle
+            row.owner_tg_id = str(acc.owner_tg_id or "")
+            row.owner_max_id = str(acc.owner_max_id or "")
+            row.bot_token_ref = acc.bot_token_ref
+            row.sheet_id = str(acc.sheet_id or "")
+            row.sheet_tab = acc.sheet_tab
+            row.signature = acc.signature
+            row.active = bool(acc.active)
+            row.updated_at = utcnow()
+        for code, row in existing.items():
+            if code not in seen and row.active:
+                row.active = False
+                log_db.warning("компания %s пропала из конфига — помечена неактивной "
+                               "(проекты на ней остаются)", code)
+        await s.commit()
+        for a in (await s.execute(select(Account))).scalars().all():
+            codes[a.code] = a.id
+    return codes
+
+
+async def account_code(account_id: int | None) -> str:
+    """id компании -> её код. Пустая строка, если компании нет."""
+    if not account_id:
+        return ""
+    async with Session() as s:
+        row = await s.get(Account, int(account_id))
+    return row.code if row else ""
+
+
+async def account_signature(account_id: int | None) -> str:
+    """Как бот подписывается клиенту от лица этой компании.
+
+    Компания добавляется К раскрытию «я бот», а не ВМЕСТО него. Клиент должен
+    понимать две вещи: с какой из компаний он говорит и что отвечает не человек.
+    Подставить сюда одно только «Qorsa Studio» значит убрать второе — а это
+    ровно то, ради чего подпись заводилась.
+    """
+    if not account_id:
+        return BOT_SIGNATURE_FALLBACK
+    async with Session() as s:
+        row = await s.get(Account, int(account_id))
+    name = (row.signature or row.name) if row else ""
+    if not name:
+        return BOT_SIGNATURE_FALLBACK
+    return f"🤖 {name}: бот по техническим вопросам (не человек).\n\n"
+
+
+BOT_SIGNATURE_FALLBACK = "🤖 Бот по техническим вопросам (не человек).\n\n"
 
 
 async def spent_today() -> float:

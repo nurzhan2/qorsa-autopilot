@@ -62,18 +62,26 @@ class Transport(Protocol):
 
 
 # ---------- offset в БД: рестарт не теряет и не дублирует ----------
+#
+# Ключ — пара (компания, транспорт). У каждой компании свой бот и свой поток
+# апдейтов: с общим ключом два бота затирали бы позицию друг друга, и после
+# каждого рестарта часть сообщений уезжала бы мимо.
 
-async def load_offset(transport: str) -> str | None:
+DEFAULT_ACCOUNT = "qorsa"
+
+
+async def load_offset(transport: str, account: str = DEFAULT_ACCOUNT) -> str | None:
     async with Session() as s:
-        row = await s.get(TransportState, transport)
+        row = await s.get(TransportState, (str(account), transport))
         return row.offset if row else None
 
 
-async def save_offset(transport: str, value: str | None) -> None:
+async def save_offset(transport: str, value: str | None,
+                      account: str = DEFAULT_ACCOUNT) -> None:
     async with Session() as s:
-        row = await s.get(TransportState, transport)
+        row = await s.get(TransportState, (str(account), transport))
         if row is None:
-            row = TransportState(transport=transport)
+            row = TransportState(account=str(account), transport=transport)
             s.add(row)
         row.offset = None if value is None else str(value)
         row.updated_at = utcnow()

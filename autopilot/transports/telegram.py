@@ -78,11 +78,21 @@ def _mentions_bot(text: str, reply_to_sender_id: str | None) -> bool:
 class TelegramTransport:
     name = "telegram"
 
-    def __init__(self, token: str | None = None, client: httpx.AsyncClient | None = None):
+    def __init__(self, token: str | None = None, client: httpx.AsyncClient | None = None,
+                 account: str = "qorsa"):
         self.token = token or cfg.tg_token
         self._client = client
         self._own_client = client is None
         self.poll_timeout = cfg.tg_poll_timeout
+        # компания, чей это бот. Нужна для offset и для того, чтобы ingest
+        # знал, в чьих чатах он сейчас работает: роль владельца зависит от неё
+        self.account = str(account)
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """Пара, которой транспорт опознаётся однозначно. Одного имени мало:
+        «telegram» теперь два, по одному на компанию."""
+        return (self.account, self.name)
 
     def supports_impersonation(self) -> bool:
         # ради этого всё и затевалось: клиенту пишем от лица владельца
@@ -118,7 +128,7 @@ class TelegramTransport:
         """Бесконечный поток сообщений. Сам переживает обрывы связи:
         наверх исключения не пускаем, иначе ingest придётся оборачивать
         тем же самым циклом переподключения."""
-        offset = await load_offset(self.name)
+        offset = await load_offset(self.name, self.account)
         next_offset = int(offset) + 1 if offset else None
         backoff = Backoff()
 

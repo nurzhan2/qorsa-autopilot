@@ -30,7 +30,8 @@ from sqlalchemy import select
 
 from .config import cfg
 from .db import (AccessItem, BusinessConnection, Message, Project, ProjectChat,
-                 Session, Task, utcnow)
+                 Session, Task, account_code, account_signature, utcnow)
+from .transports.base import DEFAULT_ACCOUNT
 
 log = logging.getLogger("comm")
 
@@ -160,12 +161,31 @@ def internal_recipient(msg_route: str) -> str:
     return cfg.tg_manager or "MANAGER"
 
 
+class CrossAccountSend(RuntimeError):
+    """Попытка ответить по проекту одной компании ботом другой.
+
+    Худший из возможных сбоев мультиаккаунтности и притом бесшумный: клиент
+    Hustle Design получает сообщение от Qorsa Studio, узнаёт, что подрядчик
+    у него не тот, за кого себя выдавал, и это уже не техническая проблема.
+    Поэтому не «залогировали и отправили как-нибудь», а исключение.
+    """
+
+
 class Communicator:
     def __init__(self, send_fn=None, transports=None):
         # transports задан — шлём по-настоящему; нет — остаётся заглушка фазы 1,
-        # на которой держатся DRY_RUN и тесты
-        self.transports = {t.name: t for t in (transports or [])}
+        # на которой держатся DRY_RUN и тесты.
+        #
+        # Ключ ПАРА (компания, мессенджер), а не имя. С ключом по имени два
+        # «telegram» схлопывались в один словарь, и чей бот останется —
+        # решал порядок в списке. Ровно так сообщение и ушло бы не с того лица
+        self.transports = {(str(getattr(t, "account", DEFAULT_ACCOUNT)), t.name): t
+                           for t in (transports or [])}
         self.send_fn = send_fn or self._stub_send
+
+    def transport_for(self, account: str, name: str):
+        """Транспорт компании. Чужой не подставляем никогда — лучше не отправить."""
+        return self.transports.get((str(account), str(name)))
 
     async def _stub_send(self, chat_id: str, text: str) -> None:
         log.info("[TG -> %s] %s", chat_id, text)
@@ -209,9 +229,19 @@ class Communicator:
                                           ProjectChat.chat_id == str(chat_id)))).scalars().first()
         return bool(row and row.is_group)
 
-    async def notify_owner(self, text: str) -> None:
-        """Оперативное уведомление владельцу — мимо очереди и тихих часов."""
-        transport = self.transports.get("telegram")
+    async def notify_owner(self, text: str, account: str | None = None) -> None:
+        """Оперативное уведомление владельцу — мимо очереди и тихих часов.
+
+        Владелец у компаний физически один, но бот у каждой свой. Если
+        компания не названа, берём любой поднятый транспорт: уведомление
+        служебное и до клиента не доходит, так что перепутать лица нельзя.
+        """
+        transport = None
+        if account:
+            transport = self.transport_for(account, "telegram")
+        if transport is None:
+            transport = next((t for (_, n), t in self.transports.items()
+                              if n == "telegram"), None)
         chat = cfg.tg_owner or "OWNER"
         if transport is None:
             await self.send_fn(chat, text)
@@ -434,6 +464,9 @@ class Communicator:
     async def _deliver(self, m: Message, project: Project) -> str | None:
         """Возвращает id отправленного сообщения либо None, если адресата нет."""
         text = m.text
+        # Компанию берём у ПРОЕКТА, а не у сообщения и не из настроек процесса:
+        # проект — единственное место, где принадлежность зафиксирована жёстко
+        account = await account_code(project.account_id)
         if m.route == TO_CLIENT:
             name, chat = m.transport, m.chat_id
             if not chat:
@@ -444,16 +477,29 @@ class Communicator:
             # владелец и менеджер — всегда обычным ботом в Telegram
             name, chat = "telegram", internal_recipient(m.route)
 
-        transport = self.transports.get(name)
+        transport = self.transport_for(account, name)
         if transport is None:
+            # Чужой транспорт не подставляем даже если он есть под рукой.
+            # Не отправить — чинится повтором, отправить не с того лица — нет
+            known = sorted({a for a, _ in self.transports})
+            if known and account not in known:
+                raise CrossAccountSend(
+                    f"проект {project.id} принадлежит компании {account!r}, "
+                    f"а подняты только {known} — сообщение не отправлено")
             await self.send_fn(chat, text)          # заглушка фазы 1
             return chat
+
+        if str(getattr(transport, "account", account)) != str(account):
+            raise CrossAccountSend(
+                f"проект {project.id} компании {account!r} — транспорт "
+                f"{transport.account!r}")
 
         connection_id = None
         if m.route == TO_CLIENT:
             if transport.supports_impersonation() and not await self._is_group(name, chat):
                 connection_id = await self._connection_id(name)
             else:
-                # там, где нельзя писать от лица владельца, притворяться запрещено
-                text = BOT_SIGNATURE + text
+                # там, где нельзя писать от лица владельца, притворяться запрещено.
+                # Подпись берём у компании: клиент Hustle не должен видеть Qorsa
+                text = await account_signature(project.account_id) + text
         return await transport.send(chat, text, connection_id=connection_id)

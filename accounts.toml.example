@@ -1,0 +1,37 @@
+# Компании владельца. Скопируй в accounts.toml и правь под себя.
+#
+# Третья компания добавляется ДОПИСАННЫМ блоком [[account]] — правок кода
+# не требуется. Если этого файла нет вовсе, система поднимает одну компанию
+# из .env (режим совместимости, код qorsa).
+#
+# ТОКЕНОВ ЗДЕСЬ НЕТ. bot_token_ref — это ИМЯ секрета в vault:
+#     python scripts/vault_cli.py add QORSA_BOT_TOKEN
+# Файл читается глазами и правится руками, ключам от ботов тут не место.
+
+[[account]]
+code = "qorsa"                      # стабильный ключ, по нему привязан проект
+name = "Qorsa Studio"
+handle = "@qorsastudio"
+owner_tg_id = "7905565788"          # владелец В ЧАТАХ ЭТОЙ КОМПАНИИ
+bot_tg_id = ""                      # id самого бота, если известен
+bot_token_ref = "QORSA_BOT_TOKEN"   # имя секрета в vault, не значение
+sheet_id = ""                       # своя таблица заказов
+sheet_tab = "Заказы"
+signature = "Qorsa Studio"          # как бот подписывается клиенту
+active = true
+
+[[account]]
+code = "hustle"
+name = "Hustle Design"
+handle = "@hustle_design"
+owner_tg_id = "8649452219"
+bot_tg_id = ""
+bot_token_ref = "HUSTLE_BOT_TOKEN"
+sheet_id = ""
+sheet_tab = "Заказы"
+signature = "Hustle Design"
+active = true
+
+# Одна общая таблица на обе компании — законный режим: поставь один и тот же
+# sheet_id обеим и заведи в таблице колонку «Компания». Синк тогда фильтрует
+# строки по ней. По умолчанию таблицы РАЗДЕЛЬНЫЕ.

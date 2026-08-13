@@ -38,6 +38,9 @@ HUMAN = {
     "Приоритет": "priority",
     "Папка": "workspace",
     "Готов к работе": "ready_for_work",
+    # только для режима одной общей таблицы; в раздельном её просто нет.
+    # Держим в HUMAN, чтобы бот гарантированно в неё не писал
+    "Компания": "account_id",
 }
 # --- колонки бота: он перезаписывает их батчем ---
 BOT = ["Статус", "Прогресс", "Ждём от клиента", "Превью", "Последнее действие",
@@ -55,6 +58,11 @@ STATUS_RU = {"new": "новый", "briefing": "уточняю ТЗ", "active": "
 
 TRUE_WORDS = {"true", "да", "yes", "1", "y", "+", "✓", "✔", "истина", "готов"}
 
+# Колонка для режима «одна таблица на все компании». В раздельном режиме
+# (по умолчанию) её не нужно заводить вовсе.
+COMPANY_COLUMN = "Компания"
+DEFAULT_CODE = "qorsa"
+
 
 def _flag(v) -> bool:
     """Галочка в Google Sheets приходит как bool, а руками её пишут как угодно."""
@@ -63,11 +71,13 @@ def _flag(v) -> bool:
     return str(v).strip().lower() in TRUE_WORDS
 
 
-def _client() -> gspread.Worksheet:
+def _client(sheet_id: str | None = None, sheet_tab: str | None = None) -> gspread.Worksheet:
     creds = Credentials.from_service_account_file(
         cfg.google_creds,
         scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    return gspread.authorize(creds).open_by_key(cfg.sheet_id).worksheet(cfg.sheet_tab)
+    return (gspread.authorize(creds)
+            .open_by_key(sheet_id or cfg.sheet_id)
+            .worksheet(sheet_tab or cfg.sheet_tab))
 
 
 def _parse_date(v):
@@ -97,16 +107,46 @@ def _num(v, cast=float):
 
 
 class SheetSync:
-    def __init__(self):
+    def __init__(self, account=None, account_id: int | None = None,
+                 shared: bool = False):
+        """Один синк — одна КОМПАНИЯ.
+
+        `shared=True` означает, что этой таблицей пользуются несколько
+        компаний: тогда строки различаются колонкой «Компания», и чужие
+        синк не трогает. По умолчанию таблицы раздельные, и колонка не нужна.
+        """
+        self.account = account
+        self.account_id = account_id
+        self.shared = shared
         self._ws_cache = None
         self._lock = asyncio.Lock()
+
+    @property
+    def code(self) -> str:
+        return str(getattr(self.account, "code", "") or "")
 
     async def ws(self):
         """Авторизация переиспользуется: строить клиента каждые 60 секунд —
         лишний раунд-трип к Google на каждый цикл синка."""
         if self._ws_cache is None:
-            self._ws_cache = await asyncio.to_thread(_client)
+            self._ws_cache = await asyncio.to_thread(
+                _client, getattr(self.account, "sheet_id", None),
+                getattr(self.account, "sheet_tab", None))
         return self._ws_cache
+
+    def _row_is_mine(self, row: dict) -> bool:
+        """Строка общей таблицы принадлежит этой компании?
+
+        В раздельном режиме таблица целиком наша — вопрос не стоит. В общей
+        решает колонка «Компания»: пустое значение считаем своим только для
+        компании по умолчанию, иначе строку без метки подхватили бы сразу все.
+        """
+        if not self.shared:
+            return True
+        mark = str(row.get(COMPANY_COLUMN, "") or "").strip().lower()
+        if not mark:
+            return self.code == DEFAULT_CODE
+        return mark in (self.code.lower(), str(getattr(self.account, "name", "")).lower())
 
     async def loop(self) -> None:
         while True:
@@ -135,12 +175,21 @@ class SheetSync:
         # фаза 2: только БД, без сетевых вызовов внутри сессии
         async with Session() as s:
             for i, row in enumerate(rows, start=2):
+                if not self._row_is_mine(row):
+                    continue          # чужая компания в общей таблице
                 pid = _num(row.get("ID"), int)
                 proj = await s.get(Project, pid) if pid else None
+                if proj is not None and self.account_id and proj.account_id != self.account_id:
+                    # Проект уже принадлежит другой компании. Перетащить его
+                    # сюда молча — это увести заказ между юрлицами по опечатке
+                    # в колонке ID. Не трогаем и говорим вслух
+                    log.error("строка %s таблицы %s ссылается на проект %s чужой "
+                              "компании — пропущена", i, self.code, pid)
+                    continue
                 if proj is None:
                     if not str(row.get("Клиент", "")).strip():
                         continue
-                    proj = Project()
+                    proj = Project(account_id=self.account_id)
                     s.add(proj)
                     await s.flush()
                     if id_col:
@@ -184,8 +233,12 @@ class SheetSync:
         assert not overlap, f"колонки бота пересеклись с твоими: {overlap}"
 
         async with Session() as s:
-            projects = (await s.execute(
-                select(Project).where(Project.sheet_row.isnot(None)))).scalars().all()
+            q = select(Project).where(Project.sheet_row.isnot(None))
+            if self.account_id:
+                # без этого фильтра синк разложил бы проекты одной компании
+                # по строкам таблицы другой: sheet_row у них свой на таблицу
+                q = q.where(Project.account_id == self.account_id)
+            projects = (await s.execute(q)).scalars().all()
             progress = await self._progress_map(s)
             waiting = await self._waiting_map(s)
 

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import gspread
-from conftest import make_project, make_tasks
+from conftest import make_project, make_tasks, make_account
 
 from autopilot import sheets
 from autopilot.db import Project, Session
@@ -50,7 +50,7 @@ async def test_sheets_column_ownership(db, monkeypatch):
         await s.commit()
 
     ws = FakeWorksheet()
-    monkeypatch.setattr(sheets, "_client", lambda: ws)
+    monkeypatch.setattr(sheets, "_client", lambda *a, **k: ws)
 
     sync = sheets.SheetSync()
     await sync._push()
@@ -73,7 +73,7 @@ async def test_push_writes_progress_and_status(db, monkeypatch):
         await s.commit()
 
     ws = FakeWorksheet()
-    monkeypatch.setattr(sheets, "_client", lambda: ws)
+    monkeypatch.setattr(sheets, "_client", lambda *a, **k: ws)
     await sheets.SheetSync()._push()
 
     by_col = {gspread.utils.a1_to_rowcol(i["range"])[1]: i["values"][0][0] for i in ws.batches}
@@ -90,9 +90,10 @@ async def test_pull_touches_only_id_column(db, monkeypatch):
         "Статус": "", "Прогресс": "", "Ждём от клиента": "", "Превью": "",
         "Последнее действие": "", "Стоимость $": "", "Обновлено": "",
     }])
-    monkeypatch.setattr(sheets, "_client", lambda: ws)
+    monkeypatch.setattr(sheets, "_client", lambda *a, **k: ws)
 
-    await sheets.SheetSync()._pull()
+    acc = await make_account()
+    await sheets.SheetSync(account=acc, account_id=acc.id)._pull()
 
     assert written_cols(ws) == {HEADER.index("ID") + 1}
 
@@ -106,3 +107,4 @@ async def test_pull_touches_only_id_column(db, monkeypatch):
     assert proj.status == "briefing"       # появился TG chat -> new -> briefing
     assert proj.ready_for_work is True
     assert proj.sheet_row == 2
+    assert proj.account_id == acc.id, "новый проект остался без компании"
