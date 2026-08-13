@@ -11,7 +11,7 @@ from sqlalchemy import func, select, text
 
 from autopilot.communicator import BOT_SIGNATURE, TO_CLIENT, Communicator
 from autopilot.config import cfg
-from autopilot.db import (Base, BusinessConnection, ChatMessage, Message, Project,
+from autopilot.db import (Account, Base, BusinessConnection, ChatMessage, Message, Project,
                           ProjectChat, Session, engine, utcnow)
 from autopilot.ingest import Ingest
 from autopilot.migrations import MIGRATIONS, current_version, migrate
@@ -52,8 +52,31 @@ async def test_migration_from_previous_version(db):
         await conn.execute(text("DROP TABLE IF EXISTS schema_version"))
         await conn.run_sync(Base.metadata.create_all)
         for table in ("chat_messages", "project_chats", "transport_state",
-                      "business_connections", "chat_participants"):
+                      "business_connections", "chat_participants", "accounts"):
             await conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
+        # Фазы 6 тогда тоже не было. DROP COLUMN тут не работает: SQLite
+        # отказывается удалять колонку, на которой висит внешний ключ.
+        # Поэтому пересобираем таблицу из её же PRAGMA, выкинув account_id —
+        # так фикстура по-прежнему не разъезжается с настоящей схемой
+        info = (await conn.execute(text("PRAGMA table_info(projects)"))).all()
+        defs, names = [], []
+        for _, cname, ctype, notnull, dflt, pk in info:
+            if cname == "account_id":
+                continue
+            names.append(cname)
+            piece = f'"{cname}" {ctype}'
+            if pk:
+                piece += " PRIMARY KEY"
+            if notnull and not pk:
+                piece += " NOT NULL"
+            if dflt is not None:
+                piece += f" DEFAULT {dflt}"
+            defs.append(piece)
+        await conn.execute(text("ALTER TABLE projects RENAME TO projects_v6"))
+        await conn.execute(text(f"CREATE TABLE projects ({', '.join(defs)})"))
+        cols = ", ".join(f'"{n}"' for n in names)
+        await conn.execute(text(f"INSERT INTO projects ({cols}) SELECT {cols} FROM projects_v6"))
+        await conn.execute(text("DROP TABLE projects_v6"))
         for column in ("chat_ref", "client_replied_at", "brief_ready"):
             await conn.execute(text(f"ALTER TABLE projects DROP COLUMN {column}"))
         await conn.execute(text("ALTER TABLE projects ADD COLUMN tg_chat_id VARCHAR"))
@@ -82,6 +105,11 @@ async def test_migration_from_previous_version(db):
     assert chat.chat_id == "555000"
     assert chat.transport == "telegram"
     assert proj.chat_ref == "tg:555000", "старое значение не перенеслось в chat_ref"
+
+    # фаза 6: проект, заведённый до мультиаккаунтности, уезжает в qorsa
+    async with Session() as s:
+        acc = await s.get(Account, proj.account_id)
+    assert acc is not None and acc.code == "qorsa"
 
     # и повторный прогон ничего не сломает и не задвоит
     assert await migrate() == LATEST
@@ -247,8 +275,11 @@ async def test_no_impersonation_in_max(db, mx, monkeypatch):
     chat, sent_text, conn = mx.sent[0]
     assert chat == "max-chat"
     assert conn is None
-    assert sent_text.startswith(BOT_SIGNATURE), "бот выдаёт себя за человека"
-    assert "бот" in sent_text.lower()
+    # подпись теперь несёт и компанию, и раскрытие «не человек» — второе
+    # обязательно: компания без него превратила бы подпись в обычный бренд
+    assert sent_text.startswith("🤖"), "бот выдаёт себя за человека"
+    assert "не человек" in sent_text.lower()
+    assert "qorsa" in sent_text.lower(), "клиент не видит, с какой компанией говорит"
 
 
 async def test_project_two_chats(db, tg, mx, monkeypatch):

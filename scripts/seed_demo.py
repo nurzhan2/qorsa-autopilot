@@ -23,8 +23,9 @@ except (AttributeError, ValueError):
 
 from sqlalchemy import delete, select                       # noqa: E402
 
+from autopilot import accounts                              # noqa: E402
 from autopilot.db import (AccessItem, ChatMessage, Message, Project, ProjectChat,  # noqa: E402
-                          Run, Session, Task, init_db)
+                          Run, Session, Task, init_db, sync_accounts)
 
 PREFIX = "DEMO:"
 TODAY = dt.date.today()
@@ -67,13 +68,22 @@ async def wipe(s) -> int:
 
 async def main() -> None:
     await init_db()
+
+    # Компании нужны раньше проектов: проект без компании не создаётся вовсе.
+    # Демо раскладываем по обеим — так видно, что очередь общая, а отправка нет
+    company_ids = await sync_accounts(accounts.active())
+    codes = list(company_ids)
+    print("компании:", ", ".join(f"{c}={company_ids[c]}" for c in codes))
+
     async with Session() as s:
         killed = await wipe(s)
         if killed:
             print(f"снёс старых демо-проектов: {killed}")
 
-        for title, client, prio, deadline, status, n_build, n_chat, ready, access in DEMO:
+        for idx, (title, client, prio, deadline, status, n_build, n_chat, ready, access)                 in enumerate(DEMO):
+            code = codes[idx % len(codes)]
             p = Project(
+                account_id=company_ids[code],
                 client=client, title=title, priority=prio, deadline=deadline,
                 status=status, chat_ref=f"tg:demo-{client.lower()}",
                 price=float(100 * prio), brief={"demo": True}, ready_for_work=ready,
@@ -104,7 +114,7 @@ async def main() -> None:
                 why = "  [нет галочки «Готов к работе»]"
             elif waiting:
                 why = f"  [ждёт доступы: {', '.join(waiting)}]"
-            print(f"  + {title:38s} приоритет={prio} дедлайн={dl:12s} "
+            print(f"  [{code:6s}] + {title:34s} приоритет={prio} дедлайн={dl:12s} "
                   f"задач={n_build + n_chat}{why}")
         await s.commit()
 

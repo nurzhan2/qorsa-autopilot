@@ -4,11 +4,11 @@ import asyncio
 import logging
 import sys
 
-from . import roles
+from . import accounts, roles
 from .brief import Brief, BriefRunner
 from .communicator import Communicator
 from .config import cfg
-from .db import init_db, recover_orphan_tasks
+from .db import init_db, recover_orphan_tasks, sync_accounts
 from .executor import Executor
 from .ingest import Ingest
 from .scheduler import Scheduler
@@ -38,7 +38,7 @@ log = logging.getLogger("main")
 install_log_masking()
 
 
-def sheets_configured() -> bool:
+def sheets_configured(sheet_id: str | None = None) -> bool:
     """Плейсхолдер из .env.example — не настройка.
 
     `SHEET_ID=1AbC...` выглядит заданным, синк стартует и валится каждые
@@ -47,7 +47,8 @@ def sheets_configured() -> bool:
     from pathlib import Path
 
     from .vault import _usable
-    return _usable(cfg.sheet_id) and Path(cfg.google_creds).exists()
+    target = sheet_id if sheet_id is not None else cfg.sheet_id
+    return _usable(target) and Path(cfg.google_creds).exists()
 
 
 def build_stack():
@@ -60,28 +61,53 @@ def build_stack():
     return Executor(), Verifier()
 
 
-def build_transports() -> list:
-    """Поднимаем только те мессенджеры, для которых есть токен."""
+def build_transports(accounts) -> list:
+    """По одному подключению на КОМПАНИЮ и мессенджер.
+
+    Токен берётся из vault по имени из `bot_token_ref` — в accounts.toml
+    лежит только ссылка. Компания без токена просто не поднимается: это не
+    повод не работать остальным, но сказать об этом надо вслух.
+    """
+    from .vault import resolve_secret
+
     transports = []
-    if cfg.tg_token:
-        transports.append(TelegramTransport())
-    else:
-        log.warning("TG_BOT_TOKEN не задан — Telegram выключен")
-    if cfg.max_token:
-        if cfg.max_mode == "polling":
-            transports.append(MaxTransport())
+    for acc in accounts:
+        token, where = resolve_secret(acc.bot_token_ref) if acc.bot_token_ref else (None, "")
+        if token:
+            transports.append(TelegramTransport(token=token, account=acc.code))
+            log.info("Telegram поднят для %s (%s), токен из: %s", acc.code, acc.name, where)
         else:
-            log.warning("MAX_MODE=%s — поллер не поднимаю, ждём webhook", cfg.max_mode)
+            log.warning("%s: нет токена по ссылке %r — Telegram для этой компании "
+                        "выключен", acc.code, acc.bot_token_ref)
+
+        if acc.max_token_ref:
+            max_token, _ = resolve_secret(acc.max_token_ref)
+            if max_token and cfg.max_mode == "polling":
+                transports.append(MaxTransport(token=max_token, account=acc.code))
+            elif max_token:
+                log.warning("MAX_MODE=%s — поллер не поднимаю, ждём webhook", cfg.max_mode)
     return transports
 
 
 async def main() -> None:
     await init_db()
+
+    # Компании — до всего остального: на них завязаны проекты, транспорты
+    # и таблицы. Конфиг источник правды, таблица accounts — его зеркало
+    companies = accounts.active()
+    ids = await sync_accounts(companies)
+    log.info("компаний активно: %s (%s)", len(companies),
+             ", ".join(f"{a.code}={a.name}" for a in companies))
+    shared = accounts.shared_sheets(companies)
+    for sheet, codes in shared.items():
+        log.info("таблицу делят компании %s — строки различаются колонкой «Компания»",
+                 ", ".join(codes))
+
     orphans = await recover_orphan_tasks()
     if orphans:
         log.warning("вернул в очередь %s задач, зависших в running после прошлого запуска", orphans)
 
-    transports = build_transports() if cfg.ingest_enabled else []
+    transports = build_transports(companies) if cfg.ingest_enabled else []
     communicator = Communicator(transports=transports)
     executor, verifier = build_stack()
     sched = Scheduler(executor, verifier, communicator)
@@ -90,16 +116,22 @@ async def main() -> None:
         asyncio.create_task(sched.run(), name="scheduler"),
         asyncio.create_task(communicator.pump(), name="pump"),
     ]
-    if sheets_configured():
-        tasks.append(asyncio.create_task(SheetSync().loop(), name="sheets"))
-    else:
-        log.warning("синк с таблицей выключен: нет SHEET_ID или файла %s",
-                    cfg.google_creds)
-    if transports and not roles.owner_configured():
-        log.critical("OWNER_TG_ID не задан — ingest выключен. Без id владельца "
-                     "его собственные реплики уедут в ТЗ как требования клиента")
+    # свой синк на компанию: у каждой своя таблица (а если общая — свой
+    # фильтр по колонке «Компания»). Смешивать проекты нельзя ни в какую сторону
+    for acc in companies:
+        if not sheets_configured(acc.sheet_id):
+            log.warning("%s: синк с таблицей выключен (нет sheet_id или файла %s)",
+                        acc.code, cfg.google_creds)
+            continue
+        sync = SheetSync(account=acc, account_id=ids.get(acc.code),
+                         shared=acc.sheet_id in shared)
+        tasks.append(asyncio.create_task(sync.loop(), name=f"sheets:{acc.code}"))
+
+    if transports and not roles.owner_configured(companies):
+        log.critical("ни у одной компании не задан владелец — ingest выключен. "
+                     "Без него собственные реплики уедут в ТЗ как требования клиента")
     elif transports:
-        ingest = Ingest(transports, communicator, sched, verifier)
+        ingest = Ingest(transports, communicator, sched, verifier, accounts=companies)
         tasks.append(asyncio.create_task(ingest.run(), name="ingest"))
     else:
         log.warning("ни один мессенджер не настроен — входящие не принимаются")

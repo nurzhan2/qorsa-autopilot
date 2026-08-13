@@ -3,6 +3,9 @@ venv/
 __pycache__/
 *.py[cod]
 .env
+# id владельца и настройки его юрлиц — как и .env, не в репозиторий
+accounts.toml
+!accounts.toml.example
 *.db
 *.db-wal
 *.db-shm

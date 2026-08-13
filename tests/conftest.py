@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -30,9 +31,12 @@ os.environ["QUIET_END"] = "0"
 # менеджер и владелец — один аккаунт; отдельная роль включается точечно
 os.environ["MANAGER_SEPARATE"] = "0"
 os.environ["OWNER_TG_ID"] = "777"
+# Компании берём из .env, а не из accounts.toml владельца: иначе тесты
+# начинают зависеть от того, какие юрлица он себе завёл
+os.environ["ACCOUNTS_FILE"] = str(_TMP / "no-such-accounts.toml")
 
-from autopilot.db import (AccessItem, Base, ChatMessage, Project, ProjectChat,  # noqa: E402
-                          Session, Task, engine)
+from autopilot.db import (AccessItem, Account, Base, ChatMessage, Project,  # noqa: E402
+                          ProjectChat, Session, Task, engine)
 
 
 @pytest.fixture
@@ -53,15 +57,35 @@ async def db():
 AUTO_CHAT = "<auto>"
 
 
+async def make_account(code: str = "qorsa", name: str | None = None,
+                       owner_tg_id: str = "777", **kw) -> Account:
+    """Компания в БД. Идемпотентна: повторный вызов возвращает существующую.
+
+    Отдельная функция нужна почти каждому тесту: проект без компании
+    не создаётся вовсе, и это намеренно (см. db.Project.account_id).
+    """
+    async with Session() as s:
+        row = (await s.execute(select(Account).where(Account.code == code))).scalars().first()
+        if row is None:
+            row = Account(code=code, name=name or code.title(),
+                          owner_tg_id=owner_tg_id, signature=name or code.title(), **kw)
+            s.add(row)
+            await s.commit()
+        return row
+
+
 async def make_project(status: str = "active", priority: int = 2,
                        deadline: dt.date | None = None, title: str = "проект",
                        tg_chat_id: str | None = AUTO_CHAT,
                        ready_for_work: bool = True,
                        brief_ready: bool = True,
-                       transport: str = "telegram") -> Project:
+                       transport: str = "telegram",
+                       account: str = "qorsa") -> Project:
     """tg_chat_id остался для читаемости тестов — под ним создаётся ProjectChat."""
+    acc = await make_account(account)
     async with Session() as s:
-        p = Project(client="клиент", title=title, status=status, priority=priority,
+        p = Project(account_id=acc.id,
+                    client="клиент", title=title, status=status, priority=priority,
                     deadline=deadline, ready_for_work=ready_for_work,
                     brief_ready=brief_ready,
                     chat_ref=(f"{'max' if transport == 'max' else 'tg'}:{tg_chat_id}"

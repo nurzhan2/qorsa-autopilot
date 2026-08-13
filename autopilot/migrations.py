@@ -175,12 +175,103 @@ async def m005_verifier(conn) -> None:
     await _add_column(conn, "projects", "autonomy_ratio_time", "FLOAT DEFAULT 0")
 
 
+async def m006_accounts(conn) -> None:
+    """Мультиаккаунтность: компания как сущность, проект принадлежит одной.
+
+    Три отдельных шага, и порядок между ними важен.
+
+    1. Компания по умолчанию заводится ПЕРВОЙ и получает id=1 на пустой базе.
+       Он нужен как литерал в DEFAULT следующего шага: SQLite умеет добавлять
+       NOT NULL-колонку только с константным значением по умолчанию,
+       подзапрос там не работает.
+    2. `projects.account_id` добавляется сразу NOT NULL. Не nullable с
+       последующим UPDATE: колонка, которую забыли заполнить, — это ровно тот
+       случай, когда проект молча остаётся без компании и всплывает через
+       месяц отправкой не с того бота.
+    3. `transport_state` получает составной ключ (account, transport).
+       В SQLite первичный ключ не меняется на месте, поэтому таблица
+       пересоздаётся с переносом строк в компанию по умолчанию.
+
+    Как и в m002, после переноса стоит ЯВНАЯ сверка количеств: миграция,
+    отработавшая «успешно» и перенёсшая ноль строк, уже случалась.
+    """
+    await ensure_tables(conn)
+    default_code = "qorsa"
+
+    # --- 1. компания по умолчанию ---
+    await conn.execute(
+        text("INSERT INTO accounts (code, name, handle, signature, active) "
+             "SELECT :c, :n, :h, :n, 1 "
+             "WHERE NOT EXISTS (SELECT 1 FROM accounts WHERE code = :c)"),
+        {"c": default_code, "n": "Qorsa Studio", "h": "@qorsastudio"})
+    row = (await conn.execute(text("SELECT id FROM accounts WHERE code = :c"),
+                              {"c": default_code})).first()
+    account_id = int(row[0])
+
+    # --- 2. проекты уезжают в компанию по умолчанию ---
+    if "account_id" not in await _columns(conn, "projects"):
+        total = (await conn.execute(text("SELECT COUNT(*) FROM projects"))).first()[0]
+        # ВНИМАНИЕ: на мигрируемой базе колонка получает NOT NULL, но БЕЗ
+        # внешнего ключа. Это осознанная уступка, а не недосмотр.
+        #
+        # SQLite не умеет `ADD COLUMN ... REFERENCES ... DEFAULT <не NULL>` —
+        # ровно та комбинация, которая тут нужна. Обойти можно только полной
+        # пересборкой таблицы, а она упирается в следующее: RENAME переписывает
+        # внешние ключи дочерних таблиц (tasks, messages, access_items,
+        # project_chats) на времянку, и снять это можно лишь через PRAGMA
+        # legacy_alter_table / foreign_keys, которые внутри уже открытой
+        # транзакции не действуют. Переделывать ради этого раннер миграций
+        # дороже, чем сама польза.
+        #
+        # Главный инвариант — «проект без компании не создаётся» — держит
+        # NOT NULL, и он работает одинаково везде. На новых базах
+        # `create_all` заводит и полноценный FOREIGN KEY. Разница схем
+        # описана в CLAUDE.md, чтобы не всплыла неожиданно.
+        await conn.execute(text(
+            f"ALTER TABLE projects ADD COLUMN account_id INTEGER NOT NULL "
+            f"DEFAULT {account_id}"))
+        moved = (await conn.execute(
+            text("SELECT COUNT(*) FROM projects WHERE account_id = :a"),
+            {"a": account_id})).first()[0]
+        if moved != total:
+            raise RuntimeError(
+                f"перенос проектов в компанию {default_code!r} задел {moved} строк "
+                f"из {total} — миграция остановлена, разбирайся руками")
+        log.info("projects: %s проектов уехали в компанию %s", moved, default_code)
+
+    # --- 3. offset на компанию, а не на весь транспорт ---
+    if "account" not in await _columns(conn, "transport_state"):
+        before = (await conn.execute(text("SELECT COUNT(*) FROM transport_state"))).first()[0]
+        await conn.execute(text("ALTER TABLE transport_state RENAME TO transport_state_old"))
+        await conn.execute(text("""
+            CREATE TABLE transport_state (
+                account TEXT NOT NULL DEFAULT 'qorsa',
+                transport VARCHAR(16) NOT NULL,
+                "offset" TEXT,
+                updated_at DATETIME,
+                PRIMARY KEY (account, transport)
+            )
+        """))
+        await conn.execute(text(
+            'INSERT INTO transport_state (account, transport, "offset", updated_at) '
+            'SELECT :a, transport, "offset", updated_at FROM transport_state_old'),
+            {"a": default_code})
+        after = (await conn.execute(text("SELECT COUNT(*) FROM transport_state"))).first()[0]
+        if after != before:
+            raise RuntimeError(
+                f"перенос offset'ов потерял строки: было {before}, стало {after}")
+        await conn.execute(text("DROP TABLE transport_state_old"))
+        log.info("transport_state: %s offset'ов привязаны к компании %s",
+                 after, default_code)
+
+
 MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline: схема фазы 1", m001_baseline),
     (2, "ingest: переписка, транспорты, привязка чатов", m002_ingest),
     (3, "группы: роли участников, готовность брифа", m003_group_roles),
     (4, "planner: классы проверяемости, исполнитель, зависимости", m004_planner),
     (5, "verifier: доля автономности по времени", m005_verifier),
+    (6, "мультиаккаунтность: компании, проект принадлежит одной", m006_accounts),
 ]
 
 

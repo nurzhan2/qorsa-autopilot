@@ -46,12 +46,17 @@ class MaxTransport:
     name = "max"
 
     def __init__(self, token: str | None = None, base_url: str | None = None,
-                 client: httpx.AsyncClient | None = None):
+                 client: httpx.AsyncClient | None = None, account: str = "qorsa"):
         self.token = token or cfg.max_token
         self.base_url = (base_url or cfg.max_api_base).rstrip("/")
         self._client = client
         self._own_client = client is None
         self.poll_timeout = cfg.max_poll_timeout
+        self.account = str(account)
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.account, self.name)
 
     def supports_impersonation(self) -> bool:
         # В MAX нет бизнес-режима: что бы мы ни делали, сообщение придёт от бота.
@@ -75,7 +80,7 @@ class MaxTransport:
     # ---------- поллинг ----------
 
     async def poll(self) -> AsyncIterator[InboundMessage]:
-        marker = await load_offset(self.name)
+        marker = await load_offset(self.name, self.account)
         backoff = Backoff()
 
         while True:

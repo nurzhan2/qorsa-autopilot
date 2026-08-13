@@ -9,6 +9,7 @@ from conftest import make_project
 from cryptography.fernet import Fernet
 from sqlalchemy import func, select
 
+from autopilot import accounts as accounts_cfg
 from autopilot import roles
 from autopilot.brief import (Brief, BriefRunner, SecretLeak, assert_no_secrets,
                              merge, pending_questions)
@@ -106,15 +107,16 @@ async def test_roles_assigned(db, monkeypatch):
     monkeypatch.setattr(cfg, "manager_tg_id", "888")
     monkeypatch.setattr(cfg, "bot_tg_id", "999")
 
-    assert roles.role_of("telegram", "888") == roles.MANAGER
-    assert roles.role_of("telegram", "777") == roles.OWNER
-    assert roles.role_of("telegram", "999") == roles.BOT
-    assert roles.role_of("telegram", "123") == roles.CLIENT
-    assert roles.role_of("telegram", None) == roles.CLIENT
+    acc = accounts_cfg.load()[0]
+    assert roles.role_of(acc, "888", "telegram") == roles.MANAGER
+    assert roles.role_of(acc, "777", "telegram") == roles.OWNER
+    assert roles.role_of(acc, "999", "telegram") == roles.BOT
+    assert roles.role_of(acc, "123", "telegram") == roles.CLIENT
+    assert roles.role_of(acc, None, "telegram") == roles.CLIENT
 
     for sender, expected in (("888", roles.MANAGER), ("777", roles.OWNER),
                              ("999", roles.BOT), ("123", roles.CLIENT)):
-        assert await roles.remember("telegram", CHAT, sender, "имя") == expected
+        assert await roles.remember(acc, "telegram", CHAT, sender, "имя") == expected
 
     async with Session() as s:
         rows = {p.sender_id: p.role for p in

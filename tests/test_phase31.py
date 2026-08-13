@@ -13,6 +13,7 @@ from autopilot.brief import (ORIGIN_CLIENT, ORIGIN_CONFIRMED, Brief, agreement,
                              find_confirmations, is_bare_agreement)
 from autopilot.communicator import (TO_CLIENT, TO_OWNER, TOPIC_COMMERCIAL, Communicator,
                                     commercial_route, route, topic)
+from autopilot.accounts import Account
 from autopilot.config import cfg
 from autopilot.db import ChatMessage, ChatParticipant, Project, ProjectChat, Session
 from autopilot.ingest import Ingest
@@ -37,13 +38,14 @@ async def test_manager_role_absent(db, monkeypatch):
     monkeypatch.setattr(cfg, "bot_tg_id", "999")
     monkeypatch.setattr(cfg, "manager_separate", False)
 
-    assert roles.role_of("telegram", "777") == roles.OWNER
-    assert roles.role_of("telegram", "888") == roles.OWNER, "менеджер должен быть алиасом владельца"
-    assert roles.role_of("telegram", "999") == roles.BOT
-    assert roles.role_of("telegram", "123") == roles.CLIENT
+    acc = Account(code="qorsa", name="Qorsa", owner_tg_id="777", bot_tg_id="999")
+    assert roles.role_of(acc, "777", "telegram") == roles.OWNER
+    assert roles.role_of(acc, "888", "telegram") == roles.OWNER, "менеджер должен быть алиасом владельца"
+    assert roles.role_of(acc, "999", "telegram") == roles.BOT
+    assert roles.role_of(acc, "123", "telegram") == roles.CLIENT
 
     for sender in ("777", "888", "999", "123"):
-        await roles.remember("telegram", CHAT, sender, "кто-то")
+        await roles.remember(acc, "telegram", CHAT, sender, "кто-то")
 
     async with Session() as s:
         assigned = {p.role for p in (await s.execute(select(ChatParticipant))).scalars()}
@@ -52,7 +54,7 @@ async def test_manager_role_absent(db, monkeypatch):
 
     # но механизм цел: менеджер может отделиться
     monkeypatch.setattr(cfg, "manager_separate", True)
-    assert roles.role_of("telegram", "888") == roles.MANAGER
+    assert roles.role_of(acc, "888", "telegram") == roles.MANAGER
     assert roles.MANAGER in roles.ROLES
 
 
@@ -93,15 +95,17 @@ async def test_missing_owner_id_fails_fast(db, monkeypatch):
     """Пустой OWNER_TG_ID не даёт стартовать ingest."""
     monkeypatch.setattr(cfg, "owner_tg_id", "")
     monkeypatch.setattr(cfg, "owner_max_id", "")
-    assert roles.owner_configured() is False
+    blind = Account(code="qorsa", name="Qorsa")          # владелец не указан
+    assert roles.owner_configured([blind]) is False
 
-    ing = Ingest([], _Comm())
-    with pytest.raises(RuntimeError, match="OWNER_TG_ID"):
+    ing = Ingest([], _Comm(), accounts=[blind])
+    with pytest.raises(RuntimeError, match="владелец не задан"):
         await ing.run()
 
-    monkeypatch.setattr(cfg, "owner_tg_id", "777")
-    assert roles.owner_configured() is True
-    await ing.run()          # транспортов нет — просто выходит, но уже без падения
+    # компания с владельцем — старт проходит
+    ok = Account(code="qorsa", name="Qorsa", owner_tg_id="777")
+    assert roles.owner_configured([ok]) is True
+    await Ingest([], _Comm(), accounts=[ok]).run()   # транспортов нет — просто выходит
 
 
 # ---------- подтверждённое предложение ----------
