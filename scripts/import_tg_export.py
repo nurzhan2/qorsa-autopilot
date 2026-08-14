@@ -246,7 +246,8 @@ async def run(path: Path, project_id: int | None, chat_id: str | None, dry: bool
         forced = resolve_role(sender)
         if forced is not None:
             sender_role = forced
-            await roles.remember(account, TRANSPORT, chat, sender, str(msg.get("from") or ""))
+            await roles.remember(account, TRANSPORT, chat, sender,
+                                 str(msg.get("from") or ""), role=forced)
         else:
             sender_role = await roles.remember(account, TRANSPORT, chat, sender,
                                                str(msg.get("from") or ""))

@@ -82,14 +82,20 @@ def unconfigured(accounts) -> list[str]:
 
 
 async def remember(account, transport: str, chat_id: str, sender_id: str | None,
-                   display_name: str = "") -> str:
+                   display_name: str = "", role: str | None = None) -> str:
     """Заносит участника в chat_participants и возвращает его роль.
 
     `account` — компания, которой принадлежит чат. Один и тот же человек
     в чатах разных компаний может иметь разные роли, и это не ошибка,
     а ровно то поведение, ради которого функция принимает компанию.
+
+    `role` — роль, назначенная снаружи и не подлежащая пересчёту. Нужна при
+    импорте старой переписки: там владельца задают ключом `--owner-id`, и
+    без этого параметра функция молча пересчитывала роль по конфигу компании
+    и писала в участники СВОЙ ответ. В сообщениях роль стояла правильная,
+    а в chat_participants — нет, и расхождение всплыло бы позже.
     """
-    role = role_of(account, sender_id, transport)
+    role = role or role_of(account, sender_id, transport)
     if not sender_id:
         return role
     code = getattr(account, "code", "") or ""
