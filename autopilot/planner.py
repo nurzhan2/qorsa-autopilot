@@ -120,6 +120,12 @@ SYSTEM_TEMPLATE = """Ты технический директор. Из гото
    Если в ТЗ стек указан — планируй по нему и не подменяй, в stack_decision
    так и напиши: «взят из ТЗ».
 
+   Если рядом со стеком в ТЗ стоит пометка ЗАФИКСИРОВАНО ВЛАДЕЛЬЦЕМ — выбор
+   уже сделан человеком, и он не обсуждается. Перечисли в chosen РОВНО эти
+   технологии и планируй строго по ним. Ничего не добавляй «для полноты»
+   и не заменяй на то, что считаешь лучше: подстановка своего будет
+   отвергнута кодом, и прогон придётся повторять.
+
    Если не указан — правило по умолчанию: САМОЕ ПРОСТОЕ РЕШЕНИЕ, закрывающее
    требования. Монолит, одна база, готовые сервисы вместо своей инфраструктуры.
 
@@ -322,6 +328,23 @@ def stack_not_in_brief(chosen, brief: dict) -> list[str]:
     return missing
 
 
+def stack_fixed(brief: dict) -> bool:
+    """Стек зафиксирован ВЛАДЕЛЬЦЕМ и обсуждению не подлежит.
+
+    Разница с обычным `stack_declared` принципиальная. Стек из переписки —
+    это то, что сказал клиент, и модель вправе достроить недостающее.
+    Стек с пометкой `curated` поставил человек, который отвечает за проект,
+    и подставить туда своё — не творчество, а подмена решения.
+
+    Причина жёсткости измерена: три прогона планировщика подряд по одному ТЗ
+    дали три разные архитектуры (React Native, Flutter + Firebase, Flutter +
+    Node + PostgreSQL). Архитектура определяет весь граф задач, и разброс тут
+    дороже, чем разброс формулировок в брифе.
+    """
+    return any(i.get("curated") for i in (brief.get("stack") or [])
+               if isinstance(i, dict))
+
+
 def classify(task: dict, declared: str | None = None) -> str:
     """Класс проверяемости. Код умеет ТОЛЬКО ПОНИЖАТЬ, никогда не повышать.
 
@@ -483,6 +506,10 @@ class Planner:
             rows = []
             for item in items:
                 mark = " [ОТСУТСТВУЕТ В ПОСЛЕДНЕМ ПРОГОНЕ]" if item.get("missing") else ""
+                # Пометка обязана дойти до модели: без неё она не отличит
+                # решение владельца от собственной находки и подставит своё
+                if item.get("curated"):
+                    mark += " [ЗАФИКСИРОВАНО ВЛАДЕЛЬЦЕМ — НЕ МЕНЯТЬ]"
                 prio = f" ({item['priority']})" if item.get("priority") else ""
                 rows.append(f"- {item_text(item)}{prio}{mark}")
             parts.append(f"## {field}\n" + "\n".join(rows))
@@ -514,12 +541,23 @@ class Planner:
         run_id = await open_run(task_id, "plan")
         t0 = time.monotonic()
         try:
+            # У API и CLI разные потолки ответа: API выше 16k требует
+            # стриминга, CLI режет на 32k по умолчанию, а план по большому
+            # ТЗ не помещается ни туда, ни туда одинаково
+            limit = (cfg.plan_max_tokens_cli
+                     if getattr(self.backend, "name", "api") == llm.CLI
+                     else cfg.plan_max_tokens)
             reply = await self.backend.ask(prompt, system=SYSTEM, model=self.model,
-                                           max_tokens=cfg.plan_max_tokens)
+                                           max_tokens=limit)
         except BaseException:
-            await close_run(run_id, ok=False,
-                            backend=getattr(self.backend, "name", "api"),
-                            cost_usd=0.0, seconds=time.monotonic() - t0)
+            # Ответа нет — значит нет и цифры расхода. Ноль тут неверен:
+            # оборванный вызов квоту сжёг, и потолок подписки обязан это
+            # увидеть. Оцениваем по времени и помечаем, что это оценка
+            spent = time.monotonic() - t0
+            backend = getattr(self.backend, "name", "api")
+            await close_run(run_id, ok=False, backend=backend,
+                            cost_usd=llm.estimated_cost(spent) if backend == llm.CLI else 0.0,
+                            seconds=spent, estimated=backend == llm.CLI)
             raise
         await self._charge(reply, project_id, task_id, run_id)
         return reply.text, reply.stop_reason
@@ -704,7 +742,7 @@ class Planner:
 
         prompt = self.build_prompt(project, brief, access)
         try:
-            tasks, decision = await self._attempt(prompt, project)
+            tasks, decision = await self._attempt(prompt, project, brief)
         except SecretLeak as e:
             log.critical("проект %s: %s — запрос НЕ отправлен", project.id, e)
             await self._escalate(project, f"планирование остановлено: {e}")
@@ -754,7 +792,8 @@ class Planner:
         return {"tasks": tasks, "stats": stats, "notes": notes, "order": order,
                 "stack_decision": decision, "decisions_path": decisions_path}
 
-    async def _attempt(self, prompt: str, project: Project) -> tuple[list[dict], dict]:
+    async def _attempt(self, prompt: str, project: Project,
+                       brief: dict | None = None) -> tuple[list[dict], dict]:
         errors: list[str] = []
         current = prompt
         for attempt in range(1, cfg.plan_max_attempts + 1):
@@ -781,9 +820,22 @@ class Planner:
                     errors = ["ответ не разобрался как JSON"]
             else:
                 errors = self.validate(data)
+                decision = data.get("stack_decision")
+                decision = decision if isinstance(decision, dict) else {}
+                if not errors and brief and stack_fixed(brief):
+                    # Стек зафиксирован владельцем: подстановка своего — это
+                    # не творчество, а подмена решения, и молча принимать её
+                    # нельзя. Ошибка прогона, а не тихая замена
+                    invented = stack_not_in_brief(decision.get("chosen"), brief)
+                    if invented:
+                        errors = ["стек ЗАФИКСИРОВАН владельцем и менять его "
+                                  "нельзя. Не из ТЗ: " + "; ".join(invented)
+                                  + ". Планируй строго по стеку из ТЗ"]
+                        log.error("проект %s: планировщик подставил свой стек "
+                                  "поверх зафиксированного: %s",
+                                  project.id, "; ".join(invented))
                 if not errors:
-                    decision = data.get("stack_decision")
-                    return data["tasks"], (decision if isinstance(decision, dict) else {})
+                    return data["tasks"], decision
             log.warning("проект %s: план, попытка %s не прошла валидацию: %s",
                         project.id, attempt, "; ".join(errors)[:300])
             current = (prompt + "\n\n# Предыдущий ответ отвергнут, исправь:\n- "

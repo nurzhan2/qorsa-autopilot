@@ -609,3 +609,88 @@ async def test_plan_does_not_call_invented_stack_a_client_decision(db):
     assert decision["from_brief"] is False, "придуманный стек объявлен решением клиента"
     assert len(decision["not_in_brief"]) == 2
     assert any("выбрано планировщиком" in n for n in result["notes"])
+
+
+# ---------- зафиксированный стек не подменяется ----------
+
+FIXED_STACK = [
+    {"text": "Мобильные приложения: Flutter", "evidence": [], "curated": "решение владельца"},
+    {"text": "Бэкенд: FastAPI + PostgreSQL, монолит", "evidence": [], "curated": "решение владельца"},
+]
+
+
+async def _with_fixed_stack() -> Project:
+    p = await with_brief()
+    async with Session() as s:
+        row = await s.get(Project, p.id)
+        data = dict(row.brief)
+        data["brief"] = dict(data["brief"])
+        data["brief"]["stack"] = [dict(i) for i in FIXED_STACK]
+        row.brief = data
+        await s.commit()
+        return await s.get(Project, p.id)
+
+
+def test_stack_fixed_only_when_owner_set_it():
+    """Стек из переписки и стек, поставленный руками, — разные вещи."""
+    from autopilot.planner import stack_declared, stack_fixed
+
+    from_chat = {"stack": [{"text": "WordPress", "evidence": ["telegram:1:1"]}]}
+    assert stack_declared(from_chat) is True
+    assert stack_fixed(from_chat) is False, "стек из чата объявлен неприкосновенным"
+
+    by_owner = {"stack": [dict(FIXED_STACK[0])]}
+    assert stack_fixed(by_owner) is True
+
+
+async def test_planner_must_not_substitute_a_fixed_stack(db):
+    """Подмена зафиксированного стека — ошибка прогона, а не тихая замена.
+
+    Три прогона подряд по одному ТЗ дали три разные архитектуры. Архитектура
+    определяет весь граф задач, поэтому её разброс дороже разброса брифа.
+    """
+    p = await _with_fixed_stack()
+
+    body = json.loads(plan_reply(task("Каталог", "каталог с фильтрами")))
+    body["stack_decision"] = {"chosen": ["React Native", "Firebase"],
+                              "rationale": "мне так удобнее"}
+    fake = FakeAnthropic(json.dumps(body, ensure_ascii=False))
+    # обе попытки модель упрямится — прогон обязан провалиться, а не принять
+    fake.replies.append(json.dumps(body, ensure_ascii=False))
+
+    result = await Planner(client=fake).plan(p)
+    assert result is None, "подставленный стек принят молча"
+
+    async with Session() as s:
+        row = await s.get(Project, p.id)
+    assert row.status == "blocked", "прогон не признан провалившимся"
+    assert len(fake.prompts) == 2, "модель не получила шанс исправиться"
+    assert "ЗАФИКСИРОВАН" in fake.prompts[1], "в повторе не сказано, что не так"
+
+
+async def test_planner_plans_by_the_fixed_stack(db):
+    """По зафиксированному стеку планируется нормально и без правок."""
+    p = await _with_fixed_stack()
+
+    body = json.loads(plan_reply(task("Каталог", "каталог с фильтрами")))
+    body["stack_decision"] = {
+        "chosen": ["Мобильные приложения: Flutter",
+                   "Бэкенд: FastAPI + PostgreSQL, монолит"],
+        "rationale": "взят из ТЗ, зафиксирован владельцем"}
+    result = await Planner(client=FakeAnthropic(json.dumps(body, ensure_ascii=False))).plan(p)
+
+    assert result is not None
+    assert result["stack_decision"]["from_brief"] is True
+    assert not result["stack_decision"].get("not_in_brief")
+
+
+async def test_fixed_stack_marked_in_prompt(db):
+    """Модель обязана видеть пометку — иначе она про запрет не узнает."""
+    p = await _with_fixed_stack()
+    body = json.loads(plan_reply(task("Каталог", "каталог с фильтрами")))
+    body["stack_decision"] = {"chosen": ["Мобильные приложения: Flutter",
+                                         "Бэкенд: FastAPI + PostgreSQL, монолит"]}
+    fake = FakeAnthropic(json.dumps(body, ensure_ascii=False))
+    await Planner(client=fake).plan(p)
+
+    assert "ЗАФИКСИРОВАНО ВЛАДЕЛЬЦЕМ" in fake.prompts[0]

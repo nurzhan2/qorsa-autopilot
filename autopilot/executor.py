@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from .config import cfg
 from . import guard
+from . import llm
 from .db import (AccessItem, Project, Session, Task, close_run, open_run,
                  utcnow)
 from .vault import refs_in, to_env_names, vault
@@ -94,8 +95,10 @@ class Executor:
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError:
-            await close_run(run_id, ok=False, backend=RUN_BACKEND, cost_usd=0.0,
-                            seconds=time.monotonic() - t0)
+            spent = time.monotonic() - t0
+            await close_run(run_id, ok=False, backend=RUN_BACKEND,
+                            cost_usd=llm.estimated_cost(spent), seconds=spent,
+                            estimated=True)
             raise RuntimeError(f"не нашёл claude-бинарь {cfg.claude_bin!r} (CLAUDE_BIN)") from None
 
         # Дочерний claude не должен нас пережить: брошенный процесс дожигает
@@ -106,8 +109,10 @@ class Executor:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            await close_run(run_id, ok=False, backend=RUN_BACKEND, cost_usd=0.0,
-                            seconds=time.monotonic() - t0)
+            spent = time.monotonic() - t0
+            await close_run(run_id, ok=False, backend=RUN_BACKEND,
+                            cost_usd=llm.estimated_cost(spent), seconds=spent,
+                            estimated=True)
             raise RuntimeError(f"timeout {cfg.task_timeout_sec}s") from None
         except BaseException:
             # отмена или сигнал: процесс убиваем сами, иначе он останется

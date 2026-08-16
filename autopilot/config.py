@@ -204,10 +204,14 @@ class Config:
     plan_model = os.getenv("PLAN_MODEL", "") or os.getenv("JUDGE_MODEL", "claude-sonnet-4-6")
     plan_max_attempts = _i("PLAN_MAX_ATTEMPTS", 2)
     # На 32 пунктах ТЗ план в 8000 токенов не помещался и обрывался
-    # на середине JSON — выглядело как «модель отдала мусор»
-    # Выше ~16k SDK требует стриминга: он считает, что запрос займёт
-    # больше десяти минут, и отказывается идти без него
+    # на середине JSON — выглядело как «модель отдала мусор».
+    # 16000 хватало на API, но не на CLI: план по 26 пунктам ТЗ упёрся
+    # в потолок ответа CLI (32000) и вернулся ошибкой, а не планом.
+    # Выше ~16k SDK требует стриминга — это ограничение API, не CLI,
+    # поэтому потолки разведены: PLAN_MAX_TOKENS для API,
+    # PLAN_MAX_TOKENS_CLI для подписки.
     plan_max_tokens = _i("PLAN_MAX_TOKENS", 16000)
+    plan_max_tokens_cli = _i("PLAN_MAX_TOKENS_CLI", 48000)
     # ниже этой доли auto-задач проект малопригоден для автопилота
     autonomy_min_ratio = _f("AUTONOMY_MIN_RATIO", 0.5)
 

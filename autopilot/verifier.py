@@ -719,9 +719,13 @@ class Verifier:
                                            model=cfg.judge_model,
                                            max_tokens=max_tokens)
         except BaseException:
-            await close_run(run_id, ok=False,
-                            backend=getattr(self.backend, "name", llm.API),
-                            cost_usd=0.0, seconds=time.monotonic() - t0)
+            # см. llm.estimated_cost: у оборванного вызова цифры нет,
+            # а квота потрачена
+            spent = time.monotonic() - t0
+            backend = getattr(self.backend, "name", llm.API)
+            await close_run(run_id, ok=False, backend=backend,
+                            cost_usd=llm.estimated_cost(spent) if backend == llm.CLI else 0.0,
+                            seconds=spent, estimated=backend == llm.CLI)
             raise
         await self._charge(task, project, reply, run_id)
         return reply

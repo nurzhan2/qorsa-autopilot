@@ -12,7 +12,7 @@ import json
 import pytest
 from conftest import FakeCommunicator, make_project, make_tasks
 
-from autopilot import limits, llm
+from autopilot import brief as B, limits, llm
 from autopilot.config import cfg
 from autopilot.db import Project, Run, Session, Task
 from autopilot.fakes import FakeExecutor, FakeVerifier
@@ -536,8 +536,14 @@ async def test_run_row_exists_before_the_model_answers(db):
     assert row.backend == "cli" and row.cost_usd == 0.02
 
 
-async def test_interrupted_call_leaves_an_unfinished_run(db):
-    """Упор в квоту или обрыв — строка остаётся, но закрытой не считается."""
+async def test_aborted_call_is_charged_by_time(db):
+    """Оборванный вызов жжёт квоту — и обязан двигать суточный потолок.
+
+    Цифру расхода отдаёт CLI вместе с ответом, а у срубленного вызова ответа
+    нет. Раньше в строку писался ноль: два получасовых таймаута на плане
+    проекта 8 не сдвинули DAILY_CLI_BUDGET_USD ни на цент, то есть тормоз
+    не работал ровно там, где был нужен.
+    """
     from sqlalchemy import select
 
     from autopilot.brief import Brief
@@ -557,7 +563,10 @@ async def test_interrupted_call_leaves_an_unfinished_run(db):
     async with Session() as s:
         row = (await s.execute(select(Run))).scalars().one()
     assert row.kind == "brief" and row.ok is False
-    assert row.cost_usd == 0.0, "за несостоявшийся вызов ничего не списываем"
+    assert row.cost_estimated is True, "догадка не отмечена как догадка"
+    assert row.cost_usd >= 0.0
+    # ставка берётся из времени вызова, а не с потолка
+    assert row.cost_usd == pytest.approx(llm.estimated_cost(row.seconds), rel=1e-6)
 
 
 def test_answer_mentioning_rate_limits_is_not_a_quota_wall(monkeypatch):
@@ -747,3 +756,130 @@ async def test_service_task_is_reused_not_bred(db):
     assert len(anchors) == 1, f"на три вызова заведено {len(anchors)} служебных задач"
     assert len(runs) == 3, "а вот строк расхода должно быть по одной на вызов"
     assert {r.task_id for r in runs} == {anchors[0].id}
+
+
+def test_estimated_cost_matches_observed_rate():
+    """Ставка снята с живых прогонов, а не выдумана.
+
+    План на CLI: $0.93 за 11.3 минуты. Бриф: $0.32 за 3.7 минуты. Оценка
+    обязана попадать в тот же порядок — иначе потолок подписки будет врать
+    в разы, а не в проценты.
+    """
+    assert llm.estimated_cost(11.3 * 60) == pytest.approx(0.90, abs=0.15)
+    assert llm.estimated_cost(3.7 * 60) == pytest.approx(0.30, abs=0.10)
+    assert llm.estimated_cost(0) == 0.0
+
+
+async def test_aborted_calls_move_the_subscription_brake(db, monkeypatch):
+    """Проверка ради чего всё: оборванные вызовы тормозят build.
+
+    Часы тут не подменяем: `time.monotonic` зовёт и SQLAlchemy, и подмена
+    ломает пул соединений. Проверяем проводку — что путь провала берёт оценку
+    и что она доходит до счётчика подписки.
+    """
+    from autopilot.db import cli_spent_today
+
+    project = await make_project()
+    monkeypatch.setattr(llm, "estimated_cost", lambda seconds: 2.4)
+
+    class Dead:
+        name = "cli"
+
+        async def ask(self, *a, **kw):
+            raise LLMError("не ответил за 1800s")
+
+    brief = B.Brief(backend=Dead())
+    for _ in range(2):
+        with pytest.raises(LLMError):
+            await brief._call("промпт", None, project.id)
+
+    spent = await cli_spent_today()
+    assert spent == pytest.approx(4.8), (
+        f"два оборванных вызова дали {spent:.2f} — тормоз не сдвинулся")
+
+
+def test_real_session_limit_text_is_recognised():
+    """Живой текст CLI, на котором упор приняли за поломку.
+
+    «You've hit your session limit · resets 5:50pm (Asia/Qyzylorda)» не подошёл
+    ни под один маркер: там «session limit», а не «usage limit», и «resets
+    5:50pm», а не «resets at». Прогон плана объявили недоступностью модели —
+    а в бою это стоило бы задаче засчитанной попытки и дороги в эскалацию.
+    """
+    import datetime as dt
+
+    text = "You've hit your session limit · resets 5:50pm (Asia/Qyzylorda)"
+    assert llm.looks_like_limit(text) is True, "настоящий упор принят за поломку"
+
+    # и пауза считается до названного времени, а не с потолка
+    now = dt.datetime(2026, 8, 16, 17, 38)
+    assert llm.retry_after_from(text, now=now) == 12 * 60
+
+    # время уже прошло — значит окно откроется завтра
+    late = dt.datetime(2026, 8, 16, 18, 10)
+    assert llm.retry_after_from(text, now=late) == pytest.approx(23 * 3600 + 40 * 60)
+
+    # прежняя форма «через сколько» продолжает работать
+    assert llm.retry_after_from("Usage limit reached, resets in 3h") == 3 * 3600
+
+
+def test_limit_text_only_checked_on_failure(monkeypatch):
+    """Слово resets в УСПЕШНОМ ответе упором не считается.
+
+    Маркеры стали шире, и это безопасно ровно потому, что успешный конверт
+    мы больше не обыскиваем: разбор идёт до проверки.
+    """
+    plan = "Задача: настроить сброс пароля, resets по ссылке из письма"
+
+    async def fake_exec(*args, **kwargs):
+        class P:
+            returncode = 0
+            pid = None
+
+            async def communicate(self, input=None):
+                return json.dumps({"is_error": False, "result": plan,
+                                   "usage": {}}).encode(), b""
+        return P()
+
+    monkeypatch.setattr("shutil.which", lambda *a: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    assert asyncio.run(CliBackend().ask("план")).text == plan
+
+
+def test_cli_gets_the_token_ceiling_through_env(monkeypatch):
+    """Потолок ответа у CLI задаётся переменной окружения, а не флагом.
+
+    Записано было обратное — «CLI не принимает max_tokens вовсе», — и наши
+    BRIEF_MAX_TOKENS с PLAN_MAX_TOKENS на подписке молча не значили ничего.
+    Цена ошибки: план вернулся не планом, а «Claude's response exceeded the
+    32000 output token maximum».
+    """
+    seen = {}
+
+    async def fake_exec(*args, **kwargs):
+        seen["env"] = kwargs.get("env") or {}
+
+        class P:
+            returncode = 0
+            pid = None
+
+            async def communicate(self, input=None):
+                return b'{"result": "ok", "usage": {}}', b""
+        return P()
+
+    monkeypatch.setattr("shutil.which", lambda *a: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    asyncio.run(CliBackend().ask("вопрос", max_tokens=48000))
+    assert seen["env"].get("CLAUDE_CODE_MAX_OUTPUT_TOKENS") == "48000"
+    # остальное окружение остаётся на месте: там ключи и PATH
+    assert "PATH" in seen["env"] or "Path" in seen["env"]
+
+
+def test_plan_ceiling_differs_by_backend():
+    """У API и CLI пределы разные, и путать их нельзя."""
+    from autopilot.config import cfg as c
+
+    assert c.plan_max_tokens_cli > c.plan_max_tokens, (
+        "на CLI план не помещался в 16k — потолок должен быть выше")
+    assert c.plan_max_tokens_cli >= 32000, "32000 — то, во что упёрлись живьём"

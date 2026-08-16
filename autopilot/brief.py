@@ -53,6 +53,45 @@ log = logging.getLogger("brief")
 
 ORIGIN_CLIENT = "client"
 ORIGIN_CONFIRMED = "confirmed_proposal"
+# Пункт, поставленный ВЛАДЕЛЬЦЕМ руками. Не проверяется на evidence и не
+# зависит от прогонов модели — это не заявление, требующее подтверждения,
+# а решение человека, который за проект отвечает.
+ORIGIN_OWNER = "owner"
+
+
+def is_curated(item) -> bool:
+    return isinstance(item, dict) and bool(item.get("curated"))
+
+
+def curated_items(brief: dict | None) -> dict[str, list[dict]]:
+    """Всё, что владелец поставил руками, по полям.
+
+    Нужно затем, что полный пересбор начинает с чистого листа: `brief_eval`
+    обнуляет бриф перед прогоном, и решение человека уезжало вместе с ним.
+    Модель его не восстановит — она про него ничего не знает.
+    """
+    out: dict[str, list[dict]] = {}
+    for field in LIST_FIELDS:
+        rows = [dict(i) for i in ((brief or {}).get(field) or []) if is_curated(i)]
+        if rows:
+            out[field] = rows
+    return out
+
+
+def restore_curated(brief: dict, curated: dict[str, list[dict]]) -> dict:
+    """Вернуть решения человека в собранный бриф.
+
+    Дубли не плодим: если модель сама назвала то же самое, ручной пункт
+    заменяет её формулировку — она вторична по отношению к решению.
+    """
+    out = dict(brief or {})
+    for field, rows in (curated or {}).items():
+        current = [i for i in (out.get(field) or []) if isinstance(i, dict)]
+        for item in rows:
+            current = [c for c in current if not same_item(c, item)]
+            current.append(dict(item))
+        out[field] = current
+    return out
 
 # Сообщение считается длинным — то есть содержательным — с этого размера.
 # Именно длинные несут ТЗ, поэтому под нож они идут последними, а не первыми.
@@ -600,9 +639,14 @@ class Brief:
             reply = await self.backend.ask(prompt, system=SYSTEM, model=self.model,
                                            max_tokens=cfg.brief_max_tokens)
         except BaseException:
-            await close_run(run_id, ok=False,
-                            backend=getattr(self.backend, "name", "api"),
-                            cost_usd=0.0, seconds=time.monotonic() - t0)
+            # Ответа нет — значит нет и цифры расхода. Ноль тут неверен:
+            # оборванный вызов квоту сжёг, и потолок подписки обязан это
+            # увидеть. Оцениваем по времени и помечаем, что это оценка
+            spent = time.monotonic() - t0
+            backend = getattr(self.backend, "name", "api")
+            await close_run(run_id, ok=False, backend=backend,
+                            cost_usd=llm.estimated_cost(spent) if backend == llm.CLI else 0.0,
+                            seconds=spent, estimated=backend == llm.CLI)
             raise
         await self._charge(reply, task_id, project_id, run_id)
         return reply.text, reply.stop_reason
@@ -707,6 +751,14 @@ class Brief:
 
         def keep(item: dict, where: str) -> str:
             """Возвращает "keep", "reject" или "drop"."""
+            # Решение владельца проверять на evidence не надо и нечем: правило
+            # существует против ВЫДУМОК МОДЕЛИ, а человек, отвечающий за проект,
+            # вправе зафиксировать то, чего клиент не говорил, — стек, например.
+            # Пометка `curated` ставится только руками и видна в brief_eval
+            if is_curated(item):
+                item["origin"] = ORIGIN_OWNER
+                return "keep"
+
             refs = resolve(_norm_evidence(item.get("evidence")))
 
             # 1) обычный путь: клиент сказал это сам.
@@ -918,6 +970,15 @@ class Brief:
         # Накапливаем ВСЕГДА, а не только на инкременте: модель недетерминирована,
         # и полный пересбор точно так же теряет пункты между прогонами
         data = accumulate(previous, data)
+        # Решения владельца возвращаются последними и поверх всего: они не
+        # результат прогона и не должны от него зависеть. Без этого полный
+        # пересбор стирал зафиксированный руками стек, а модель выбирала
+        # архитектуру заново — три прогона подряд дали три разные
+        manual = curated_items(previous)
+        if manual:
+            data = restore_curated(data, manual)
+            log.info("проект %s: возвращено решений владельца — %s",
+                     project.id, sum(len(v) for v in manual.values()))
 
         await self._persist(project, data, messages, dropped, full=full)
         return data
@@ -1373,6 +1434,11 @@ def accumulate(previous: dict | None, fresh: dict, now: str | None = None) -> di
                 match.pop("missing", None)
                 result.append(match)
                 used.add(id(match))
+            elif is_curated(old):
+                # Решение владельца прогоном модели не подтверждается и в нём
+                # не нуждается: пометки «не подтверждён» тут быть не должно,
+                # иначе человек каждый раз видел бы свой же выбор как спорный
+                result.append(dict(old))
             elif field == "open_questions" or any(same_item(old, r) for r in rejected_items):
                 continue        # закрытый вопрос и отвергнутый пункт не возвращаем
             else:
