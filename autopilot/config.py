@@ -152,6 +152,11 @@ class Config:
     # --- planner.py ---
     plan_model = os.getenv("PLAN_MODEL", "") or os.getenv("JUDGE_MODEL", "claude-sonnet-4-6")
     plan_max_attempts = _i("PLAN_MAX_ATTEMPTS", 2)
+    # На 32 пунктах ТЗ план в 8000 токенов не помещался и обрывался
+    # на середине JSON — выглядело как «модель отдала мусор»
+    # Выше ~16k SDK требует стриминга: он считает, что запрос займёт
+    # больше десяти минут, и отказывается идти без него
+    plan_max_tokens = _i("PLAN_MAX_TOKENS", 16000)
     # ниже этой доли auto-задач проект малопригоден для автопилота
     autonomy_min_ratio = _f("AUTONOMY_MIN_RATIO", 0.5)
 

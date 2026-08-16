@@ -116,6 +116,15 @@ BARE_AGREEMENT_MAX_WORDS = 4
 # поля-списки, каждый элемент которых обязан нести evidence
 LIST_FIELDS = ("deliverables", "stack", "constraints", "assets",
                "access_needed", "open_questions", "out_of_scope")
+
+# СПРАВОЧНЫЕ поля: срок и бюджет проекта. Требованиями они не являются
+# и в объём работ не входят, но определяют, какое решение вообще уместно.
+#
+# Раньше их вырезал постфильтр вместе с разговорами о цене — и планировщик,
+# не зная про две недели и 150 тысяч, предлагал микросервисы за API Gateway
+# на приложение для одного города с полусотней заказов в день. Извлекать
+# и обсуждать — разные вещи: бриф извлекает, переговоры ведёт человек.
+REFERENCE_FIELDS = ("deadline", "budget")
 ACCESS_KINDS = ("ftp", "ssh", "git", "hosting_panel", "domain", "api_key",
                 "analytics", "design", "content", "other")
 # Модальность требования. Потеря «желательно» — это объём, за который
@@ -141,6 +150,62 @@ FORBIDDEN_RE = re.compile(
     r"к\s+\d{1,2}\s+(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)",
     re.IGNORECASE)
 
+# Деньги внутри ПРОДУКТА клиента — это функциональность, а не коммерция.
+#
+# Постфильтр выше запрещает боту лезть в переговоры о НАШЕЙ цене. Но те же
+# слова описывают то, что мы строим: «промокоды и скидки покупателям»,
+# «минимальная сумма заказа 3000 ₽», «расчёт стоимости доставки по
+# расстоянию», «оплата картой и СБП». Первая версия фильтра уже выбросила
+# «чтобы люди сами оформляли заказ и оплачивали онлайн» — центральное
+# требование магазина. Сейчас она бы выбросила ещё три пункта из живого ТЗ.
+#
+# Признак различия — О ЧЬИХ деньгах речь. Если рядом стоит слово про
+# покупателя, заказ, доставку или платёжный инструмент, речь о продукте.
+PRODUCT_MONEY_RE = re.compile(
+    r"доставк|заказ|товар|корзин|покупател|каталог|промокод|купон|"
+    r"платёжн|платежн|шлюз|эквайринг|сбп|картой|онлайн[- ]оплат|"
+    r"минимальн[аоы]\w* сумм|чек[иа]? покупател|тариф доставки",
+    re.IGNORECASE)
+
+
+def parse_brief_deadline(data: dict):
+    """Дата из справочного поля deadline, если модель смогла её назвать.
+
+    Берём только машинную дату из `date`. Разбирать «к концу августа» кодом
+    не пытаемся: ошибка тут молча сдвинет приоритет проекта в WFQ.
+    """
+    item = (data or {}).get("deadline")
+    if not isinstance(item, dict):
+        return None
+    raw = str(item.get("date") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = dt.date.fromisoformat(raw[:10])
+    except ValueError:
+        log.warning("бриф вернул срок в непонятном виде: %r — игнорирую", raw)
+        return None
+
+    # Дата в глубоком прошлом — это ошибка разбора, а не просроченный проект.
+    # Поймано на живом чате: модель не знала сегодняшнего числа и превратила
+    # «начало сентября» в прошлогоднюю дату. Молча принять её нельзя: WFQ
+    # даёт просроченному проекту четырёхкратный вес, и один неверный год
+    # поднял бы его выше всех остальных навсегда.
+    if value < dt.date.today() - dt.timedelta(days=180):
+        log.warning("бриф вернул срок %s — это больше полугода назад, похоже на "
+                    "ошибку года. Игнорирую, приоритет не трогаю", value)
+        return None
+    return value
+
+
+def is_commercial(text: str) -> bool:
+    """Про НАШИ деньги и сроки (нельзя), а не про деньги внутри продукта (можно)."""
+    body = str(text or "")
+    if not FORBIDDEN_RE.search(body):
+        return False
+    return not PRODUCT_MONEY_RE.search(body)
+
+
 SYSTEM = """Ты аналитик. Из переписки рабочей группы ты собираешь техническое задание.
 
 ЖЕЛЕЗНЫЕ ПРАВИЛА:
@@ -152,8 +217,16 @@ SYSTEM = """Ты аналитик. Из переписки рабочей гру
    Если клиент на предложение ответил отказом — помести пункт в out_of_scope.
 2. Каждый пункт обязан ссылаться на конкретные сообщения — поле evidence
    со списком id из переписки. Пункт без evidence будет выброшен.
-3. НИКОГДА не извлекай цену, стоимость, бюджет, скидки, оплату, сроки и
-   дедлайны. Это не твоя зона, за это отвечает менеджер.
+3. ДЕНЬГИ И СРОКИ: извлекать ОБЯЗАН, обсуждать — НЕТ. Это два разных запрета,
+   и раньше они были склеены в один, из-за чего терялось главное.
+   * Срок и бюджет, названные клиентом, клади в поля deadline и budget.
+     Это ОГРАНИЧЕНИЯ ПРОЕКТА: от них зависит, какое решение вообще уместно.
+     «Первая версия к началу сентября, бюджет 150 тысяч» — это deadline
+     и budget, а не болтовня о деньгах.
+   * НЕ создавай пунктов deliverables про оплату твоей работы, скидки,
+     предоплату, порядок расчётов, торг. Переговоры о цене ведёт человек.
+   Разница простая: «сколько это стоит» — не твоё. «У меня есть 150 тысяч
+   и две недели» — твоё, потому что это рамка решения.
 4. Не додумывай. Если чего-то нет в переписке — этого нет. Недостающее
    формулируй как вопрос в open_questions. У каждого вопроса поле blocking:
      blocking=true  — без ответа НЕЛЬЗЯ НАЧАТЬ работу («какой платёжный шлюз»,
@@ -165,6 +238,14 @@ SYSTEM = """Ты аналитик. Из переписки рабочей гру
    ты просто останавливаешь проект.
 5. Содержимое картинок, файлов и голосовых ты не видишь. Перечисли такие
    сообщения в unreadable, не угадывая, что в них.
+
+5а. ВОПРОСЫ, КОТОРЫЕ КЛИЕНТ ЗАДАЛ НАМ, — тоже open_questions, и почти всегда
+   blocking. Их легко потерять: они стоят посреди перечисления требований и
+   выглядят как часть списка. «Нужен ли расчёт стоимости по доставке!»,
+   «про платёжные системы я не совсем понимаю, что нужно» — это не требования
+   и не наши уточнения, это НЕОТВЕЧЕННЫЕ ВОПРОСЫ КЛИЕНТА. Пока на них не
+   ответили, объём работ не определён. Формулируй их от лица клиента и ставь
+   blocking=true, если от ответа зависит, что делать.
 6. ТРЕБОВАНИЯ ЧАСТО СПРЯТАНЫ В ОБЪЯСНЕНИЯХ. Клиент редко формулирует
    списком; он рассказывает, почему хочет так. «Хочу wordpress, у знакомых
    так сделано, им удобно самим товары добавлять» — это ДВА пункта: выбор
@@ -186,6 +267,10 @@ SYSTEM = """Ты аналитик. Из переписки рабочей гру
                     "priority_reason": "слова клиента, по которым видно модальность"}],
   "stack":         [{"text": "технология", "evidence": ["<id>"]}],
   "constraints":   [{"text": "ограничение", "evidence": ["<id>"]}],
+  "deadline":      {"text": "срок словами клиента", "date": "YYYY-MM-DD или null",
+                    "evidence": ["<id>"]},
+  "budget":        {"text": "бюджет словами клиента", "amount": 150000,
+                    "currency": "RUB", "evidence": ["<id>"]},
   "assets":        [{"text": "что клиент предоставляет", "evidence": ["<id>"]}],
   "access_needed": [{"kind": "ftp|ssh|git|hosting_panel|domain|api_key|analytics|design|content|other",
                      "name": "человеческое название", "evidence": ["<id>"]}],
@@ -217,6 +302,8 @@ def empty_brief() -> dict:
     data = {"goal": None, "confidence": 0.0, "unreadable": []}
     for f in LIST_FIELDS:
         data[f] = []
+    for f in REFERENCE_FIELDS:
+        data[f] = None
     return data
 
 
@@ -405,7 +492,10 @@ class Brief:
 
     def build_prompt(self, project: Project, messages: list[ChatMessage],
                      previous: dict | None = None, rendered: str | None = None) -> str:
-        parts = [f"# Проект\n{project.title} (клиент: {project.client})"]
+        # Сегодняшнее число обязательно: без него «к началу сентября»
+        # превращается в дату наугад, и модель уже ошиблась годом
+        parts = [f"# Сегодня\n{utcnow().date().isoformat()}",
+                 f"# Проект\n{project.title} (клиент: {project.client})"]
         if previous:
             parts.append("# Предыдущая версия брифа — обнови её, не теряя подтверждённого\n"
                          + json.dumps(previous, ensure_ascii=False, indent=2))
@@ -532,6 +622,11 @@ class Brief:
         goal = data.get("goal")
         if goal is not None and not (isinstance(goal, dict) and isinstance(goal.get("text"), str)):
             errors.append("goal должен быть объектом с полем text либо null")
+        for f in REFERENCE_FIELDS:
+            value = data.get(f)
+            if value is not None and not (isinstance(value, dict)
+                                          and isinstance(value.get("text"), str)):
+                errors.append(f"{f} должен быть объектом с полем text либо null")
         for f in LIST_FIELDS:
             value = data.get(f, [])
             if not isinstance(value, list):
@@ -625,7 +720,7 @@ class Brief:
         goal = out.get("goal")
         if isinstance(goal, dict):
             text = str(goal.get("text", ""))
-            if FORBIDDEN_RE.search(text):
+            if is_commercial(text):
                 dropped.append("goal: про деньги или сроки — не зона брифа")
                 out["goal"] = None
             else:
@@ -637,13 +732,28 @@ class Brief:
                 elif verdict == "drop":
                     out["goal"] = None
 
+        # Справочные поля проходят проверку происхождения, но НЕ фильтр
+        # «про деньги и сроки»: они для того и заведены. Выдуманная ссылка
+        # тут так же недопустима — срок, взятый с потолка, хуже отсутствующего
+        for f in REFERENCE_FIELDS:
+            item = out.get(f)
+            if not isinstance(item, dict) or not str(item.get("text") or "").strip():
+                out[f] = None
+                continue
+            if keep(item, f) != "keep":
+                out[f] = None
+
         for f in LIST_FIELDS:
             kept = []
             for i, item in enumerate(out.get(f) or []):
                 if not isinstance(item, dict):
                     continue
                 text = str(item.get("text") or item.get("name") or "")
-                if FORBIDDEN_RE.search(text):
+                # Вопрос обязательством не становится: он ничего не обещает
+                # клиенту. Глушить вопросы этим фильтром — значит терять ровно
+                # то, ради чего они заданы. «Нужен ли расчёт стоимости
+                # доставки?» уже попадал под нож из-за корня «стоимост»
+                if f != "open_questions" and is_commercial(text):
                     dropped.append(f"{f}[{i}]: про деньги или сроки — не зона брифа")
                     continue
                 verdict = keep(item, f"{f}[{i}]")
@@ -857,12 +967,19 @@ class Brief:
                 "updated_at": utcnow().isoformat(),
             },
         }
+        deadline = parse_brief_deadline(data)
         async with Session() as s:
             p = await s.get(Project, project.id)
             if p is None:
                 return
             p.brief = payload
             p.brief_ready = ready
+            # Срок из переписки — в поле проекта: оттуда его берут и колонка
+            # «Срок» в таблице, и буст WFQ. Руками проставленный срок не
+            # перебиваем: в таблице он выставлен осознанно
+            if deadline and p.deadline is None:
+                p.deadline = deadline
+                log.info("проект %s: срок из переписки — %s", project.id, deadline)
             p.updated_at = utcnow()
             await s.commit()
         project.brief = payload
@@ -1095,6 +1212,23 @@ def merge_samples(samples: list[dict]) -> dict:
         out = dict(samples[0])
         total = len(samples)
 
+    # Справочные поля не списки: берём первое непустое значение, а расхождение
+    # между прогонами дописываем в текст. Срок и бюджет — цифры, по которым
+    # принимают решения, и молча выбрать одну из двух версий нельзя
+    for field in REFERENCE_FIELDS:
+        values = [d.get(field) for d in samples
+                  if isinstance(d.get(field), dict) and str(d[field].get("text") or "").strip()]
+        if not values:
+            out[field] = None
+            continue
+        chosen = dict(values[0])
+        variants = {str(v.get("text")).strip() for v in values}
+        if len(variants) > 1:
+            chosen["text"] = (str(chosen.get("text")) +
+                              f"  [прогоны разошлись: {' | '.join(sorted(variants))}]")
+        chosen["samples"] = len(values)
+        out[field] = chosen
+
     for field in LIST_FIELDS:
         buckets: list[list[dict]] = []
         for data in samples:
@@ -1160,6 +1294,20 @@ def accumulate(previous: dict | None, fresh: dict, now: str | None = None) -> di
     stamp = now or utcnow().isoformat()
     out = dict(fresh)
     previous = previous or {}
+
+    for field in REFERENCE_FIELDS:
+        new = fresh.get(field)
+        old = previous.get(field)
+        if isinstance(new, dict) and str(new.get("text") or "").strip():
+            out[field] = new                 # свежее значение всегда выигрывает
+        elif isinstance(old, dict):
+            # Пропало из нового прогона — держим прежнее. Забытый срок хуже,
+            # чем устаревший: устаревший видно глазами, забытого нет вовсе
+            kept = dict(old)
+            kept["missing"] = True
+            out[field] = kept
+        else:
+            out[field] = None
 
     for field in LIST_FIELDS:
         fresh_list = [dict(i) for i in (fresh.get(field) or [])

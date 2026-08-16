@@ -39,6 +39,55 @@ CLASS_MARK = {"auto": "✓ авто", "assisted": "~ с моделью", "human"
 EXEC_MARK = {"claude_code": "агент", "manual": "руками", "external": "третья сторона"}
 
 
+def show_stack(decision: dict, path: str | None) -> None:
+    """Выбранный стек — ПЕРВЫМ блоком, до задач.
+
+    Это решение определяет весь остальной план: первая задача заводит проект
+    на выбранных технологиях, а от неё зависят все прочие. Смотреть на него
+    надо раньше, чем на список задач, а не выискивать в описаниях.
+    """
+    print(f"\n{LINE}\nВЫБРАННЫЙ СТЕК\n{LINE}")
+    if not decision:
+        print("  (модель не вернула решение по стеку)")
+        return
+    if decision.get("from_brief"):
+        print("  ВЗЯТ ИЗ ТЗ — планировщик его не выбирал")
+    for item in decision.get("chosen") or []:
+        print(f"  • {item}")
+    if decision.get("rationale"):
+        print(f"\n  Почему: {decision['rationale']}")
+    driven = decision.get("driven_by") or []
+    if driven:
+        print(f"  Продиктовано: {', '.join(str(d) for d in driven)}")
+    rejected = decision.get("rejected") or []
+    if rejected:
+        print("\n  Отброшено:")
+        for item in rejected:
+            if isinstance(item, dict):
+                print(f"    ✗ {item.get('option')} — {item.get('why')}")
+            else:
+                print(f"    ✗ {item}")
+    if path:
+        print(f"\n  записано в {path}")
+
+
+def show_frame(brief: dict) -> None:
+    """Рамки проекта: срок и бюджет. Внутри них выбиралось решение."""
+    rows = []
+    for field, label in (("deadline", "Срок"), ("budget", "Бюджет")):
+        item = brief.get(field)
+        if isinstance(item, dict) and str(item.get("text") or "").strip():
+            mark = "  [нет в последнем прогоне]" if item.get("missing") else ""
+            rows.append(f"  {label}: {item['text']}{mark}")
+    if not rows:
+        print("\n  РАМКИ: срок и бюджет в ТЗ не названы — решение выбиралось "
+              "без них")
+        return
+    print("\n  РАМКИ ПРОЕКТА:")
+    for row in rows:
+        print(row)
+
+
 def show_tasks(tasks: list[dict]) -> None:
     print(f"\n{LINE}\nПЛАН ({len(tasks)} задач)\n{LINE}")
     for i, t in enumerate(tasks, 1):
@@ -196,6 +245,8 @@ async def run(project_id: int) -> int:
         print("\nплан не собран — смотри лог выше", file=sys.stderr)
         return 1
 
+    show_stack(result.get("stack_decision") or {}, result.get("decisions_path"))
+    show_frame(brief)
     show_tasks(result["tasks"])
     show_graph(result["tasks"], result["order"])
     show_from_goal(result["tasks"])
