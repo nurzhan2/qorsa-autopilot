@@ -11,10 +11,19 @@ from pathlib import Path
 from sqlalchemy import select
 
 from .config import cfg
-from .db import AccessItem, Project, Run, Session, Task, utcnow
+from . import guard
+from .db import (AccessItem, Project, Session, Task, close_run, open_run,
+                 utcnow)
 from .vault import refs_in, to_env_names, vault
 
 log = logging.getLogger("exec")
+
+# Чем платит headless-сессия Claude Code. Оставлено "api", как было до
+# раздельного учёта: именно по этой цифре суточный бюджет останавливает
+# полосу build, и менять это молча нельзя. Если сессии исполнителя идут
+# по подписке (а сейчас идут), честнее "cli" — но тогда у build пропадёт
+# единственный денежный тормоз, и решать это владельцу, а не правке мимоходом.
+RUN_BACKEND = "api"
 
 SYSTEM_RULES = """Ты работаешь автономно, человека рядом нет.
 Правила:
@@ -72,6 +81,9 @@ class Executor:
             "--model", cfg.cc_model,
         ]
 
+        # Строка расхода — ДО запуска: сессия исполнителя живёт до получаса,
+        # и всё это время её не было видно в учёте вообще
+        run_id = await open_run(task.id, "execute")
         t0 = time.monotonic()
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -79,14 +91,29 @@ class Executor:
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError:
+            await close_run(run_id, ok=False, backend=RUN_BACKEND, cost_usd=0.0,
+                            seconds=time.monotonic() - t0)
             raise RuntimeError(f"не нашёл claude-бинарь {cfg.claude_bin!r} (CLAUDE_BIN)") from None
 
+        # Дочерний claude не должен нас пережить: брошенный процесс дожигает
+        # то же пятичасовое окно, что и работа владельца руками
+        guard.watch_child(proc)
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=cfg.task_timeout_sec)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
+            await close_run(run_id, ok=False, backend=RUN_BACKEND, cost_usd=0.0,
+                            seconds=time.monotonic() - t0)
             raise RuntimeError(f"timeout {cfg.task_timeout_sec}s") from None
+        except BaseException:
+            # отмена или сигнал: процесс убиваем сами, иначе он останется
+            # работать сиротой
+            if proc.returncode is None:
+                proc.kill()
+            raise
+        finally:
+            guard.forget_child(proc)
 
         elapsed = time.monotonic() - t0
         log_path = cfg.logs / f"task{task.id}_{int(time.time())}.json"
@@ -105,6 +132,8 @@ class Executor:
         cost = float(data.get("total_cost_usd") or 0)
         sid = data.get("session_id")
 
+        await close_run(run_id, ok=True, backend=RUN_BACKEND, cost_usd=cost,
+                        seconds=elapsed, log_path=str(log_path))
         async with Session() as s:
             t = await s.get(Task, task.id)
             if t is not None:
@@ -116,8 +145,6 @@ class Executor:
                 p.cost_usd += cost
                 p.last_action = f"код: {task.title}"
                 p.updated_at = utcnow()
-            s.add(Run(task_id=task.id, kind="execute", ok=True,
-                      cost_usd=cost, seconds=elapsed, log_path=str(log_path)))
             await s.commit()
 
         log.info("task %s done in %.0fs / $%.3f", task.id, elapsed, cost)

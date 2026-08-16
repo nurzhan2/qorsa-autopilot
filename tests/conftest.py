@@ -39,8 +39,13 @@ os.environ["OWNER_TG_ID"] = "777"
 # начинают зависеть от того, какие юрлица он себе завёл
 os.environ["ACCOUNTS_FILE"] = str(_TMP / "no-such-accounts.toml")
 
+from autopilot import guard                                                # noqa: E402
 from autopilot.db import (AccessItem, Account, Base, ChatMessage, Project,  # noqa: E402
                           ProjectChat, Session, Task, engine)
+
+# Замки прогонов — во временный каталог. Иначе тесты, дёргающие BriefRunner,
+# сорят файлами в рабочем locks/ рядом с настоящими прогонами.
+guard.LOCK_DIR = _TMP / "locks"
 
 
 @pytest.fixture

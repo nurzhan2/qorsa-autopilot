@@ -39,11 +39,13 @@ from sqlalchemy import select
 from .brief import (BriefFailed, SecretLeak, assert_no_secrets, item_text,
                     same_item)
 from . import checks
+from . import guard
 from . import llm
 from .config import cfg
 from pathlib import Path
 
-from .db import AccessItem, Project, Run, Session, Task, utcnow
+from .db import (AccessItem, Project, Session, Task, close_run, open_run,
+                 utcnow)
 from .vault import anthropic_key, missing_secret_message
 from .verifier import parse_judge_json
 from .vault import vault as default_vault
@@ -442,25 +444,46 @@ class Planner:
 
     async def _call(self, prompt: str, project_id: int) -> tuple[str, str]:
         assert_no_secrets(prompt, self.vault)
-        reply = await self.backend.ask(prompt, system=SYSTEM, model=self.model,
-                                       max_tokens=cfg.plan_max_tokens)
-        await self._charge(reply, project_id)
+        # Строка расхода заводится ДО вызова: план на подписке идёт больше
+        # десяти минут, и всё это время в учёте не было ничего. Прогон,
+        # убитый на середине, не оставлял следа вовсе — квоту сжёг,
+        # а показать нечего
+        task_id = await self._service_task(project_id)
+        run_id = await open_run(task_id, "plan")
+        t0 = time.monotonic()
+        try:
+            reply = await self.backend.ask(prompt, system=SYSTEM, model=self.model,
+                                           max_tokens=cfg.plan_max_tokens)
+        except BaseException:
+            await close_run(run_id, ok=False,
+                            backend=getattr(self.backend, "name", "api"),
+                            cost_usd=0.0, seconds=time.monotonic() - t0)
+            raise
+        await self._charge(reply, project_id, task_id, run_id)
         return reply.text, reply.stop_reason
 
-    async def _charge(self, reply, project_id: int) -> None:
+    async def _service_task(self, project_id: int) -> int:
+        """Служебная задача, к которой привязан расход: Run без task_id нет."""
+        async with Session() as s:
+            t = Task(project_id=project_id, lane="chat", title="планирование",
+                     status="done")
+            s.add(t)
+            await s.commit()
+            return t.id
+
+    async def _charge(self, reply, project_id: int, task_id: int, run_id: int) -> None:
         """Расход. У CLI это оценка подписки, а не деньги — см. llm.Reply."""
         money = ("$%.4f" % reply.cost_usd if reply.billed
                  else "~$%.4f (подписка)" % reply.cost_usd)
         log.info("план [%s]: вход %s токенов, выход %s, %s, %.1fs",
                  reply.backend, reply.input_tokens, reply.output_tokens,
                  money, reply.seconds)
+        await close_run(run_id, ok=True, backend=reply.backend,
+                        cost_usd=reply.cost_usd, seconds=reply.seconds)
         async with Session() as s:
-            t = Task(project_id=project_id, lane="chat", title="планирование",
-                     status="done", cost_usd=reply.cost_usd if reply.billed else 0.0)
-            s.add(t)
-            await s.flush()
-            s.add(Run(task_id=t.id, kind="plan", ok=True, backend=reply.backend,
-                      cost_usd=reply.cost_usd, seconds=reply.seconds))
+            t = await s.get(Task, task_id)
+            if t is not None and reply.billed:
+                t.cost_usd += reply.cost_usd
             p = await s.get(Project, project_id)
             if p is not None and reply.billed:
                 p.cost_usd += reply.cost_usd
@@ -602,12 +625,22 @@ class Planner:
     # ---------- главный вход ----------
 
     async def plan(self, project: Project) -> dict | None:
+        """Собрать план. Один пишущий процесс на проект — второй не начнётся.
+
+        Замок стоит здесь, а не в скрипте: писать задачи через `_persist`
+        может кто угодно — `plan_eval`, планировщик полос, будущий вызов
+        из главного цикла. Два прогона на проекте 8 уже перемешали план,
+        и разбирать это пришлось руками.
+        """
         brief = (project.brief or {}).get("brief") if isinstance(project.brief, dict) else None
         if not brief or not brief.get("deliverables"):
             log.info("проект %s: планировать нечего — в брифе нет deliverables", project.id)
             return None
 
+        with guard.project_lock(project.id, "планирование"):
+            return await self._plan_locked(project, brief)
 
+    async def _plan_locked(self, project: Project, brief: dict) -> dict | None:
         async with Session() as s:
             access = (await s.execute(
                 select(AccessItem).where(AccessItem.project_id == project.id))).scalars().all()
@@ -663,7 +696,10 @@ class Planner:
             raw, stop_reason = await self._call(current, project.id)
             # тот же терпимый разбор, что у судьи и у брифа: модель регулярно
             # предваряет JSON прозой, и строгий json.loads давал ложный провал
-            data, extracted = parse_judge_json(raw)
+            # require: в прозе перед планом попадается свой маленький объект,
+            # и без опознавательного ключа вынули бы именно его — на живом
+            # прогоне это стоило попытки и тринадцати минут
+            data, extracted = parse_judge_json(raw, require=("tasks",))
             if extracted:
                 log.warning("проект %s: план начат прозой, JSON извлечён из текста",
                             project.id)

@@ -28,6 +28,7 @@ except (AttributeError, ValueError):
 from sqlalchemy import func, select                                   # noqa: E402
 
 from autopilot import checks                                       # noqa: E402
+from autopilot import guard                                        # noqa: E402
 from autopilot.config import cfg
 from autopilot.llm import LimitReached, LLMError                                      # noqa: E402
 from autopilot.db import consumed_today, AccessItem, ChatMessage, Project, Session, Task, init_db  # noqa: E402
@@ -256,6 +257,11 @@ async def run(project_id: int) -> int:
 
     try:
         result = await Planner(client=None).plan(project)
+    except guard.BusyProject as e:
+        # Второй процесс на том же проекте — это не «занято, подожди»,
+        # а «иначе получится каша»: оба пишут задачи через _persist
+        print(f"\n{e}", file=sys.stderr)
+        return 4
     except LimitReached as e:
         print(f"\nКВОТА ПОДПИСКИ ИСЧЕРПАНА: {e}\n"
               f"План не тронут — повтори, когда откроется окно.", file=sys.stderr)
@@ -300,8 +306,14 @@ def main() -> int:
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
     if args.list or not args.project:
-        return asyncio.run(show_projects())
-    return asyncio.run(run(args.project))
+        return guard.run(show_projects())
+    # guard.run: сигнал прерывает прогон предсказуемо и уносит с собой
+    # дочерний claude. Оставленный в живых, он дожигает квоту в одиночку
+    try:
+        return guard.run(run(args.project))
+    except guard.Interrupted as e:
+        print(f"\n{e}. Дочерний claude убит, план не тронут.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

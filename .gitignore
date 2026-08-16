@@ -20,3 +20,6 @@ workspaces/
 .vscode/
 .pytest_cache/
 backup/
+
+# замки прогонов: файлы держит ОС, в репозитории им делать нечего
+locks/

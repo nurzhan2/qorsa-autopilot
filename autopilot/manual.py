@@ -75,6 +75,12 @@ def describe(task: Task) -> str:
         lines.append("      - критериев нет — принять будет нечем")
     if task.risk:
         lines.append(f"    риск: {task.risk[:200]}")
+    if task.observations:
+        # Замечания судьи ВНЕ критерия. На приёмку они не влияли и не должны,
+        # но это настоящие находки: из них выходят следующие задачи
+        lines.append("    судья заметил попутно (на приёмку не влияет):")
+        for note in task.observations:
+            lines.append(f"      · {str(note)[:200]}")
     return "\n".join(lines)
 
 

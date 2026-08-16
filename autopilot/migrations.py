@@ -297,6 +297,31 @@ async def m008_llm_backend(conn) -> None:
         "UPDATE runs SET backend = 'api' WHERE backend IS NULL OR backend = ''"))
 
 
+async def m009_judge_observations(conn) -> None:
+    """Замечания судьи вне заявленного критерия — отдельно от дефектов.
+
+    Смешивать их нельзя: дефект гонит задачу на повтор и дальше
+    в эскалацию, а «нет тестов» при выполненном критерии — это повод
+    завести следующую задачу, а не завалить текущую.
+    """
+    await ensure_tables(conn)
+    await _add_column(conn, "tasks", "observations", "JSON DEFAULT '[]'")
+    await conn.execute(text(
+        "UPDATE tasks SET observations = '[]' WHERE observations IS NULL"))
+
+
+async def m010_run_finished_at(conn) -> None:
+    """У прогона появляется конец, а начало становится началом.
+
+    До этого строка `runs` создавалась ПОСЛЕ ответа модели, и `started_at`
+    на самом деле означал время окончания. Задним числом исправить старые
+    строки нечем — их `finished_at` остаётся пустым, и это честно: когда
+    вызов начался, мы не записывали.
+    """
+    await ensure_tables(conn)
+    await _add_column(conn, "runs", "finished_at", "DATETIME")
+
+
 MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline: схема фазы 1", m001_baseline),
     (2, "ingest: переписка, транспорты, привязка чатов", m002_ingest),
@@ -306,6 +331,8 @@ MIGRATIONS: list[tuple[int, str, object]] = [
     (6, "мультиаккаунтность: компании, проект принадлежит одной", m006_accounts),
     (7, "компания: имя для людей, алиасы таблицы, основной мессенджер", m007_company_naming),
     (8, "учёт: чем платили за вызов модели", m008_llm_backend),
+    (9, "приёмка: замечания судьи вне критерия", m009_judge_observations),
+    (10, "учёт: прогон знает своё начало и свой конец", m010_run_finished_at),
 ]
 
 

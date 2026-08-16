@@ -38,8 +38,10 @@ from difflib import SequenceMatcher
 
 from sqlalchemy import select
 
+from . import guard
 from .config import cfg
-from .db import AccessItem, ChatMessage, Project, Run, Session, Task, utcnow
+from .db import (AccessItem, ChatMessage, Project, Session, Task, close_run,
+                 open_run, utcnow)
 from . import llm
 from .llm import LimitReached
 from .roles import CLIENT, OWNER
@@ -585,28 +587,46 @@ class Brief:
         # ПОСЛЕДНИЙ рубеж перед сетью: секрет не должен уехать в чужой дата-центр
         assert_no_secrets(prompt, self.vault)
 
-        reply = await self.backend.ask(prompt, system=SYSTEM, model=self.model,
-                                       max_tokens=cfg.brief_max_tokens)
-        await self._charge(reply, task_id, project_id)
+        # Строка расхода заводится ДО вызова: на подписке один прогон брифа
+        # идёт четыре минуты, и всё это время в учёте не было ничего.
+        # Убитый на середине прогон не оставлял следа вообще — а квоту он съел
+        if task_id is None:
+            # Run привязан к задаче: заводим служебную, иначе расход
+            # брифа не попадёт в учёт
+            task_id = await self._service_task(project_id)
+        run_id = await open_run(task_id, "brief")
+        t0 = time.monotonic()
+        try:
+            reply = await self.backend.ask(prompt, system=SYSTEM, model=self.model,
+                                           max_tokens=cfg.brief_max_tokens)
+        except BaseException:
+            await close_run(run_id, ok=False,
+                            backend=getattr(self.backend, "name", "api"),
+                            cost_usd=0.0, seconds=time.monotonic() - t0)
+            raise
+        await self._charge(reply, task_id, project_id, run_id)
         return reply.text, reply.stop_reason
 
-    async def _charge(self, reply, task_id: int | None, project_id: int) -> None:
+    async def _service_task(self, project_id: int) -> int:
+        async with Session() as s:
+            t = Task(project_id=project_id, lane="chat", title="сбор ТЗ",
+                     status="done")
+            s.add(t)
+            await s.commit()
+            return t.id
+
+    async def _charge(self, reply, task_id: int, project_id: int, run_id: int) -> None:
         """Записывает расход. Для CLI это оценка, а не списание — см. llm.Reply."""
         money = "$%.4f" % reply.cost_usd if reply.billed else "~$%.4f (подписка)" % reply.cost_usd
         log.info("бриф [%s]: вход %s токенов, выход %s, %s, %.1fs",
                  reply.backend, reply.input_tokens, reply.output_tokens,
                  money, reply.seconds)
+        await close_run(run_id, ok=True, backend=reply.backend,
+                        cost_usd=reply.cost_usd, seconds=reply.seconds)
         async with Session() as s:
-            if task_id is None:
-                # Run привязан к задаче: заводим служебную, иначе расход
-                # брифа не попадёт в учёт
-                t = Task(project_id=project_id, lane="chat", title="сбор ТЗ",
-                         status="done", cost_usd=reply.cost_usd if reply.billed else 0.0)
-                s.add(t)
-                await s.flush()
-                task_id = t.id
-            s.add(Run(task_id=task_id, kind="brief", ok=True, backend=reply.backend,
-                      cost_usd=reply.cost_usd, seconds=reply.seconds))
+            t = await s.get(Task, task_id)
+            if t is not None and reply.billed:
+                t.cost_usd += reply.cost_usd
             p = await s.get(Project, project_id)
             # В стоимость проекта идут только настоящие деньги: показать
             # клиенту оценку подписки как расход было бы враньём
@@ -907,7 +927,7 @@ class Brief:
             raw, stop_reason = await self._call(current, None, project.id)
             # тот же терпимый разбор, что у судьи: модель регулярно предваряет
             # JSON прозой, и строгий json.loads на этом давал ложный провал
-            data, extracted = parse_judge_json(raw)
+            data, extracted = parse_judge_json(raw, require=("deliverables",))
             if extracted:
                 log.warning("проект %s: бриф начат прозой, JSON извлечён из текста",
                             project.id)
@@ -1476,7 +1496,15 @@ class BriefRunner:
 
         touched = 0
         for project in projects:
-            data = await self.brief.build(project)
+            try:
+                # Тот же замок, что у планирования: `brief_eval` чистит бриф
+                # перед полным пересбором, и если в этот момент по проекту
+                # пойдёт фоновый прогон, они перепишут результат друг друга
+                with guard.project_lock(project.id, "сбор ТЗ"):
+                    data = await self.brief.build(project)
+            except guard.BusyProject as e:
+                log.info("проект %s пропущен: %s", project.id, e)
+                continue
             if data is None:
                 continue
             touched += 1

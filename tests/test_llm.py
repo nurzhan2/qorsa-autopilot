@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from conftest import FakeCommunicator, make_project, make_tasks
@@ -453,3 +454,162 @@ def test_reply_reports_actual_model(monkeypatch):
     assert reply.models == ("claude-sonnet-5",)
     assert "sonnet" in reply.model_names and "opus" not in reply.model_names
     assert reply.cache_creation_tokens == 7000
+
+
+def test_disallowed_tools_never_passed(monkeypatch):
+    """--disallowedTools стоит вчетверо больше квоты, и это незаметно.
+
+    Перечисление инструментов по именам подтягивает в контекст их описания:
+    26k токенов кэша на вызов против 6.7k без него. Замерено на живом CLI.
+    Запрещать поимённо то, что и так не разрешено пустым allowlist, — значит
+    платить за список запретов. Отдельный тест, а не строка в общем: вернуть
+    флаг «для надёжности» легко, а замечает это только счёт за квоту.
+    """
+    seen = {}
+
+    async def fake_exec(*args, **kwargs):
+        seen["args"] = args
+
+        class P:
+            returncode = 0
+            pid = None
+
+            async def communicate(self, input=None):
+                return b'{"result": "ok", "usage": {}}', b""
+        return P()
+
+    monkeypatch.setattr("shutil.which", lambda *a: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    for consumer in ("brief", "plan", "judge"):
+        seen.clear()
+        asyncio.run(CliBackend().ask(f"вопрос от {consumer}"))
+        args = [str(a) for a in seen["args"]]
+        assert "--disallowedTools" not in args, (
+            f"вернулся --disallowedTools ({consumer}): расход кэша вырастет вчетверо")
+        # и запрет по-прежнему держится пустым allowlist, а не отсутствием флагов
+        assert args[args.index("--allowedTools") + 1] == ""
+
+
+# ---------- расход виден с НАЧАЛА вызова ----------
+
+async def test_run_row_exists_before_the_model_answers(db):
+    """Строка расхода заводится до вызова, а не после.
+
+    Раньше `started_at` был на самом деле временем ОКОНЧАНИЯ: строка
+    создавалась после ответа. Прогон, убитый на середине, не оставлял следа
+    вовсе — квоту сжёг, а в учёте пусто.
+    """
+    from sqlalchemy import select
+
+    from autopilot.brief import Brief
+    from autopilot.db import Run, utcnow
+
+    project = await make_project()
+    seen = {}
+
+    class SlowBackend:
+        name = "cli"
+
+        async def ask(self, prompt, *, system="", model="", max_tokens=8000,
+                      content=None):
+            async with Session() as s:
+                rows = (await s.execute(select(Run))).scalars().all()
+                seen["во время вызова"] = [(r.kind, r.ok, r.finished_at) for r in rows]
+            return Reply(text='{"goal": null, "deliverables": [], "confidence": 0.1}',
+                         backend="cli", seconds=1.0, cost_usd=0.02)
+
+    brief = Brief(backend=SlowBackend())
+    before = utcnow()
+    await brief._call("промпт", None, project.id)
+
+    assert len(seen["во время вызова"]) == 1, "строки расхода не было во время вызова"
+    kind, ok, finished = seen["во время вызова"][0]
+    assert kind == "brief" and ok is False and finished is None, (
+        "незакрытая строка — это и есть признак «вызов ещё не вернулся»")
+
+    async with Session() as s:
+        row = (await s.execute(select(Run))).scalars().one()
+    assert row.ok is True and row.finished_at is not None
+    assert row.started_at >= before and row.started_at <= row.finished_at, (
+        "started_at снова оказался временем окончания")
+    assert row.backend == "cli" and row.cost_usd == 0.02
+
+
+async def test_interrupted_call_leaves_an_unfinished_run(db):
+    """Упор в квоту или обрыв — строка остаётся, но закрытой не считается."""
+    from sqlalchemy import select
+
+    from autopilot.brief import Brief
+    from autopilot.db import Run
+
+    project = await make_project()
+
+    class DeadBackend:
+        name = "cli"
+
+        async def ask(self, *a, **kw):
+            raise LimitReached("окно кончилось")
+
+    with pytest.raises(LimitReached):
+        await Brief(backend=DeadBackend())._call("промпт", None, project.id)
+
+    async with Session() as s:
+        row = (await s.execute(select(Run))).scalars().one()
+    assert row.kind == "brief" and row.ok is False
+    assert row.cost_usd == 0.0, "за несостоявшийся вызов ничего не списываем"
+
+
+def test_answer_mentioning_rate_limits_is_not_a_quota_wall(monkeypatch):
+    """Слово «лимит» В ОТВЕТЕ модели — не упор в квоту.
+
+    Живой случай, стоивший 26 минут работы модели: план приложения доставки
+    честно расписал rate limit для API, а `looks_like_limit` обыскивал весь
+    stdout — то есть сам ответ. Прогон объявили упором в квоту, план выбросили,
+    и по правилам limits.py встала бы вся работа разом. При этом в конверте
+    стояло `is_error:false` и `stop_reason:end_turn`: модель ответила успешно.
+
+    Про исчерпание квоты нам говорит оболочка, а не содержимое ответа.
+    """
+    plan = ("Настроить rate limit на API: не больше 100 запросов в минуту. "
+            "Квота внешнего сервиса превышена не будет.")
+
+    async def fake_exec(*args, **kwargs):
+        class P:
+            returncode = 0
+            pid = None
+
+            async def communicate(self, input=None):
+                body = json.dumps({"is_error": False, "stop_reason": "end_turn",
+                                   "result": plan, "total_cost_usd": 1.79,
+                                   "usage": {"output_tokens": 100668}})
+                return body.encode(), b""
+        return P()
+
+    monkeypatch.setattr("shutil.which", lambda *a: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    reply = asyncio.run(CliBackend().ask("составь план"))
+    assert reply.text == plan, "успешный ответ принят за упор в квоту"
+    assert reply.output_tokens == 100668
+
+
+def test_real_quota_wall_is_still_detected(monkeypatch):
+    """Обратная сторона: настоящий упор по-прежнему опознаётся."""
+    async def fake_exec(*args, **kwargs):
+        class P:
+            returncode = 1
+            pid = None
+
+            async def communicate(self, input=None):
+                body = json.dumps({"is_error": True,
+                                   "result": "Usage limit reached, resets in 2h"})
+                return body.encode(), b""
+        return P()
+
+    monkeypatch.setattr("shutil.which", lambda *a: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(LimitReached) as exc:
+        asyncio.run(CliBackend().ask("вопрос"))
+    assert exc.value.retry_after == 2 * 3600
