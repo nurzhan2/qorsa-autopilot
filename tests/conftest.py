@@ -23,6 +23,10 @@ os.environ["DB_URL"] = f"sqlite+aiosqlite:///{(_TMP / 'test.db').as_posix()}"
 os.environ["WORKSPACES"] = str(_TMP / "workspaces")
 os.environ["LOGS"] = str(_TMP / "logs")
 os.environ["ANTHROPIC_API_KEY"] = ""       # судья в тестах не поднимается
+# В тестах модель подменяется заглушкой через client=, а это путь API.
+# Боевое умолчание — cli, и без этой строки тесты пошли бы искать
+# настоящий `claude` в PATH. Тесты самого CLI-бэкенда ставят его явно.
+os.environ["LLM_BACKEND"] = "api"
 os.environ["SHEET_ID"] = ""
 # Тихие часы по умолчанию 23–9. Без этого половина тестов про отправку
 # клиенту зелёная днём и красная ночью — ловушка, на которую я уже попался.

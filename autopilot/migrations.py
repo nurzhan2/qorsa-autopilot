@@ -284,6 +284,19 @@ async def m007_company_naming(conn) -> None:
         "WHERE display_name IS NULL OR display_name = ''"))
 
 
+async def m008_llm_backend(conn) -> None:
+    """Чем платили за вызов: реальными деньгами или квотой подписки.
+
+    Без этой колонки суточный бюджет складывал бы условную оценку CLI
+    с настоящим расходом API и вставал бы на пустом месте.
+    """
+    await ensure_tables(conn)
+    await _add_column(conn, "runs", "backend", "VARCHAR(8) DEFAULT 'api'")
+    # всё, что записано до перехода, шло через API — это правда
+    await conn.execute(text(
+        "UPDATE runs SET backend = 'api' WHERE backend IS NULL OR backend = ''"))
+
+
 MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline: схема фазы 1", m001_baseline),
     (2, "ingest: переписка, транспорты, привязка чатов", m002_ingest),
@@ -292,6 +305,7 @@ MIGRATIONS: list[tuple[int, str, object]] = [
     (5, "verifier: доля автономности по времени", m005_verifier),
     (6, "мультиаккаунтность: компании, проект принадлежит одной", m006_accounts),
     (7, "компания: имя для людей, алиасы таблицы, основной мессенджер", m007_company_naming),
+    (8, "учёт: чем платили за вызов модели", m008_llm_backend),
 ]
 
 

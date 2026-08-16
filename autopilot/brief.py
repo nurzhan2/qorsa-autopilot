@@ -40,6 +40,8 @@ from sqlalchemy import select
 
 from .config import cfg
 from .db import AccessItem, ChatMessage, Project, Run, Session, Task, utcnow
+from . import llm
+from .llm import LimitReached
 from .roles import CLIENT, OWNER
 from .verifier import parse_judge_json
 from .vault import MIN_MASKABLE_LEN, anthropic_key, missing_secret_message, ref, refs_in
@@ -412,8 +414,9 @@ def _norm_evidence(raw) -> list[str]:
 
 class Brief:
     def __init__(self, client=None, vault=None, communicator=None, model: str | None = None,
-                 samples: int | None = None):
+                 samples: int | None = None, backend=None):
         self._client = client
+        self._backend = backend
         self.vault = vault or default_vault
         self.communicator = communicator
         self.model = model or cfg.brief_model
@@ -562,6 +565,13 @@ class Brief:
     # ---------- вызов модели ----------
 
     @property
+    def backend(self):
+        """Откуда берём ответ: API или CLI. Задаётся LLM_BACKEND_BRIEF."""
+        if self._backend is None:
+            self._backend = llm.make("brief", client=self._client)
+        return self._backend
+
+    @property
     def client(self):
         """Ключ ищется в трёх местах: vault, окружение, .env — см. resolve_secret."""
         if self._client is None:
@@ -575,42 +585,33 @@ class Brief:
         # ПОСЛЕДНИЙ рубеж перед сетью: секрет не должен уехать в чужой дата-центр
         assert_no_secrets(prompt, self.vault)
 
-        if self.client is None:
-            raise BriefFailed(missing_secret_message("ANTHROPIC_API_KEY"))
+        reply = await self.backend.ask(prompt, system=SYSTEM, model=self.model,
+                                       max_tokens=cfg.brief_max_tokens)
+        await self._charge(reply, task_id, project_id)
+        return reply.text, reply.stop_reason
 
-        t0 = time.monotonic()
-        resp = await self.client.messages.create(
-            model=self.model, max_tokens=cfg.brief_max_tokens, system=SYSTEM,
-            messages=[{"role": "user", "content": prompt}])
-        await self._charge(resp, time.monotonic() - t0, task_id, project_id)
-        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-        return text, str(getattr(resp, "stop_reason", "") or "")
-
-    async def _charge(self, resp, seconds: float, task_id: int | None, project_id: int) -> None:
-        from .verifier import PRICE_IN, PRICE_OUT
-        usage = getattr(resp, "usage", None)
-        cost = 0.0
-        tokens_in = tokens_out = 0
-        if usage is not None:
-            tokens_in = getattr(usage, "input_tokens", 0) or 0
-            tokens_out = getattr(usage, "output_tokens", 0) or 0
-            cost = tokens_in / 1e6 * PRICE_IN + tokens_out / 1e6 * PRICE_OUT
-        log.info("бриф: вход %s токенов, выход %s токенов, $%.4f, %.1fs",
-                 tokens_in, tokens_out, cost, seconds)
+    async def _charge(self, reply, task_id: int | None, project_id: int) -> None:
+        """Записывает расход. Для CLI это оценка, а не списание — см. llm.Reply."""
+        money = "$%.4f" % reply.cost_usd if reply.billed else "~$%.4f (подписка)" % reply.cost_usd
+        log.info("бриф [%s]: вход %s токенов, выход %s, %s, %.1fs",
+                 reply.backend, reply.input_tokens, reply.output_tokens,
+                 money, reply.seconds)
         async with Session() as s:
             if task_id is None:
-                # Run привязан к задаче: заводим служебную, иначе стоимость
-                # брифа не попадёт в суточный бюджет
+                # Run привязан к задаче: заводим служебную, иначе расход
+                # брифа не попадёт в учёт
                 t = Task(project_id=project_id, lane="chat", title="сбор ТЗ",
-                         status="done", cost_usd=cost)
+                         status="done", cost_usd=reply.cost_usd if reply.billed else 0.0)
                 s.add(t)
                 await s.flush()
                 task_id = t.id
-            s.add(Run(task_id=task_id, kind="brief", ok=True,
-                      cost_usd=cost, seconds=seconds))
+            s.add(Run(task_id=task_id, kind="brief", ok=True, backend=reply.backend,
+                      cost_usd=reply.cost_usd, seconds=reply.seconds))
             p = await s.get(Project, project_id)
-            if p is not None:
-                p.cost_usd += cost
+            # В стоимость проекта идут только настоящие деньги: показать
+            # клиенту оценку подписки как расход было бы враньём
+            if p is not None and reply.billed:
+                p.cost_usd += reply.cost_usd
             await s.commit()
 
     # ---------- валидация ----------
@@ -840,6 +841,13 @@ class Brief:
                 log.critical("проект %s: %s — запрос к модели НЕ отправлен", project.id, e)
                 await self._escalate(project, f"бриф остановлен: {e}")
                 return None
+            except LimitReached:
+                # Квота кончилась. Это НЕ провал брифа: накопленное не трогаем,
+                # проект не блокируем, попытку не засчитываем. Пробрасываем
+                # наверх — планировщик полос отложит работу целиком
+                log.warning("проект %s: упор в квоту на прогоне %s/%s — "
+                            "бриф не тронут", project.id, i + 1, rounds)
+                raise
             except BriefFailed as e:
                 if samples:
                     # один прогон из нескольких сорвался — работаем на остальных

@@ -41,8 +41,9 @@ from sqlalchemy import func, select                                    # noqa: E
 from autopilot.brief import (LIST_FIELDS, ORIGIN_CONFIRMED, Brief,      # noqa: E402
                              _msg_key, agreement, check_coverage,
                              missing_items, parse_requirements)
-from autopilot.config import cfg                                       # noqa: E402
-from autopilot.db import ChatMessage, Project, Session, init_db        # noqa: E402
+from autopilot.config import cfg
+from autopilot.llm import LimitReached, LLMError                                       # noqa: E402
+from autopilot.db import consumed_today, ChatMessage, Project, Session, init_db        # noqa: E402
 from autopilot.vault import (anthropic_key, anthropic_key_source,      # noqa: E402
                              missing_secret_message)
 
@@ -322,6 +323,19 @@ async def _restore(project_id: int, brief_data, ready: bool, status: str) -> Non
             await s.commit()
 
 
+
+async def show_spend() -> None:
+    """Две цифры РАЗДЕЛЬНО: деньги и подписка. Это разные ресурсы."""
+    both = await consumed_today()
+    print(f"\n{LINE}\nРАСХОД ЗА СУТКИ\n{LINE}")
+    print(f"  реальные деньги (API):  ${both['api_usd']:.2f}   "
+          f"вызовов {int(both['api_calls'])}")
+    print(f"  подписка (CLI):         ~${both['cli_usd_est']:.2f} оценочно, "
+          f"вызовов {int(both['cli_calls'])}, {both['cli_seconds'] / 60:.1f} мин")
+    print("  суточный бюджет считает ТОЛЬКО первую строку: подписка деньгами")
+    print("  не тратится, и останавливать работу из-за неё было бы неверно")
+
+
 async def run(project_id: int, stub: bool, draft: bool) -> int:
     await init_db()
     async with Session() as s:
@@ -361,6 +375,17 @@ async def run(project_id: int, stub: bool, draft: bool) -> int:
 
     try:
         data = await brief.build(project)
+    except LimitReached as e:
+        await _restore(project_id, *saved)
+        print(f"\nКВОТА ПОДПИСКИ ИСЧЕРПАНА: {e}\n"
+              f"Бриф не тронут, попытка не засчитана — повтори, когда "
+              f"откроется окно.", file=sys.stderr)
+        return 3
+    except LLMError as e:
+        await _restore(project_id, *saved)
+        print(f"\nМОДЕЛЬ НЕДОСТУПНА: {e}\nПрежний бриф возвращён на место.",
+              file=sys.stderr)
+        return 2
     except BaseException:
         await _restore(project_id, *saved)
         print("\nпрогон прерван — прежний бриф возвращён на место", file=sys.stderr)
@@ -375,6 +400,7 @@ async def run(project_id: int, stub: bool, draft: bool) -> int:
     show_missing(data)
     async with Session() as s:
         show_dropped(await s.get(Project, project_id))
+    await show_spend()
 
     fixture = FIXTURES / f"{project_id}.requirements.txt"
     if draft:

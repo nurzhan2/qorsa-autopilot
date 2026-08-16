@@ -16,6 +16,8 @@ from .checks import (DEFAULT_TIMEOUT_SEC, HUMAN_ONLY, REGISTRY, VIEWPORTS,
                      is_runnable, spec)
 from .checks import suspicious as suspicious_reason
 from .config import cfg
+from . import llm
+from .llm import LLMError
 from .db import Project, Run, Session, Task
 from .vault import anthropic_key, missing_secret_message
 
@@ -174,7 +176,8 @@ def parse_judge_json(raw: str) -> tuple[dict | None, bool]:
 
 
 class Verifier:
-    def __init__(self):
+    def __init__(self, backend=None):
+        self._backend = backend
         self.client = None
         # без ключа судья недоступен. По умолчанию это ДЕФЕКТ, а не «ну и ладно»:
         # молча пропускать llm-приёмку — прямое противоречие смыслу модуля.
@@ -188,6 +191,13 @@ class Verifier:
             log.warning("ключа нет — llm-приёмка %s.\n%s",
                         "пропускается" if self.judge_optional else "будет валить задачи",
                         missing_secret_message("ANTHROPIC_API_KEY"))
+
+    @property
+    def backend(self):
+        """Откуда берём вердикт: API или CLI. Задаётся LLM_BACKEND_JUDGE."""
+        if self._backend is None:
+            self._backend = llm.make("judge", client=self.client)
+        return self._backend
 
     # Тип проверки -> метод. Покрытие реестра проверяется тестом:
     # разрыв между тем, что планировщик выдаёт, и тем, что верификатор
@@ -355,7 +365,7 @@ class Verifier:
             from playwright.async_api import async_playwright
         except ImportError:
             return False, "screenshot: playwright не установлен — проверка невыполнима"
-        if self.client is None:
+        if self.uses_api and self.client is None:
             return False, ("screenshot: судить снимок нечем — "
                            + missing_secret_message("ANTHROPIC_API_KEY").splitlines()[0])
 
@@ -387,12 +397,13 @@ class Verifier:
                             "source": {"type": "base64", "media_type": "image/png",
                                        "data": base64.b64encode(png).decode()}})
 
-        t0 = time.monotonic()
-        resp = await self.client.messages.create(
-            model=cfg.judge_model, max_tokens=800,
-            messages=[{"role": "user", "content": content}])
-        await self._charge(task, project, resp, time.monotonic() - t0)
-        raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        try:
+            reply = await self.backend.ask("", content=content,
+                                           model=cfg.judge_model, max_tokens=800)
+        except LLMError as e:
+            return False, f"screenshot: {e}"
+        await self._charge(task, project, reply)
+        raw = reply.text
         data, extracted = parse_judge_json(raw)
         if extracted:
             log.warning("судья по снимку начал ответ прозой, вердикт извлечён "
@@ -431,7 +442,7 @@ class Verifier:
     # --- уровень 3: судья ---
 
     async def _judge(self, criteria: str, cwd: str, task: Task, project: Project) -> tuple[bool, str]:
-        if not self.client:
+        if self.uses_api and not self.client:
             if self.judge_optional:
                 log.warning("судья пропущен (нет ANTHROPIC_API_KEY), задача %s", task.id)
                 return True, ""
@@ -443,14 +454,9 @@ class Verifier:
             diff=diff[:60000],
             report=task.last_error or "—",
         )
-        t0 = time.monotonic()
-        resp = await self.client.messages.create(
-            model=cfg.judge_model, max_tokens=1500,
-            messages=[{"role": "user", "content": msg}],
-        )
-        await self._charge(task, project, resp, time.monotonic() - t0)
-
-        raw = "".join(b.text for b in resp.content if b.type == "text")
+        reply = await self.backend.ask(msg, model=cfg.judge_model, max_tokens=1500)
+        await self._charge(task, project, reply)
+        raw = reply.text
         data, extracted = parse_judge_json(raw)
         if extracted:
             # считаем такие случаи: если их много, чинить надо промпт судьи,
@@ -480,20 +486,16 @@ class Verifier:
                 return out.decode(errors="replace")
         return ""
 
-    async def _charge(self, task: Task, project: Project, resp, seconds: float) -> None:
-        """Приёмка тоже стоит денег. Без этой записи суточный бюджет
-        не видит расходов судьи и не срабатывает вовремя."""
-        usage = getattr(resp, "usage", None)
-        cost = 0.0
-        if usage is not None:
-            cost = (getattr(usage, "input_tokens", 0) / 1e6 * PRICE_IN
-                    + getattr(usage, "output_tokens", 0) / 1e6 * PRICE_OUT)
+    async def _charge(self, task: Task, project: Project, reply) -> None:
+        """Приёмка тоже стоит ресурса. У CLI это квота подписки, а не деньги:
+        складывать одно с другим — соврать в обе стороны сразу."""
         async with Session() as s:
             t = await s.get(Task, task.id)
-            if t is not None:
-                t.cost_usd += cost
+            if t is not None and reply.billed:
+                t.cost_usd += reply.cost_usd
             pr = await s.get(Project, project.id)
-            if pr is not None:
-                pr.cost_usd += cost
-            s.add(Run(task_id=task.id, kind="judge", ok=True, cost_usd=cost, seconds=seconds))
+            if pr is not None and reply.billed:
+                pr.cost_usd += reply.cost_usd
+            s.add(Run(task_id=task.id, kind="judge", ok=True, backend=reply.backend,
+                      cost_usd=reply.cost_usd, seconds=reply.seconds))
             await s.commit()
