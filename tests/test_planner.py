@@ -558,3 +558,54 @@ async def test_prune_leaves_live_tasks_alone(db):
 
     safe, keep = await prunable(p.id)
     assert (safe, keep) == ([], [])
+
+
+# ---------- «взят из ТЗ» — утверждение, которое надо проверять ----------
+
+def test_stack_not_in_brief_spots_invented_technologies():
+    """Пометку «из ТЗ» ставил код по одной строчке про стек в брифе.
+
+    На живом плане проекта 8 в ТЗ стояло «мобильные приложения под iOS
+    и Android, тип не уточнён», а как «взятый из ТЗ» был помечен
+    Node.js + PostgreSQL + Prisma + Socket.IO. Ярлык «не проверяй, это
+    решение клиента» висел ровно на том, что придумала модель.
+    """
+    from autopilot.planner import stack_not_in_brief
+
+    brief = {"stack": [{"text": "Мобильные приложения для iOS и Android "
+                                "(тип: нативные или кросс-платформа — не уточнено)"}]}
+    invented = stack_not_in_brief(
+        ["Flutter (Dart) — единая кодовая база",
+         "Node.js + Express + TypeScript — backend монолит",
+         "PostgreSQL — единая реляционная БД"], brief)
+    assert len(invented) == 3, f"придуманное принято за выбор клиента: {invented}"
+
+    # а вот это клиент действительно назвал
+    declared = {"stack": [{"text": "WordPress + WooCommerce"}]}
+    assert stack_not_in_brief(["WordPress — движок сайта"], declared) == []
+    assert stack_not_in_brief(["Redis — кэш"], declared) == ["Redis — кэш"]
+
+
+async def test_plan_does_not_call_invented_stack_a_client_decision(db):
+    """Флаг from_brief снимается, а придуманное показывается отдельно."""
+    p = await with_brief()
+    async with Session() as s:
+        row = await s.get(Project, p.id)
+        data = dict(row.brief)
+        data["brief"] = dict(data["brief"])
+        data["brief"]["stack"] = [{"text": "Мобильное приложение (тип не уточнён)",
+                                   "evidence": ["telegram:1:1"], "origin": "client"}]
+        row.brief = data
+        await s.commit()
+        p = await s.get(Project, p.id)
+
+    reply = plan_reply(task("Каталог", "каталог с фильтрами"))
+    body = json.loads(reply)
+    body["stack_decision"] = {"chosen": ["Node.js + Express", "PostgreSQL"],
+                              "rationale": "монолит по срокам"}
+    result = await Planner(client=FakeAnthropic(json.dumps(body, ensure_ascii=False))).plan(p)
+
+    decision = result["stack_decision"]
+    assert decision["from_brief"] is False, "придуманный стек объявлен решением клиента"
+    assert len(decision["not_in_brief"]) == 2
+    assert any("выбрано планировщиком" in n for n in result["notes"])
