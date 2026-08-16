@@ -125,8 +125,18 @@ class Config:
     brief_min_confidence = _f("BRIEF_MIN_CONFIDENCE", 0.75)
     brief_question_cooldown_h = _f("BRIEF_QUESTION_COOLDOWN_H", 12)
     brief_full_rebuild_every = _i("BRIEF_FULL_REBUILD_EVERY", 50)
-    brief_context_messages = _i("BRIEF_CONTEXT_MESSAGES", 80)
+    # Бюджет контекста переписки в ТОКЕНАХ, а не в сообщениях.
+    #
+    # Раньше стоял счёт по сообщениям (последние 80 целиком, остальные обрезком
+    # в 120 символов), и на первой же живой переписке это выбросило главное:
+    # заполненный клиентом бриф на 3851 символ оказался 53-м с конца и дошёл
+    # до модели в виде 120 знаков. Весь чат при этом весил 15 тысяч символов
+    # и влезал целиком. Считать надо объём, а не количество реплик.
+    brief_context_tokens = _i("BRIEF_CONTEXT_TOKENS", 60000)
     brief_max_attempts = _i("BRIEF_MAX_ATTEMPTS", 2)
+    # Потолок ответа модели. 4000 не хватало: на полной переписке JSON брифа
+    # обрывался на середине и падал разбор — «не-JSON» вместо «не поместилось»
+    brief_max_tokens = _i("BRIEF_MAX_TOKENS", 16000)
     # сколько вопросов держим в брифе всего
     brief_max_questions = _i("BRIEF_MAX_QUESTIONS", 8)
     # и сколько отдаём клиенту за один раз: список из восьми он не читает

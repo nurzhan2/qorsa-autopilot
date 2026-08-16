@@ -161,11 +161,16 @@ def find_secrets(text: str) -> list[tuple[str, str]]:
 
 
 def scrub(text: str, *, project_id: int | None = None, chat_id: str = "",
-          vault: Vault | None = None) -> tuple[str, list[str]]:
+          vault: Vault | None = None, store: bool = True) -> tuple[str, list[str]]:
     """Возвращает (текст с плейсхолдерами, имена созданных секретов).
 
     Без VAULT_KEY значение сохранить негде — тогда оно просто вырезается.
     Потерять пароль лучше, чем записать его в базу открытым.
+
+    `store=False` — вырезать, но НЕ класть в хранилище. Нужно для пробных
+    прогонов импорта: раньше `--dry-run` честно ничего не писал в базу, но
+    секреты в vault складывал, и один и тот же пароль оседал там дважды под
+    разными именами. Пробный прогон обязан не менять состояние вообще.
     """
     v = vault or default_vault
     hits = find_secrets(text or "")
@@ -175,6 +180,12 @@ def scrub(text: str, *, project_id: int | None = None, chat_id: str = "",
     names: list[str] = []
     out = text
     for kind, value in hits:
+        if not store:
+            # пробный прогон: показать, что нашли бы, и ничего не менять
+            out = out.replace(value, MASK)
+            log.info("нашёл секрет (%s) — пробный прогон, в хранилище не кладу", kind)
+            names.append(kind)
+            continue
         if not v.enabled:
             out = out.replace(value, MASK)
             log.warning("нашёл секрет (%s), но VAULT_KEY не задан — вырезал без сохранения", kind)

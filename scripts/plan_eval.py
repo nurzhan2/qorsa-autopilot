@@ -70,6 +70,27 @@ def show_tasks(tasks: list[dict]) -> None:
                 print(f"       ⚠ пройдёт и без этой задачи: {why}")
 
 
+def show_from_goal(tasks: list[dict]) -> None:
+    """Задачи, выведенные из ЦЕЛИ, а не из пункта ТЗ — отдельно, на проверку.
+
+    Ссылка на цель законна: именно из-за её запрета из плана однажды пропала
+    публикация в App Store и Google Play, то есть то, чем проект кончается.
+    Но основание это более слабое: цель широкая, и под неё удобно подвести
+    работу, которой никто не просил. Поэтому такие задачи смотрят глазами.
+    """
+    rows = [t for t in tasks if t.get("ref_origin") == "goal"]
+    print(f"\n{LINE}\nЗАДАЧИ ИЗ ЦЕЛИ, А НЕ ИЗ ПУНКТА ТЗ ({len(rows)}) — "
+          f"ПРОВЕРЬ ГЛАЗАМИ\n{LINE}")
+    if not rows:
+        print("  (нет: все задачи выведены из конкретных пунктов ТЗ)")
+        return
+    for t in rows:
+        print(f"  • {t['title']}")
+        print(f"      обосновано целью: «{t['deliverable_ref'][:100]}»")
+    print("\n  Цель — не выдумка, но и не пункт ТЗ. Смотри, действительно ли")
+    print("  работа следует из неё, а не притянута.")
+
+
 def show_suspicious(tasks: list[dict]) -> None:
     """Отдельным блоком — иначе тонет в общем выводе плана.
 
@@ -177,6 +198,7 @@ async def run(project_id: int) -> int:
 
     show_tasks(result["tasks"])
     show_graph(result["tasks"], result["order"])
+    show_from_goal(result["tasks"])
     show_suspicious(result["tasks"])
     show_notes(result["notes"])
     show_stats(result["stats"])

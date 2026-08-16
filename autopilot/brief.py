@@ -41,6 +41,7 @@ from sqlalchemy import select
 from .config import cfg
 from .db import AccessItem, ChatMessage, Project, Run, Session, Task, utcnow
 from .roles import CLIENT, OWNER
+from .verifier import parse_judge_json
 from .vault import MIN_MASKABLE_LEN, anthropic_key, missing_secret_message, ref, refs_in
 from .vault import vault as default_vault
 
@@ -48,6 +49,41 @@ log = logging.getLogger("brief")
 
 ORIGIN_CLIENT = "client"
 ORIGIN_CONFIRMED = "confirmed_proposal"
+
+# Сообщение считается длинным — то есть содержательным — с этого размера.
+# Именно длинные несут ТЗ, поэтому под нож они идут последними, а не первыми.
+LONG_MESSAGE_CHARS = 400
+
+# Грубая оценка: для русского текста ~3 символа на токен. Точный счёт требовал
+# бы токенизатора, а нам нужен порядок величины для бюджета контекста.
+CHARS_PER_TOKEN = 3
+
+
+def _tokens(chars: int) -> int:
+    return int(chars / CHARS_PER_TOKEN) + 1
+
+
+# Модель сообщает в unreadable[], что текст до неё дошёл обрезанным. Это НАША
+# поломка, а не свойство данных: вложение прочитать нельзя объективно, а текст
+# мы обрубили сами. Прогон с такой пометкой не принимается.
+TRUNCATION_KINDS = ("text_truncated", "truncated", "text_cut", "message_truncated")
+
+
+def truncation_complaints(data: dict) -> list[str]:
+    """Сообщения, про которые модель сказала «текст обрезан».
+
+    Отличать от нечитаемых вложений обязательно. «Не вижу, что на фото» —
+    честное ограничение, с ним живём. «Текст обрезан» — наш промах нарезки,
+    и по обрубленной переписке ТЗ собирать нельзя.
+    """
+    out = []
+    for item in (data or {}).get("unreadable") or []:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip().lower()
+        if kind in TRUNCATION_KINDS or "truncat" in kind or "обрез" in kind:
+            out.append(str(item.get("message_id") or "?"))
+    return out
 
 # Согласие и отказ. Списки короткие намеренно: чем шире сеть, тем выше шанс
 # принять вежливое «хорошо, я подумаю» за подтверждение требования.
@@ -307,40 +343,131 @@ class Brief:
                        ChatMessage.deleted.is_(False))
                 .order_by(ChatMessage.created_at, ChatMessage.id))).scalars().all()
 
-    def _render(self, messages: list[ChatMessage]) -> str:
-        """Последние N реплик целиком, старые — сжатой выжимкой.
+    @staticmethod
+    def _line(m: ChatMessage, body: str | None = None) -> str:
+        text = m.text if body is None else body
+        text = text or ""
+        if m.has_media:
+            text = (text + f" [ВЛОЖЕНИЕ: {m.media_kind or 'файл'}, "
+                           f"содержимое недоступно]").strip()
+        return f"[{_msg_key(m)}] {m.sender_role}: {text}"
 
-        Обрезать надо: групповой чат за месяц не влезет ни в контекст, ни в бюджет.
+    def _render(self, messages: list[ChatMessage]) -> tuple[str, list[str]]:
+        """Переписка для промпта. Возвращает (текст, id обрезанных сообщений).
+
+        Бюджет считается в ТОКЕНАХ. Прежняя версия считала сообщения и резала
+        всё, что старше последних 80, до 120 символов — и на первой живой
+        переписке выбросила ровно то, ради чего всё затевалось: заполненный
+        клиентом бриф. Он был длинным, а значит и самым ценным.
+
+        Отсюда правило: **длину сообщения нельзя использовать как признак
+        неважности, она означает обратное**. Когда бюджет всё-таки жмёт,
+        жертвуем короткими и старыми репликами («ок», «спасибо», «добрый
+        день»), а длинные сохраняем целиком. Если и этого мало — длинные
+        уходят на сжатие отдельным дешёвым вызовом (см. `_condense`),
+        а не под нож.
+
+        Второй элемент возврата — список сообщений, которые всё же пришлось
+        урезать. Пустой он или нет, решает, принимать ли бриф вообще:
+        обрезанный НАМИ текст это дефект прогона, а не свойство данных.
         """
-        head, tail = [], messages
-        if len(messages) > cfg.brief_context_messages:
-            split = len(messages) - cfg.brief_context_messages
-            head, tail = messages[:split], messages[split:]
+        budget = cfg.brief_context_tokens
+        if _tokens(sum(len(m.text or "") for m in messages)) <= budget:
+            # обычный случай: переписка целиком влезает, резать нечего
+            return "# Переписка\n" + "\n".join(self._line(m) for m in messages), []
 
-        lines = []
-        if head:
-            lines.append("# Более ранняя переписка (сжато)")
-            for m in head:
-                text = (m.text or "").replace("\n", " ")[:120]
-                lines.append(f"[{_msg_key(m)}] {m.sender_role}: {text}")
+        # Не влезло. Считаем, сколько занимают длинные — их трогаем последними
+        long_ids = {m.id for m in messages if len(m.text or "") >= LONG_MESSAGE_CHARS}
+        long_cost = _tokens(sum(len(m.text or "") for m in messages if m.id in long_ids))
+
+        kept: dict[int, str] = {}
+        spent = long_cost
+        # короткие набираем с конца: свежие важнее старых при равной длине
+        for m in reversed([m for m in messages if m.id not in long_ids]):
+            cost = _tokens(len(m.text or "") + 40)
+            if spent + cost > budget:
+                continue
+            kept[m.id] = m.text or ""
+            spent += cost
+
+        dropped_short = [m for m in messages if m.id not in long_ids and m.id not in kept]
+        lines = ["# Переписка"]
+        for m in messages:
+            if m.id in long_ids or m.id in kept:
+                lines.append(self._line(m))
+        if dropped_short:
             lines.append("")
-        lines.append("# Переписка")
-        for m in tail:
-            body = m.text or ""
-            if m.has_media:
-                body = (body + f" [ВЛОЖЕНИЕ: {m.media_kind or 'файл'}, содержимое недоступно]").strip()
-            lines.append(f"[{_msg_key(m)}] {m.sender_role}: {body}")
-        return "\n".join(lines)
+            lines.append(f"# Опущено коротких реплик: {len(dropped_short)} "
+                         f"(приветствия, подтверждения, уточнения по срокам)")
+        log.warning("проект: переписка не влезла в %s токенов — опущено %s коротких реплик, "
+                    "все длинные сохранены целиком", budget, len(dropped_short))
+        return "\n".join(lines), []
 
     def build_prompt(self, project: Project, messages: list[ChatMessage],
-                     previous: dict | None = None) -> str:
+                     previous: dict | None = None, rendered: str | None = None) -> str:
         parts = [f"# Проект\n{project.title} (клиент: {project.client})"]
         if previous:
             parts.append("# Предыдущая версия брифа — обнови её, не теряя подтверждённого\n"
                          + json.dumps(previous, ensure_ascii=False, indent=2))
-        parts.append(self._render(messages))
+        parts.append(rendered if rendered is not None else self._render(messages)[0])
         parts.append("Верни обновлённый бриф одним JSON-объектом.")
         return "\n\n".join(parts)
+
+    async def render_context(self, messages: list[ChatMessage]) -> str:
+        """Переписка для промпта, при нужде сжатая — но не обрубленная.
+
+        Сжимаем ТОЛЬКО если длинные сообщения не влезают даже сами по себе.
+        Тогда самые старые из них уходят на пересказ дешёвой моделью: пересказ
+        теряет детали, но сохраняет смысл, а обрубание по счётчику символов
+        не сохраняет ничего — оно рубит ровно посередине списка требований.
+        """
+        long_msgs = [m for m in messages if len(m.text or "") >= LONG_MESSAGE_CHARS]
+        long_cost = _tokens(sum(len(m.text or "") for m in long_msgs))
+        if long_cost <= cfg.brief_context_tokens:
+            return self._render(messages)[0]
+
+        log.warning("длинные сообщения занимают ~%s токенов при бюджете %s — "
+                    "самые старые уходят на сжатие", long_cost, cfg.brief_context_tokens)
+        condensed: dict[int, str] = {}
+        spent = long_cost
+        for m in long_msgs:                       # от старых к свежим
+            if spent <= cfg.brief_context_tokens:
+                break
+            summary = await self._condense(m)
+            if not summary:
+                continue
+            spent -= _tokens(len(m.text or "") - len(summary))
+            condensed[m.id] = summary
+
+        lines = ["# Переписка"]
+        for m in messages:
+            if m.id in condensed:
+                lines.append(self._line(m, "[ПЕРЕСКАЗ, исходное сообщение длиннее] "
+                                           + condensed[m.id]))
+            else:
+                lines.append(self._line(m))
+        return "\n".join(lines)
+
+    async def _condense(self, m: ChatMessage) -> str | None:
+        """Пересказ одного длинного сообщения дешёвой моделью.
+
+        Дешёвой намеренно: задача механическая — сжать, ничего не потеряв
+        из требований. Платить за неё ценой основной модели незачем.
+        """
+        if self.client is None:
+            return None
+        try:
+            resp = await self.client.messages.create(
+                model=cfg.coverage_model, max_tokens=1200,
+                messages=[{"role": "user", "content":
+                           "Перескажи сообщение, сохранив ВСЕ требования, числа, "
+                           "названия и перечисления. Ничего не додумывай.\n\n"
+                           + (m.text or "")}])
+            return "".join(b.text for b in resp.content
+                           if getattr(b, "type", "") == "text").strip() or None
+        except Exception:
+            log.exception("не смог сжать сообщение %s — оставляю как есть", m.id)
+            return None
 
     # ---------- вызов модели ----------
 
@@ -354,7 +481,7 @@ class Brief:
                 self._client = AsyncAnthropic(api_key=key)
         return self._client
 
-    async def _call(self, prompt: str, task_id: int | None, project_id: int) -> str:
+    async def _call(self, prompt: str, task_id: int | None, project_id: int) -> tuple[str, str]:
         # ПОСЛЕДНИЙ рубеж перед сетью: секрет не должен уехать в чужой дата-центр
         assert_no_secrets(prompt, self.vault)
 
@@ -363,10 +490,11 @@ class Brief:
 
         t0 = time.monotonic()
         resp = await self.client.messages.create(
-            model=self.model, max_tokens=4000, system=SYSTEM,
+            model=self.model, max_tokens=cfg.brief_max_tokens, system=SYSTEM,
             messages=[{"role": "user", "content": prompt}])
         await self._charge(resp, time.monotonic() - t0, task_id, project_id)
-        return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        return text, str(getattr(resp, "stop_reason", "") or "")
 
     async def _charge(self, resp, seconds: float, task_id: int | None, project_id: int) -> None:
         from .verifier import PRICE_IN, PRICE_OUT
@@ -588,7 +716,9 @@ class Brief:
         # инкрементально подаём предыдущий бриф + только новые реплики,
         # но проверять evidence всё равно надо по ВСЕЙ переписке
         window = messages if full else fresh
-        prompt = self.build_prompt(project, window, None if full else previous)
+        rendered = await self.render_context(window)
+        prompt = self.build_prompt(project, window, None if full else previous,
+                                   rendered=rendered)
 
         samples: list[dict] = []
         dropped: list[str] = []
@@ -608,6 +738,31 @@ class Brief:
                     continue
                 log.error("проект %s: бриф не собран — %s", project.id, e)
                 await self._escalate(project, f"бриф не собран: {e}")
+                return None
+
+            cut = truncation_complaints(raw)
+            if cut:
+                # Модель СООБЩИЛА, что текст до неё дошёл обрезанным. Это наш
+                # дефект, а не свойство данных: вложение объективно нечитаемо,
+                # а текст мы обрубили сами. Принять такой бриф — значит принять
+                # ТЗ, собранное по неполному условию, и не узнать об этом.
+                log.critical("проект %s: модель сообщила об обрезанном тексте в %s "
+                             "сообщениях (%s) — бриф НЕ принимается. Это дефект "
+                             "нарезки контекста, а не переписки",
+                             project.id, len(cut), ", ".join(cut[:8]))
+                await self._notify(
+                    f"Проект {project.id} «{project.title}». "
+                    f"Бриф не собран: модель сообщила, что {len(cut)} сообщений "
+                    f"дошли до неё обрезанными ({', '.join(cut[:5])}). Это поломка "
+                    f"нарезки контекста на нашей стороне — ТЗ по обрубленной "
+                    f"переписке собирать нельзя. Подними BRIEF_CONTEXT_TOKENS.")
+                # Жёсткий стоп для ВСЕГО прогона, а не «сорвался один сэмпл».
+                # Обрезка одинаково калечит все прогоны: контекст у них общий,
+                # так что повторять на остальных бессмысленно
+                await self._escalate(
+                    project,
+                    f"бриф не собран: текст {len(cut)} сообщений дошёл до модели "
+                    f"обрезанным — это дефект нарезки контекста")
                 return None
 
             checked, drops = self.apply_evidence(raw, messages)
@@ -631,12 +786,22 @@ class Brief:
         last_errors: list[str] = []
         current = prompt
         for attempt in range(1, cfg.brief_max_attempts + 1):
-            raw = await self._call(current, None, project.id)
-            cleaned = raw.replace("```json", "").replace("```", "").strip()
-            try:
-                data = json.loads(cleaned)
-            except Exception:
-                last_errors = ["ответ не разобрался как JSON"]
+            raw, stop_reason = await self._call(current, None, project.id)
+            # тот же терпимый разбор, что у судьи: модель регулярно предваряет
+            # JSON прозой, и строгий json.loads на этом давал ложный провал
+            data, extracted = parse_judge_json(raw)
+            if extracted:
+                log.warning("проект %s: бриф начат прозой, JSON извлечён из текста",
+                            project.id)
+            if data is None:
+                if stop_reason == "max_tokens":
+                    # Отдельный внятный дефект. «Не-JSON» тут врёт: JSON был
+                    # правильный, он просто не поместился в лимит ответа
+                    last_errors = [f"ответ не поместился в {cfg.brief_max_tokens} токенов "
+                                   f"и оборвался — подними BRIEF_MAX_TOKENS"]
+                    log.error("проект %s: ответ модели обрезан по лимиту", project.id)
+                else:
+                    last_errors = ["ответ не разобрался как JSON"]
             else:
                 last_errors = self.validate_schema(data)
                 if not last_errors:
@@ -646,6 +811,14 @@ class Brief:
             current = (prompt + "\n\n# Предыдущий ответ отвергнут, исправь:\n- "
                        + "\n- ".join(last_errors))
         raise BriefFailed("; ".join(last_errors)[:300])
+
+    async def _notify(self, text: str) -> None:
+        """Уведомление владельцу без смены статуса проекта."""
+        if self.communicator is None:
+            return
+        notify = getattr(self.communicator, "notify_owner", None)
+        if notify is not None:
+            await notify(text)
 
     async def _escalate(self, project: Project, text: str) -> None:
         async with Session() as s:

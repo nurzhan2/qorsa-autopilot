@@ -296,6 +296,17 @@ def draft_requirements(data: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+async def _restore(project_id: int, brief_data, ready: bool, status: str) -> None:
+    """Вернуть проект в состояние до прогона."""
+    async with Session() as s:
+        p = await s.get(Project, project_id)
+        if p is not None:
+            p.brief = brief_data
+            p.brief_ready = ready
+            p.status = status
+            await s.commit()
+
+
 async def run(project_id: int, stub: bool, draft: bool) -> int:
     await init_db()
     async with Session() as s:
@@ -322,16 +333,26 @@ async def run(project_id: int, stub: bool, draft: bool) -> int:
               f"{anthropic_key_source()}, прогонов: {cfg.brief_samples}]")
         brief = Brief()
 
-    # для eval всегда полный пересбор: смотреть надо на весь чат
+    # Для eval всегда полный пересбор: смотреть надо на весь чат.
+    # Прежнее состояние запоминаем — неудачный прогон обязан его вернуть.
+    # Иначе диагностика уничтожает ровно то, что диагностирует: один упавший
+    # прогон уже стирал собранный бриф проекта 8 подчистую.
     async with Session() as s:
         p = await s.get(Project, project_id)
+        saved = (p.brief, p.brief_ready, p.status)
         p.brief = {}
         await s.commit()
         project = await s.get(Project, project_id)
 
-    data = await brief.build(project)
+    try:
+        data = await brief.build(project)
+    except BaseException:
+        await _restore(project_id, *saved)
+        print("\nпрогон прерван — прежний бриф возвращён на место", file=sys.stderr)
+        raise
     if data is None:
-        print("\nбриф не собран — смотри лог выше")
+        await _restore(project_id, *saved)
+        print("\nбриф не собран — смотри лог выше. Прежний бриф возвращён на место")
         return 1
 
     show_brief(data)
