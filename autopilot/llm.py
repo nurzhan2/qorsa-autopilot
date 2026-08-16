@@ -1,0 +1,270 @@
+"""Откуда берутся ответы модели: платный API или подписка через CLI.
+
+С этого момента бриф, план и судья ходят к модели не напрямую, а через один
+интерфейс с двумя реализациями:
+
+* `api` — `anthropic` SDK. Списывает реальные деньги, считается в суточном
+  бюджете, ограничен только балансом;
+* `cli` — `claude -p`. Денег не списывает, ест квоту подписки в пятичасовом
+  окне, ограничен этим окном и ничем больше.
+
+Выбор задаётся отдельно для каждого потребителя (`LLM_BACKEND_BRIEF`,
+`LLM_BACKEND_PLAN`, `LLM_BACKEND_JUDGE`), потому что они разные по цене и
+по важности: судью можно держать на подписке, а бриф вернуть на API,
+когда там снова появятся деньги.
+
+**CLI здесь — это чистый вызов модели, а не агент.** Инструменты выключены
+все до одного: агенту дай Read и Bash, и он пойдёт изучать репозиторий,
+сжигая ходы и время на работу, которой у него не просили. Нам нужен один
+ответ на один промпт.
+
+**`--resume` не передаётся никогда.** Судья обязан смотреть на диф свежими
+глазами: продолжив сессию исполнителя, он будет оценивать собственную работу
+и найдёт её прекрасной. Это не оптимизация контекста, это подмена приёмки.
+"""
+from __future__ import annotations
+
+import asyncio
+import dataclasses as dc
+import json
+import logging
+import os
+import re
+import shutil
+import tempfile
+import time
+
+from .config import cfg
+from .vault import anthropic_key, missing_secret_message
+
+log = logging.getLogger("llm")
+
+API, CLI = "api", "cli"
+
+# Признаки того, что мы упёрлись в квоту подписки, а не сломали запрос.
+# Отличать обязательно: упор — это «подожди», ошибка — это «почини».
+LIMIT_MARKERS = (
+    "usage limit", "rate limit", "quota", "limit reached", "limit exceeded",
+    "too many requests", "resets at", "try again later", "overloaded",
+    "лимит", "превышен", "исчерпан",
+)
+
+
+class LLMError(RuntimeError):
+    """Модель не ответила по технической причине: не найдена, не авторизована."""
+
+
+class LimitReached(RuntimeError):
+    """Упор в квоту. НЕ ошибка задачи и НЕ повод засчитывать попытку.
+
+    Отдельный тип нужен, чтобы вызывающий код не спутал его с провалом
+    работы: четыре упора подряд увели бы живую задачу в эскалацию, хотя
+    с ней всё в порядке и нужно просто подождать.
+    """
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+@dc.dataclass(frozen=True)
+class Reply:
+    """Ответ модели и то, во что он обошёлся.
+
+    `cost_usd` от CLI — ОЦЕНКА, а не списание: подписка деньгами не считается.
+    Поэтому счётчики раздельные, и суточный бюджет смотрит только на `billed`.
+    """
+
+    text: str
+    stop_reason: str = ""
+    cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    backend: str = API
+    seconds: float = 0.0
+
+    @property
+    def billed(self) -> bool:
+        """Списаны ли за это реальные деньги."""
+        return self.backend == API
+
+
+def backend_for(consumer: str) -> str:
+    """Какой бэкенд у этого потребителя: brief | plan | judge."""
+    value = str(getattr(cfg, f"llm_backend_{consumer}", "") or cfg.llm_backend).strip().lower()
+    return value if value in (API, CLI) else CLI
+
+
+def looks_like_limit(text: str, returncode: int | None = None) -> bool:
+    """Упор в квоту или обычная ошибка.
+
+    Смотрим и на текст, и на код возврата: CLI сообщает об исчерпании
+    по-разному в разных версиях, и держаться за одну формулировку — способ
+    однажды принять упор за поломку и увести задачу в эскалацию.
+    """
+    body = str(text or "").lower()
+    if any(m in body for m in LIMIT_MARKERS):
+        return True
+    # 429 приходит и кодом возврата тоже
+    return returncode == 429
+
+
+def retry_after_from(text: str) -> float | None:
+    """Когда сбрасывается окно, если CLI это сказал."""
+    m = re.search(r"resets?\s+(?:at|in)\s+([^\n.]+)", str(text or ""), re.IGNORECASE)
+    if not m:
+        return None
+    tail = m.group(1)
+    hours = re.search(r"(\d+)\s*h", tail, re.IGNORECASE)
+    mins = re.search(r"(\d+)\s*m", tail, re.IGNORECASE)
+    if hours or mins:
+        return (int(hours.group(1)) * 3600 if hours else 0) + \
+               (int(mins.group(1)) * 60 if mins else 0)
+    return None
+
+
+# ---------- реализации ----------
+
+class ApiBackend:
+    """Прямые вызовы Anthropic API. Стоят денег и считаются в бюджете."""
+
+    name = API
+
+    def __init__(self, client=None):
+        self._client = client
+
+    @property
+    def client(self):
+        if self._client is None:
+            key = anthropic_key()
+            if not key:
+                raise LLMError(missing_secret_message("ANTHROPIC_API_KEY"))
+            from anthropic import AsyncAnthropic
+            self._client = AsyncAnthropic(api_key=key)
+        return self._client
+
+    async def ask(self, prompt: str, *, system: str = "", model: str = "",
+                  max_tokens: int = 8000, content=None) -> Reply:
+        from .verifier import PRICE_IN, PRICE_OUT
+
+        body = content if content is not None else prompt
+        t0 = time.monotonic()
+        try:
+            resp = await self.client.messages.create(
+                model=model or cfg.judge_model, max_tokens=max_tokens,
+                **({"system": system} if system else {}),
+                messages=[{"role": "user", "content": body}])
+        except Exception as e:
+            if looks_like_limit(str(e)):
+                raise LimitReached(f"API: {e}") from e
+            raise
+        seconds = time.monotonic() - t0
+
+        usage = getattr(resp, "usage", None)
+        tin = getattr(usage, "input_tokens", 0) if usage else 0
+        tout = getattr(usage, "output_tokens", 0) if usage else 0
+        text = "".join(b.text for b in resp.content
+                       if getattr(b, "type", "") == "text")
+        return Reply(text=text, stop_reason=str(getattr(resp, "stop_reason", "") or ""),
+                     cost_usd=tin / 1e6 * PRICE_IN + tout / 1e6 * PRICE_OUT,
+                     input_tokens=tin, output_tokens=tout, backend=API, seconds=seconds)
+
+
+class CliBackend:
+    """`claude -p` — подписка вместо денег.
+
+    Инструменты выключены полностью, каталог временный, сессия всегда новая.
+    """
+
+    name = CLI
+
+    def __init__(self, binary: str | None = None):
+        self.binary = binary or cfg.claude_bin
+
+    async def ask(self, prompt: str, *, system: str = "", model: str = "",
+                  max_tokens: int = 8000, content=None) -> Reply:
+        if content is not None:
+            # Картинки CLI в таком виде не принимает. Молча слать текст без
+            # изображения нельзя: судья по скриншоту вынес бы вердикт, ничего
+            # не увидев, и это была бы приёмка на пустом месте
+            raise LLMError("CLI-бэкенд не умеет картинки — для screenshot-проверок "
+                           "нужен LLM_BACKEND_JUDGE=api")
+        if not shutil.which(self.binary):
+            raise LLMError(
+                f"не нашёл {self.binary!r} в PATH. Claude Code CLI не установлен "
+                f"или не в PATH; поставь его либо переключись на API "
+                f"(LLM_BACKEND_*=api)")
+
+        args = [
+            self.binary, "-p", prompt,
+            "--output-format", "json",
+            # Ни одного инструмента: это вызов модели, а не агент. С Read
+            # и Bash модель уходит изучать репозиторий и жжёт ходы впустую
+            "--allowedTools", "",
+            "--disallowedTools", "Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch",
+            "--max-turns", "1",
+            # sonnet намеренно: недельная квота Opus на порядок меньше
+            # и нужна владельцу для ручной работы
+            "--model", model or cfg.cli_model,
+        ]
+        if system:
+            args += ["--append-system-prompt", system]
+        # --resume НЕ передаётся никогда, см. docstring модуля
+
+        # Каталог временный: в репозитории проекта CLI подхватил бы его
+        # CLAUDE.md и настройки, а нам нужен чистый вызов
+        workdir = tempfile.mkdtemp(prefix="qorsa-llm-")
+        t0 = time.monotonic()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args, cwd=workdir,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(),
+                                                  timeout=cfg.cli_timeout_sec)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise LLMError(f"{self.binary} не ответил за {cfg.cli_timeout_sec}s")
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        seconds = time.monotonic() - t0
+
+        stdout = (out or b"").decode(errors="replace")
+        stderr = (err or b"").decode(errors="replace")
+        if looks_like_limit(stdout + stderr, proc.returncode):
+            raise LimitReached(f"квота подписки исчерпана: {(stderr or stdout)[:300]}",
+                               retry_after_from(stdout + stderr))
+        if proc.returncode != 0:
+            raise LLMError(f"{self.binary} вернул {proc.returncode}: "
+                           f"{(stderr or stdout)[:300]}")
+
+        try:
+            data = json.loads(stdout)
+        except ValueError as e:
+            raise LLMError(f"{self.binary} отдал не-JSON: {stdout[:300]!r}") from e
+
+        if data.get("is_error"):
+            body = str(data.get("result") or "")
+            if looks_like_limit(body):
+                raise LimitReached(f"квота подписки исчерпана: {body[:300]}",
+                                   retry_after_from(body))
+            raise LLMError(f"{self.binary}: {body[:300]}")
+
+        usage = data.get("usage") or {}
+        return Reply(
+            text=str(data.get("result") or ""),
+            stop_reason=str(data.get("stop_reason") or ""),
+            # ОЦЕНКА, не списание: подписка деньгами не считается
+            cost_usd=float(data.get("total_cost_usd") or 0.0),
+            input_tokens=int(usage.get("input_tokens") or 0),
+            output_tokens=int(usage.get("output_tokens") or 0),
+            backend=CLI, seconds=seconds)
+
+
+def make(consumer: str, client=None):
+    """Бэкенд для потребителя: brief | plan | judge."""
+    kind = backend_for(consumer)
+    if kind == API:
+        return ApiBackend(client=client)
+    return CliBackend()

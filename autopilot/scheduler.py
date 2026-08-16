@@ -13,6 +13,8 @@ from sqlalchemy import select, update
 
 from .config import cfg
 from .db import AccessItem, Project, Session, Task, decayed_units, spent_today, utcnow
+from . import limits
+from .llm import LimitReached
 from .manual import NEEDS_HUMAN, needs_human, unproven_note
 
 log = logging.getLogger("sched")
@@ -31,6 +33,10 @@ DEAD_STATUSES = ("done", "blocked")
 # Полоса build требует двух разрешений от людей: галочки менеджера
 # «Готов к работе» и полного чеклиста доступов от клиента.
 GATED_LANE = "build"
+
+# Полосы, поднимающие процессы claude. Их суммарный параллелизм ограничен
+# отдельно от LANE_*: квота подписки общая с ручной работой владельца.
+CLAUDE_LANES = ("build", "verify")
 
 # Сколько единиц WFQ списывается в момент выдачи слота. Списываем ДО работы:
 # иначе проект с 40 задачами заберёт все свободные слоты одного тика, ведь
@@ -64,7 +70,34 @@ class Scheduler:
         self.tick_sec = 1.0
 
     def free_slots(self, lane: str) -> int:
-        return cfg.lane_limits[lane] - self.running[lane]
+        limit = cfg.lane_limits[lane]
+        if lane in CLAUDE_LANES:
+            # Полоса считает ЗАДАЧИ, а CC_MAX_CONCURRENT — одновременные
+            # процессы claude. Это разные вещи: build и verify оба поднимают
+            # сессии и вместе съедают окно подписки быстрее, чем каждая
+            # по отдельности. Общий потолок — на обе полосы сразу
+            busy = sum(self.running[ln] for ln in CLAUDE_LANES)
+            limit = min(limit, cfg.cc_max_concurrent - busy + self.running[lane])
+        return max(0, limit - self.running[lane])
+
+    @staticmethod
+    def build_allowed(now_local: dt.datetime | None = None) -> bool:
+        """Можно ли сейчас поднимать headless-сессии Claude Code.
+
+        Они едят ТУ ЖЕ пятичасовую квоту подписки, что и работа владельца
+        руками. Тихие часы разводят автопилот и человека по времени: днём
+        окно нужно живому человеку, ночью его некому занимать.
+
+        Равные границы выключают ограничение — так и стоит по умолчанию.
+        """
+        if cfg.quiet_build_start == cfg.quiet_build_end:
+            return True
+        hour = (now_local or dt.datetime.now()).hour
+        if cfg.quiet_build_start < cfg.quiet_build_end:
+            quiet = cfg.quiet_build_start <= hour < cfg.quiet_build_end
+        else:
+            quiet = hour >= cfg.quiet_build_start or hour < cfg.quiet_build_end
+        return not quiet
 
     # ---------- главный цикл ----------
 
@@ -91,8 +124,18 @@ class Scheduler:
 
         await self._sync_access()
 
+        # Квота подписки исчерпана — стоит ВСЯ работа с моделью. Пробовать
+        # соседнюю задачу бессмысленно: упрётся ровно так же и сожжёт
+        # остаток окна на пустые попытки
+        limited = limits.state.blocked()
+        if limited:
+            log.debug("квота закрыта ещё %.0f мин — платные полосы стоят",
+                      limits.state.seconds_left() / 60)
+
         for lane in LANES:
-            if self.budget_paused and lane in PAID_LANES:
+            if (self.budget_paused or limited) and lane in PAID_LANES:
+                continue
+            if lane == "build" and not self.build_allowed():
                 continue
             await self._dispatch(lane)
 
@@ -242,6 +285,11 @@ class Scheduler:
                 await self._set_status(task.id, "done")
         except asyncio.CancelledError:
             raise
+        except LimitReached as e:
+            # Упор в квоту — НЕ провал задачи. Попытку не засчитываем и
+            # возвращаем задачу в очередь как есть: четыре упора подряд
+            # увели бы живую работу в эскалацию, хотя с ней всё в порядке
+            await self._on_limit(task, lane, e)
         except Exception as e:
             log.exception("task %s failed", task.id)
             try:
@@ -258,6 +306,27 @@ class Scheduler:
             if exclusive:
                 self.busy_projects.discard(project.id)
             self.running[lane] -= 1
+
+    async def _on_limit(self, task: Task, lane: str, exc) -> None:
+        """Квота кончилась: задача возвращается в очередь нетронутой.
+
+        Ни attempts, ни defects, ни статус не меняются — меняется только
+        общее состояние процесса, и встают все полосы сразу. Квота одна
+        на всех, и пробовать соседнюю задачу бессмысленно.
+        """
+        wait = limits.state.hit(str(exc), getattr(exc, "retry_after", None))
+        async with Session() as s:
+            row = await s.get(Task, task.id)
+            if row is not None and row.status == "running":
+                row.status = "ready"          # вернуть в очередь как есть
+                row.updated_at = utcnow()
+                await s.commit()
+        log.warning("задача %s отложена из-за квоты на %.0f минут (полоса %s), "
+                    "попытка НЕ засчитана", task.id, wait / 60, lane)
+        if limits.state.should_notify():
+            notify = getattr(self.communicator, "notify_owner", None)
+            if notify is not None:
+                await notify(limits.state.message())
 
     async def _needs_confirmation(self, task: Task, project: Project, verdict) -> None:
         """Задача сделана и проверки прошли — но ничего не доказали.

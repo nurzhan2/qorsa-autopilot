@@ -41,7 +41,40 @@ class Config:
     max_attempts = _i("MAX_ATTEMPTS", 4)
     task_timeout_sec = _i("TASK_TIMEOUT_SEC", 1800)
 
+    # Суточный потолок РЕАЛЬНЫХ денег. Расход подписки сюда не входит:
+    # иначе бюджет вставал бы на пустом месте, когда всё идёт через CLI
+    # и ни рубля не тратится.
     daily_budget_usd = _f("DAILY_BUDGET_USD", 25)
+
+    # --- откуда берутся ответы модели ---
+    # api — платный SDK, cli — подписка через `claude -p`.
+    # По умолчанию cli: денег на API нет, работа идёт по подписке.
+    llm_backend = os.getenv("LLM_BACKEND", "cli").strip().lower()
+    llm_backend_brief = os.getenv("LLM_BACKEND_BRIEF", "").strip().lower()
+    llm_backend_plan = os.getenv("LLM_BACKEND_PLAN", "").strip().lower()
+    llm_backend_judge = os.getenv("LLM_BACKEND_JUDGE", "").strip().lower()
+    # Модель для CLI. sonnet намеренно: недельная квота Opus на порядок
+    # меньше и нужна владельцу для ручной работы в Claude Code.
+    cli_model = os.getenv("CLI_MODEL", "sonnet")
+    cli_timeout_sec = _i("CLI_TIMEOUT_SEC", 600)
+
+    # Пауза после упора в квоту подписки, если CLI не сказал время сброса.
+    # Растёт по степени двойки до потолка: ломиться в закрытую дверь раз
+    # в минуту — способ не заметить, что она закрыта.
+    limit_backoff_start_sec = _i("LIMIT_BACKOFF_START_SEC", 300)
+    limit_backoff_max_sec = _i("LIMIT_BACKOFF_MAX_SEC", 3600)
+    # уведомление владельцу об упоре — не чаще раза за этот период
+    limit_notify_every_sec = _i("LIMIT_NOTIFY_EVERY_SEC", 3600)
+
+    # --- окно подписки: автопилот против ручной работы владельца ---
+    # Headless-запуски Claude Code едят ТУ ЖЕ пятичасовую квоту, что и
+    # работа владельца руками. Разводим по времени и по числу сессий.
+    # Равные границы = ограничение выключено.
+    quiet_build_start = _i("QUIET_HOURS_BUILD_START", 0)
+    quiet_build_end = _i("QUIET_HOURS_BUILD_END", 0)
+    # Отдельно от LANE_BUILD: полоса считает ЗАДАЧИ, а этот потолок —
+    # одновременные процессы claude, включая те, что заняты приёмкой.
+    cc_max_concurrent = _i("CC_MAX_CONCURRENT", 2)
 
     lane_limits = {
         "chat": _i("LANE_CHAT", 8),
@@ -145,6 +178,10 @@ class Config:
     confirm_window = _i("CONFIRM_WINDOW", 3)
     # сколько раз собирать бриф за один проход. >1 дорого, но лечит разброс
     # модели: пункт входит в итог, если встретился хотя бы в одном прогоне
+    # По умолчанию ОДИН прогон. На API три прогона стоили втрое больше
+    # денег, на подписке — втрое больше квоты пятичасового окна,
+    # а окно кончается быстрее кошелька. Разброс модели гасит
+    # накопление пунктов: потерянное в одном прогоне вернётся в другом.
     brief_samples = _i("BRIEF_SAMPLES", 1)
     # дешёвая модель для сверки брифа с эталонным списком требований
     coverage_model = os.getenv("COVERAGE_MODEL", "claude-haiku-4-5-20251001")

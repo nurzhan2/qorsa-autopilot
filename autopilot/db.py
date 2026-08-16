@@ -324,7 +324,13 @@ class Run(Base):
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"))
     kind: Mapped[str] = mapped_column(String(10), default="execute")
     ok: Mapped[bool] = mapped_column(default=False)
+    # Стоимость. У CLI это ОЦЕНКА, а не списание: подписка деньгами
+    # не считается, и складывать её с расходом API — значит соврать
+    # в обе стороны сразу.
     cost_usd: Mapped[float] = mapped_column(default=0.0)
+    # чем платили: api (реальные деньги) | cli (квота подписки)
+    backend: Mapped[str] = mapped_column(String(8), default="api",
+                                         server_default=text("'api'"))
     seconds: Mapped[float] = mapped_column(default=0.0)
     log_path: Mapped[str] = mapped_column(default="")
     started_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
@@ -432,11 +438,43 @@ BOT_SIGNATURE_FALLBACK = "🤖 Бот по техническим вопроса
 
 
 async def spent_today() -> float:
-    """Потрачено за последние 24 часа (скользящее окно, не календарные сутки)."""
+    """РЕАЛЬНЫЕ деньги за последние 24 часа (скользящее окно).
+
+    Только `backend="api"`. Расход подписки сюда не входит намеренно:
+    иначе суточный бюджет вставал бы на пустом месте — всё идёт через CLI,
+    денег не тратится ни рубля, а работа остановлена.
+    """
     since = utcnow() - dt.timedelta(hours=24)
     async with Session() as s:
-        rows = (await s.execute(select(Run.cost_usd).where(Run.started_at >= since))).scalars().all()
+        rows = (await s.execute(
+            select(Run.cost_usd).where(Run.started_at >= since,
+                                       Run.backend == "api"))).scalars().all()
     return float(sum(rows))
+
+
+async def consumed_today() -> dict[str, float]:
+    """Обе цифры раздельно: деньги и подписка.
+
+    Показывать их одной суммой нельзя — это разные ресурсы с разными
+    потолками. Кошелёк меряется в долларах, окно подписки — в вызовах
+    и времени до сброса.
+    """
+    since = utcnow() - dt.timedelta(hours=24)
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Run.backend, Run.cost_usd, Run.seconds)
+            .where(Run.started_at >= since))).all()
+    out = {"api_usd": 0.0, "cli_usd_est": 0.0, "api_calls": 0.0,
+           "cli_calls": 0.0, "cli_seconds": 0.0}
+    for backend, cost, seconds in rows:
+        if str(backend) == "cli":
+            out["cli_usd_est"] += float(cost or 0)
+            out["cli_calls"] += 1
+            out["cli_seconds"] += float(seconds or 0)
+        else:
+            out["api_usd"] += float(cost or 0)
+            out["api_calls"] += 1
+    return out
 
 
 async def recover_orphan_tasks() -> int:

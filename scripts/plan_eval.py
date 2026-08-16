@@ -28,8 +28,9 @@ except (AttributeError, ValueError):
 from sqlalchemy import func, select                                   # noqa: E402
 
 from autopilot import checks                                       # noqa: E402
-from autopilot.config import cfg                                      # noqa: E402
-from autopilot.db import AccessItem, ChatMessage, Project, Session, Task, init_db  # noqa: E402
+from autopilot.config import cfg
+from autopilot.llm import LimitReached, LLMError                                      # noqa: E402
+from autopilot.db import consumed_today, AccessItem, ChatMessage, Project, Session, Task, init_db  # noqa: E402
 from autopilot.planner import DETERMINISTIC_CHECKS, Planner           # noqa: E402
 from autopilot.vault import (anthropic_key, anthropic_key_source,     # noqa: E402
                              missing_secret_message)
@@ -218,6 +219,19 @@ def show_notes(notes: list[str]) -> None:
         print(f"  • {note}")
 
 
+
+async def show_spend() -> None:
+    """Две цифры РАЗДЕЛЬНО: деньги и подписка. Это разные ресурсы."""
+    both = await consumed_today()
+    print(f"\n{LINE}\nРАСХОД ЗА СУТКИ\n{LINE}")
+    print(f"  реальные деньги (API):  ${both['api_usd']:.2f}   "
+          f"вызовов {int(both['api_calls'])}")
+    print(f"  подписка (CLI):         ~${both['cli_usd_est']:.2f} оценочно, "
+          f"вызовов {int(both['cli_calls'])}, {both['cli_seconds'] / 60:.1f} мин")
+    print("  суточный бюджет считает ТОЛЬКО первую строку: подписка деньгами")
+    print("  не тратится, и останавливать работу из-за неё было бы неверно")
+
+
 async def run(project_id: int) -> int:
     await init_db()
     async with Session() as s:
@@ -240,7 +254,15 @@ async def run(project_id: int) -> int:
     print(f"пунктов ТЗ: {len(brief.get('deliverables') or [])}, "
           f"confidence {brief.get('confidence')}, готов={project.brief_ready}")
 
-    result = await Planner(client=None).plan(project)
+    try:
+        result = await Planner(client=None).plan(project)
+    except LimitReached as e:
+        print(f"\nКВОТА ПОДПИСКИ ИСЧЕРПАНА: {e}\n"
+              f"План не тронут — повтори, когда откроется окно.", file=sys.stderr)
+        return 3
+    except LLMError as e:
+        print(f"\nМОДЕЛЬ НЕДОСТУПНА: {e}", file=sys.stderr)
+        return 2
     if result is None:
         print("\nплан не собран — смотри лог выше", file=sys.stderr)
         return 1
@@ -253,6 +275,7 @@ async def run(project_id: int) -> int:
     show_suspicious(result["tasks"])
     show_notes(result["notes"])
     show_stats(result["stats"])
+    await show_spend()
     print()
     return 0
 

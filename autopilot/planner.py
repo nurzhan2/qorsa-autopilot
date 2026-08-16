@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 
 from sqlalchemy import select
@@ -38,6 +39,7 @@ from sqlalchemy import select
 from .brief import (BriefFailed, SecretLeak, assert_no_secrets, item_text,
                     same_item)
 from . import checks
+from . import llm
 from .config import cfg
 from pathlib import Path
 
@@ -169,6 +171,33 @@ class CycleInPlan(RuntimeError):
 # ---------- проверки, которые делает КОД ----------
 
 valid_checks = checks.valid_checks
+
+
+def split_ref(ref: str) -> list[str]:
+    """Разбирает составную ссылку на пункты ТЗ.
+
+    Модель просят дать ТОЧНЫЙ текст одного пункта, но она регулярно
+    перечисляет несколько через «;» и дописывает модальность в скобках:
+
+        «Клиентское приложение (must); Админ-панель (must)»
+
+    Целиком такая строка не совпадает ни с чем, и задача выбрасывалась как
+    выдуманная. На живом плане так пропали инициализация репозитория и
+    E2E-тестирование — а потом код снял зависимости на несуществующие задачи,
+    и граф разъехался у шести штук.
+
+    Возвращает части в исходном порядке, без модальности и пустых.
+    """
+    body = str(ref or "")
+    parts = []
+    for chunk in re.split(r"[;\n]+|(?<=\))\s*\+\s*", body):
+        # хвост вида «(must)», «(should)», «(nice)» — это модальность,
+        # а не часть формулировки пункта
+        clean = re.sub(r"\s*\((?:must|should|nice)\)\s*$", "", chunk.strip(),
+                       flags=re.IGNORECASE).strip(" .;")
+        if clean:
+            parts.append(clean)
+    return parts if len(parts) > 1 else []
 
 
 def constraints_block(brief: dict) -> str:
@@ -349,11 +378,20 @@ def autonomy(tasks: list[dict]) -> dict:
 
 
 class Planner:
-    def __init__(self, client=None, vault=None, communicator=None, model: str | None = None):
+    def __init__(self, client=None, vault=None, communicator=None, model: str | None = None,
+                 backend=None):
         self._client = client
+        self._backend = backend
         self.vault = vault or default_vault
         self.communicator = communicator
         self.model = model or cfg.plan_model
+
+    @property
+    def backend(self):
+        """Откуда берём ответ: API или CLI. Задаётся LLM_BACKEND_PLAN."""
+        if self._backend is None:
+            self._backend = llm.make("plan", client=self._client)
+        return self._backend
 
     @property
     def client(self):
@@ -404,38 +442,29 @@ class Planner:
 
     async def _call(self, prompt: str, project_id: int) -> tuple[str, str]:
         assert_no_secrets(prompt, self.vault)
-        if self.client is None:
-            raise PlanFailed(missing_secret_message("ANTHROPIC_API_KEY"))
-        t0 = time.monotonic()
-        resp = await self.client.messages.create(
-            model=self.model, max_tokens=cfg.plan_max_tokens, system=SYSTEM,
-            messages=[{"role": "user", "content": prompt}])
-        await self._charge(resp, time.monotonic() - t0, project_id)
-        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-        return text, str(getattr(resp, "stop_reason", "") or "")
+        reply = await self.backend.ask(prompt, system=SYSTEM, model=self.model,
+                                       max_tokens=cfg.plan_max_tokens)
+        await self._charge(reply, project_id)
+        return reply.text, reply.stop_reason
 
-    async def _charge(self, resp, seconds: float, project_id: int) -> None:
-        from .verifier import PRICE_IN, PRICE_OUT
-        usage = getattr(resp, "usage", None)
-        cost = 0.0
-        tokens_in = tokens_out = 0
-        if usage is not None:
-            tokens_in = getattr(usage, "input_tokens", 0)
-            tokens_out = getattr(usage, "output_tokens", 0)
-            cost = tokens_in / 1e6 * PRICE_IN + tokens_out / 1e6 * PRICE_OUT
+    async def _charge(self, reply, project_id: int) -> None:
+        """Расход. У CLI это оценка подписки, а не деньги — см. llm.Reply."""
+        money = ("$%.4f" % reply.cost_usd if reply.billed
+                 else "~$%.4f (подписка)" % reply.cost_usd)
+        log.info("план [%s]: вход %s токенов, выход %s, %s, %.1fs",
+                 reply.backend, reply.input_tokens, reply.output_tokens,
+                 money, reply.seconds)
         async with Session() as s:
             t = Task(project_id=project_id, lane="chat", title="планирование",
-                     status="done", cost_usd=cost, verify_class="human",
-                     executor="manual")
+                     status="done", cost_usd=reply.cost_usd if reply.billed else 0.0)
             s.add(t)
             await s.flush()
-            s.add(Run(task_id=t.id, kind="plan", ok=True, cost_usd=cost, seconds=seconds))
+            s.add(Run(task_id=t.id, kind="plan", ok=True, backend=reply.backend,
+                      cost_usd=reply.cost_usd, seconds=reply.seconds))
             p = await s.get(Project, project_id)
-            if p is not None:
-                p.cost_usd += cost
+            if p is not None and reply.billed:
+                p.cost_usd += reply.cost_usd
             await s.commit()
-        log.info("план: вход %s токенов, выход %s токенов, $%.4f, %.1fs",
-                 tokens_in, tokens_out, cost, seconds)
 
     # ---------- разбор и починка ответа ----------
 
@@ -492,6 +521,21 @@ class Planner:
             # 1) происхождение: пункт ТЗ должен существовать
             probe = {"text": ref}
             match = next((item for item in known if same_item(item, probe)), None)
+            if match is None:
+                # Модель регулярно склеивает несколько пунктов в одну ссылку:
+                # «Клиентское приложение (must); Админ-панель (must)». Целиком
+                # такая строка не совпадает ни с чем, и задача выбрасывалась —
+                # на живом плане так потерялись инициализация репозитория
+                # и E2E-тестирование, а следом разъехался граф зависимостей.
+                parts = split_ref(ref)
+                for part in parts:
+                    probe_part = {"text": part}
+                    match = next((i for i in known if same_item(i, probe_part)), None)
+                    if match is not None:
+                        probe = probe_part
+                        notes.append(f"«{title}»: ссылка склеена из {len(parts)} "
+                                     f"пунктов, взят первый совпавший — «{part}»")
+                        break
             if match is None:
                 notes.append(f"«{title}»: выброшена — deliverable_ref «{ref}» "
                              f"не найден в ТЗ")
