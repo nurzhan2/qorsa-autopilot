@@ -238,7 +238,9 @@ async def run(path: Path, project_id: int | None, chat_id: str | None, dry: bool
             log.warning("сообщение %s не разобралось (%s) — пропущено", mid, e)
             continue
 
-        text, names = scrub(raw_text, project_id=project_id, chat_id=chat)
+        # store=not dry: пробный прогон не трогает ни базу, ни vault
+        text, names = scrub(raw_text, project_id=project_id, chat_id=chat,
+                            store=not dry)
         secrets_found += len(names)
 
         # роль: сперва явное указание и эвристика личного чата,

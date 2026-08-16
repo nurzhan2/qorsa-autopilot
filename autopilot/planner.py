@@ -142,6 +142,17 @@ class CycleInPlan(RuntimeError):
 valid_checks = checks.valid_checks
 
 
+def stack_declared(brief: dict) -> bool:
+    """Зафиксирован ли стек в ТЗ.
+
+    Пустой список — это не «любой», а «не обсуждали». Разница принципиальная:
+    в первом случае можно брать что угодно, во втором нельзя брать ничего,
+    пока не спросишь.
+    """
+    return any(str(item_text(i)).strip()
+               for i in (brief.get("stack") or []) if isinstance(i, dict))
+
+
 def classify(task: dict, declared: str | None = None) -> str:
     """Класс проверяемости. Код умеет ТОЛЬКО ПОНИЖАТЬ, никогда не повышать.
 
@@ -374,7 +385,16 @@ class Planner:
         deliverables = [i for i in (brief.get("deliverables") or []) if isinstance(i, dict)]
         others = [i for f in ("stack", "constraints", "assets") for i in (brief.get(f) or [])
                   if isinstance(i, dict)]
-        known = deliverables + others
+        # ЦЕЛЬ — тоже законное происхождение задачи.
+        #
+        # Раньше её тут не было, и на живом плане это выбросило подготовку
+        # к публикации в App Store и Google Play — то есть то, чем проект
+        # заканчивается. Цель прямо про публикацию и говорила. Правило против
+        # выдуманной работы остаётся: ссылка обязана на что-то указывать.
+        # Но цель — не выдумка, а самая главная строчка ТЗ.
+        goal = brief.get("goal") if isinstance(brief.get("goal"), dict) else None
+        goal_items = [goal] if goal and str(goal.get("text") or "").strip() else []
+        known = deliverables + others + goal_items
         access_names = [{"text": f"{a.kind} {a.name}"} for a in access]
 
         out: list[dict] = []
@@ -392,6 +412,11 @@ class Planner:
                 notes.append(f"«{title}»: выброшена — deliverable_ref «{ref}» "
                              f"не найден в ТЗ")
                 continue
+            # откуда именно взялась задача. Ссылка на цель законна, но это
+            # более слабое основание, чем пункт: цель широкая, и под неё легко
+            # подвести что угодно. Поэтому такие задачи показываются отдельно
+            origin = ("goal" if goal_items and match is goal_items[0]
+                      else "deliverable")
 
             # 2) доступы задачами не бывают: их ведёт чеклист
             if any(same_item(a, probe) for a in access_names) or _looks_like_access(title):
@@ -427,6 +452,7 @@ class Planner:
                 "title": title,
                 "description": str(raw.get("description") or "").strip(),
                 "deliverable_ref": item_text(match),
+                "ref_origin": origin,
                 "acceptance": checks,
                 "verify_class": real_class,
                 "executor": real_exec,
@@ -451,6 +477,21 @@ class Planner:
         brief = (project.brief or {}).get("brief") if isinstance(project.brief, dict) else None
         if not brief or not brief.get("deliverables"):
             log.info("проект %s: планировать нечего — в брифе нет deliverables", project.id)
+            return None
+
+        if not stack_declared(brief):
+            # Стек не выбирают за клиента молча.
+            #
+            # На живом проекте ТЗ не содержало о технологиях НИ СЛОВА, а план
+            # начинался с «Инициализация проекта React Native» — и дальше все
+            # задачи зависели от этой первой. Выбор был сделан моделью, подан
+            # как данность и зацементирован графом зависимостей. Клиент об этом
+            # не знал и согласия не давал.
+            #
+            # Планировать по невыбранному стеку нельзя: цена ошибки — весь
+            # проект. Поэтому вместо плана — блокирующий вопрос с предложением
+            # и обоснованием. Предложить можно, решить нельзя.
+            await self._ask_about_stack(project, brief)
             return None
 
         async with Session() as s:
@@ -570,6 +611,63 @@ class Planner:
             await s.commit()
         log.info("проект %s: план записан — %s задач, автономность %.0f%%",
                  project.id, stats["tasks"], stats["auto_ratio"] * 100)
+
+    async def _ask_about_stack(self, project: Project, brief: dict) -> None:
+        """Блокирующий вопрос о стеке + наше предложение с обоснованием."""
+        suggestion = await self._suggest_stack(project, brief)
+        question = {
+            "text": ("На каких технологиях делаем? В ТЗ стек не зафиксирован, "
+                     "а от него зависит весь план работ.\n" + suggestion),
+            "blocking": True,
+            "evidence": [],
+            "origin": "planner",
+        }
+        async with Session() as s:
+            p = await s.get(Project, project.id)
+            if p is None:
+                return
+            payload = dict(p.brief or {})
+            body = dict(payload.get("brief") or {})
+            questions = [q for q in (body.get("open_questions") or [])
+                         if isinstance(q, dict)
+                         and "стек" not in str(q.get("text", "")).lower()]
+            body["open_questions"] = [question] + questions
+            payload["brief"] = body
+            p.brief = payload
+            p.brief_ready = False        # блокирующий вопрос держит проект
+            p.updated_at = utcnow()
+            await s.commit()
+
+        log.warning("проект %s: стек не зафиксирован в ТЗ — планирование "
+                    "остановлено, вопрос клиенту поставлен", project.id)
+        if self.communicator is not None:
+            notify = getattr(self.communicator, "notify_owner", None)
+            if notify is not None:
+                await notify(f"Проект {project.id} «{project.title}»: в ТЗ нет стека, "
+                             f"планировать не начинаю.\n{suggestion}")
+
+    async def _suggest_stack(self, project: Project, brief: dict) -> str:
+        """Предложение по стеку. Это ПРЕДЛОЖЕНИЕ, а не выбор — так и подписано."""
+        goal = ""
+        if isinstance(brief.get("goal"), dict):
+            goal = str(brief["goal"].get("text") or "")
+        items = "; ".join(item_text(d) for d in (brief.get("deliverables") or [])
+                          if isinstance(d, dict))[:1500]
+        if self.client is None:
+            return "Предложить стек не могу: нет ключа модели."
+        try:
+            resp = await self.client.messages.create(
+                model=self.model, max_tokens=700,
+                messages=[{"role": "user", "content":
+                           "Ты технический директор. Предложи стек для проекта и "
+                           "объясни выбор в 3-4 предложениях. Явно скажи, что это "
+                           "предложение, требующее согласования с клиентом.\n\n"
+                           f"Цель: {goal}\nЧто нужно сделать: {items}"}])
+            return "".join(b.text for b in resp.content
+                           if getattr(b, "type", "") == "text").strip()
+        except Exception:
+            log.exception("не смог сформулировать предложение по стеку")
+            return "Предложение по стеку сформулировать не удалось — реши сам."
 
     async def _escalate(self, project: Project, text: str) -> None:
         async with Session() as s:
