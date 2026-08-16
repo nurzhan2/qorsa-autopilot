@@ -45,7 +45,7 @@ from .config import cfg
 from pathlib import Path
 
 from .db import (AccessItem, Project, Session, Task, close_run, open_run,
-                 utcnow)
+                 service_task, utcnow)
 from .vault import anthropic_key, missing_secret_message
 from .verifier import parse_judge_json
 from .vault import vault as default_vault
@@ -173,6 +173,42 @@ class CycleInPlan(RuntimeError):
 # ---------- проверки, которые делает КОД ----------
 
 valid_checks = checks.valid_checks
+
+# Насколько похожими должны быть названия, чтобы считать задачи одной и той же.
+# Выше, чем порог склейки пунктов брифа (0.75): задачи мельче требований, и
+# «Админ-панель: заказы» и «Админ-панель: товары» — РАЗНАЯ работа. Ошибиться
+# в эту сторону дороже: склеенная задача молча исчезает из плана, а лишняя
+# сирота всего лишь мозолит глаза.
+TASK_MATCH_MIN = 0.82
+
+
+def match_task(spec: dict, existing, used: set[int]):
+    """Та же задача из прошлого плана — или None, если это новая работа.
+
+    Двух условий сразу: похожее название И тот же пункт ТЗ. Одного названия
+    мало (модель переформулирует), одного пункта ТЗ мало (из одного пункта
+    выходит по три-четыре разные задачи).
+
+    Каждая строка достаётся не больше чем одной новой задаче: иначе две
+    переформулировки одной старой задачи схлопнулись бы в одну запись,
+    и половина плана потерялась бы молча.
+    """
+    from .groups import similarity
+
+    ref = str(spec.get("deliverable_ref") or "").strip()
+    best, best_score = None, 0.0
+    for row in existing:
+        if row.id in used or not row.title:
+            continue
+        if ref and row.deliverable_ref:
+            if not same_item({"text": ref}, {"text": row.deliverable_ref}):
+                continue
+        elif ref or row.deliverable_ref:
+            continue            # у одной ссылка есть, у другой нет — не пара
+        score = similarity(spec.get("title") or "", row.title)
+        if score >= TASK_MATCH_MIN and score > best_score:
+            best, best_score = row, score
+    return best
 
 
 def split_ref(ref: str) -> list[str]:
@@ -463,13 +499,8 @@ class Planner:
         return reply.text, reply.stop_reason
 
     async def _service_task(self, project_id: int) -> int:
-        """Служебная задача, к которой привязан расход: Run без task_id нет."""
-        async with Session() as s:
-            t = Task(project_id=project_id, lane="chat", title="планирование",
-                     status="done")
-            s.add(t)
-            await s.commit()
-            return t.id
+        """Якорь для строк расхода: ОДИН на проект, а не по одному на вызов."""
+        return await service_task(project_id, "планирование")
 
     async def _charge(self, reply, project_id: int, task_id: int, run_id: int) -> None:
         """Расход. У CLI это оценка подписки, а не деньги — см. llm.Reply."""
@@ -733,17 +764,26 @@ class Planner:
         Выполненные задачи остаются как есть. Задача, чьё требование исчезло
         из ТЗ, помечается `orphaned` и показывается человеку — тот же принцип,
         что у брифа: молча ничего не пропадает.
+
+        Сопоставление НЕЧЁТКОЕ, и это не украшение. По точному названию оно
+        не находило ничего: модель каждый раз формулирует иначе, «Интеграция
+        платёжного шлюза (ЮKassa / Тинькофф)» превращается в «Интеграция
+        онлайн-оплаты (YooKassa, карты + СБП)». Каждый прогон заводил весь
+        план заново и осиротял предыдущий целиком — три прогона по проекту 8
+        дали 84 сироты при 26 живых задачах.
         """
         async with Session() as s:
             existing = (await s.execute(
                 select(Task).where(Task.project_id == project.id,
                                    Task.lane.in_(("build", "verify"))))).scalars().all()
             by_title = {t.title.strip().lower(): t for t in existing}
-            fresh_titles = {t["title"].strip().lower() for t in tasks}
+            used: set[int] = set()
 
             for idx, spec in enumerate(tasks):
                 key = spec["title"].strip().lower()
-                row = by_title.get(key)
+                row = by_title.get(key) or match_task(spec, existing, used)
+                if row is not None:
+                    used.add(row.id)
                 if row is not None and row.status in ("done", "escalated"):
                     continue        # сделанное не трогаем никогда
                 if row is None:
@@ -762,8 +802,8 @@ class Planner:
                 row.orphaned = False
                 row.updated_at = utcnow()
 
-            for key, row in by_title.items():
-                if key in fresh_titles or row.status in ("done", "escalated"):
+            for row in existing:
+                if row.id in used or row.status in ("done", "escalated"):
                     continue
                 # требование исчезло — задачу не удаляем, а показываем
                 row.orphaned = True

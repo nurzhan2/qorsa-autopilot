@@ -75,6 +75,46 @@ async def cmd_confirm(task_id: int) -> int:
     return 0 if ok else 2
 
 
+async def cmd_prune(project_id: int, apply: bool) -> int:
+    """Выбросить осиротевшие задачи, по которым ничего не происходило.
+
+    Сироты — след прошлых прогонов планировщика: пока сопоставление шло
+    по точному названию, каждый прогон осиротял предыдущий план целиком.
+    Сама по себе сирота безвредна, но когда их вчетверо больше живых задач,
+    список перестаёт читаться, а это единственный способ увидеть свою работу.
+    """
+    await init_db()
+    safe, keep = await manual.prunable(project_id)
+    if not safe and not keep:
+        print(f"у проекта {project_id} осиротевших задач нет")
+        return 0
+
+    print(f"осиротевших задач: {len(safe) + len(keep)}")
+    print(f"\nБЕЗ ИСТОРИИ — можно удалять ({len(safe)}):")
+    for t in safe[:40]:
+        print(f"  #{t.id} {t.title[:70]}")
+    if len(safe) > 40:
+        print(f"  ... и ещё {len(safe) - 40}")
+    if keep:
+        print(f"\nС ИСТОРИЕЙ — остаются, решать тебе ({len(keep)}):")
+        for t in keep:
+            why = []
+            if (t.attempts or 0) > 0:
+                why.append(f"попыток {t.attempts}")
+            if t.status in ("done", "escalated", manual.NEEDS_HUMAN):
+                why.append(t.status)
+            if t.cc_session_id:
+                why.append("была сессия агента")
+            print(f"  #{t.id} {t.title[:60]} — {', '.join(why) or 'есть расход'}")
+
+    if not apply:
+        print(f"\nэто примерка. Удалить: --apply")
+        return 0
+    removed, kept = await manual.prune(project_id, apply=True)
+    print(f"\nудалено {removed}, оставлено с историей {kept}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="ручные задачи проекта")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -87,6 +127,10 @@ def main() -> int:
     p_conf = sub.add_parser(
         "confirm", help="закрыть задачу под свою ответственность (assisted-приёмка)")
     p_conf.add_argument("task_id", type=int)
+    p_prune = sub.add_parser("prune", help="выбросить осиротевшие задачи без истории")
+    p_prune.add_argument("--project", type=int, required=True)
+    p_prune.add_argument("--apply", action="store_true",
+                         help="без него — только примерка")
     args = ap.parse_args()
 
     if args.cmd == "list":
@@ -95,6 +139,8 @@ def main() -> int:
         return asyncio.run(cmd_show(args.task_id))
     if args.cmd == "confirm":
         return asyncio.run(cmd_confirm(args.task_id))
+    if args.cmd == "prune":
+        return asyncio.run(cmd_prune(args.project, args.apply))
     return asyncio.run(cmd_done(args.task_id))
 
 

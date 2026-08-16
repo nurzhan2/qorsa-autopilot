@@ -433,3 +433,128 @@ async def test_honest_human_task_survives_planning(db):
     async with Session() as s:
         built = {(await s.get(Task, tid)).title for _, tid in ex.calls}
     assert "Вёрстка по макету" not in built
+
+
+async def test_replan_does_not_breed_orphans_on_rewording(db):
+    """Переформулированное название — та же задача, а не новая плюс сирота.
+
+    Сопоставление шло по ТОЧНОМУ названию, а модель каждый раз пишет иначе.
+    Каждый прогон заводил план заново и осиротял предыдущий целиком: три
+    прогона по проекту 8 дали 84 сироты при 26 живых задачах.
+    """
+    p = await with_brief()
+    await Planner(client=FakeAnthropic(plan_reply(
+        task("Каталог", "каталог с фильтрами"),
+        task("Корзина", "корзина и оформление заказа")))).plan(p)
+    first = {t.title: t.id for t in await tasks_of(p.id)}
+    assert len(first) == 2
+
+    # тот же план, но названия переписаны — работа не изменилась
+    await Planner(client=FakeAnthropic(plan_reply(
+        task("Каталог товаров с фильтрами", "каталог с фильтрами"),
+        task("Корзина и оформление заказа", "корзина и оформление заказа")))).plan(
+            await _reload(p))
+
+    rows = await tasks_of(p.id)
+    assert len(rows) == 2, f"план размножился: {[t.title for t in rows]}"
+    assert not any(t.orphaned for t in rows), "живые задачи объявлены сиротами"
+    # это те же строки, а не новые: id сохранились
+    assert {t.id for t in rows} == set(first.values())
+
+
+async def test_replan_does_not_glue_different_tasks_of_one_requirement(db):
+    """Из одного пункта ТЗ выходит несколько РАЗНЫХ задач — склеивать нельзя.
+
+    Ошибка в эту сторону дороже сироты: склеенная задача молча исчезает
+    из плана, и никто этого не замечает.
+    """
+    p = await with_brief()
+    await Planner(client=FakeAnthropic(plan_reply(
+        task("Каталог: вёрстка списка", "каталог с фильтрами"),
+        task("Каталог: фильтры по бренду", "каталог с фильтрами")))).plan(p)
+    assert len(await tasks_of(p.id)) == 2
+
+    await Planner(client=FakeAnthropic(plan_reply(
+        task("Каталог: вёрстка списка", "каталог с фильтрами"),
+        task("Каталог: фильтры по бренду", "каталог с фильтрами")))).plan(
+            await _reload(p))
+
+    rows = await tasks_of(p.id)
+    assert len(rows) == 2, "две разные задачи схлопнулись в одну"
+    assert not any(t.orphaned for t in rows)
+
+
+async def test_task_from_another_requirement_is_not_matched(db):
+    """Похожее название при ДРУГОМ пункте ТЗ — это другая работа."""
+    from autopilot.planner import match_task
+
+    class Row:
+        def __init__(self, id, title, ref):
+            self.id, self.title, self.deliverable_ref = id, title, ref
+
+    rows = [Row(1, "Импорт товаров", "каталог с фильтрами")]
+    same = match_task({"title": "Импорт товаров в каталог",
+                       "deliverable_ref": "каталог с фильтрами"}, rows, set())
+    assert same is not None and same.id == 1
+
+    other = match_task({"title": "Импорт товаров",
+                        "deliverable_ref": "корзина и оформление заказа"}, rows, set())
+    assert other is None, "задача подхвачена из чужого пункта ТЗ"
+
+    # уже занятую строку второй раз не отдаём
+    assert match_task({"title": "Импорт товаров",
+                       "deliverable_ref": "каталог с фильтрами"}, rows, {1}) is None
+
+
+# ---------- уборка сирот ----------
+
+async def test_prune_removes_only_untouched_orphans(db):
+    """Удаляем след планировщика, но не следы работы."""
+    from autopilot.db import Run
+    from autopilot.manual import NEEDS_HUMAN, prunable, prune
+
+    p = await with_brief()
+    await Planner(client=FakeAnthropic(plan_reply(
+        task("Каталог", "каталог с фильтрами"),
+        task("Корзина", "корзина и оформление заказа")))).plan(p)
+
+    async with Session() as s:
+        rows = {t.title: t for t in
+                (await s.execute(select(Task).where(Task.project_id == p.id,
+                                                    Task.lane == "build"))).scalars()}
+        # чистая сирота: план передумал, работы по ней не было
+        rows["Каталог"].orphaned = True
+        # сирота с историей: её делали и она упёрлась в человека
+        rows["Корзина"].orphaned = True
+        rows["Корзина"].attempts = 2
+        rows["Корзина"].status = NEEDS_HUMAN
+        s.add(Run(task_id=rows["Корзина"].id, kind="execute", ok=True, backend="cli"))
+        await s.commit()
+        clean_id, worked_id = rows["Каталог"].id, rows["Корзина"].id
+
+    safe, keep = await prunable(p.id)
+    assert [t.id for t in safe] == [clean_id]
+    assert [t.id for t in keep] == [worked_id]
+
+    # примерка ничего не трогает
+    await prune(p.id, apply=False)
+    async with Session() as s:
+        assert await s.get(Task, clean_id) is not None
+
+    removed, kept = await prune(p.id, apply=True)
+    assert (removed, kept) == (1, 1)
+    async with Session() as s:
+        assert await s.get(Task, clean_id) is None, "чистая сирота осталась"
+        assert await s.get(Task, worked_id) is not None, "стёрт след настоящей работы"
+
+
+async def test_prune_leaves_live_tasks_alone(db):
+    """Живые задачи уборка не видит вовсе."""
+    from autopilot.manual import prunable
+
+    p = await with_brief()
+    await Planner(client=FakeAnthropic(plan_reply(
+        task("Каталог", "каталог с фильтрами")))).plan(p)
+
+    safe, keep = await prunable(p.id)
+    assert (safe, keep) == ([], [])

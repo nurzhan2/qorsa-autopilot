@@ -12,7 +12,8 @@ import logging
 from sqlalchemy import select, update
 
 from .config import cfg
-from .db import AccessItem, Project, Session, Task, decayed_units, spent_today, utcnow
+from .db import (AccessItem, Project, Session, Task, cli_spent_today,
+                 decayed_units, spent_today, utcnow)
 from . import limits
 from .llm import LimitReached
 from .manual import NEEDS_HUMAN, needs_human, unproven_note
@@ -114,12 +115,23 @@ class Scheduler:
 
     async def tick(self) -> None:
         """Один проход по всем полосам. Вынесен из run(), чтобы дёргать поштучно из тестов."""
-        over_budget = await spent_today() >= cfg.daily_budget_usd
+        # Два потолка, и они меряют РАЗНЫЕ ресурсы: кошелёк и окно подписки.
+        # Складывать их нельзя (см. db.spent_today), а сравнивать надо оба:
+        # с тех пор как исполнитель платит подпиской, денежный счётчик на
+        # ней показывает ноль и один не удержал бы ничего
+        money, subscription = await spent_today(), await cli_spent_today()
+        over_money = money >= cfg.daily_budget_usd
+        over_cli = subscription >= cfg.daily_cli_budget_usd
+        over_budget = over_money or over_cli
         if over_budget and not self.budget_paused:
-            log.warning("СУТОЧНЫЙ БЮДЖЕТ ИСЧЕРПАН ($%.2f) — пауза build/verify, chat работает",
-                        cfg.daily_budget_usd)
+            log.warning("СУТОЧНЫЙ ПОТОЛОК ИСЧЕРПАН (%s) — пауза build/verify, "
+                        "chat работает",
+                        f"деньги ${money:.2f} из ${cfg.daily_budget_usd:.2f}"
+                        if over_money else
+                        f"подписка ~${subscription:.2f} из "
+                        f"${cfg.daily_cli_budget_usd:.2f} оценочно")
         elif self.budget_paused and not over_budget:
-            log.info("бюджет снова в норме — build/verify разморожены")
+            log.info("потолок снова не задет — build/verify разморожены")
         self.budget_paused = over_budget
 
         await self._sync_access()
@@ -153,6 +165,18 @@ class Scheduler:
         quota = self.free_slots(lane)
 
         while quota > 0 and self.free_slots(lane) > 0:
+            # Окно могло закрыться ПРЯМО СЕЙЧАС, посреди этого же тика.
+            #
+            # Проверка в начале tick() от этого не спасает: задача, которую
+            # `_on_limit` вернул в очередь, снова становится `ready`, и
+            # следующий проход цикла подхватывает её же — в закрытое окно,
+            # немедленно, до всякой паузы. Поймано плавающим тестом: три тика
+            # давали четыре вызова судьи. В бою это значит, что при упоре
+            # в квоту мы не встаём, а долбимся в стену столько раз, сколько
+            # свободно слотов, сжигая остаток окна на заведомо пустые попытки
+            if lane in PAID_LANES and limits.state.blocked():
+                log.debug("окно закрылось посреди тика — полоса %s встаёт", lane)
+                return
             quota -= 1
             pair = await self._pick(lane, exclusive)
             if pair is None:
@@ -162,6 +186,18 @@ class Scheduler:
             if not await self._claim(task.id):
                 # снимок из _pick устарел: задачу уже забрали. Берём следующую
                 continue
+
+            # ПОСЛЕДНЯЯ проверка, и она обязательна: между проверкой наверху
+            # и этой строкой два await'а, а окно закрывается в чужой корутине.
+            # Первая версия заслона стояла только в начале прохода — и упор,
+            # случившийся во время `_pick`, всё равно пропускал ещё один вызов
+            # в закрытое окно. Задачу возвращаем ровно туда, откуда взяли:
+            # работать по ней мы не начали
+            if lane in PAID_LANES and limits.state.blocked():
+                await self._release(task.id)
+                log.debug("окно закрылось, пока выбирали задачу %s — вернул "
+                          "в очередь", task.id)
+                return
 
             self.running[lane] += 1
             self.inflight.add(task.id)
@@ -259,6 +295,19 @@ class Scheduler:
                 .values(status="running", updated_at=utcnow()))
             await s.commit()
             return res.rowcount == 1
+
+    async def _release(self, task_id: int) -> None:
+        """Вернуть захваченную, но не начатую задачу в очередь как было.
+
+        Ни попытки, ни дефекта: по задаче ничего не делали. То же, что
+        `_on_limit`, но без записи о неудаче — её не было.
+        """
+        async with Session() as s:
+            await s.execute(
+                update(Task)
+                .where(Task.id == task_id, Task.status == "running")
+                .values(status="ready", updated_at=utcnow()))
+            await s.commit()
 
     async def _work(self, lane: str, task: Task, project: Project, exclusive: bool) -> None:
         started = utcnow()

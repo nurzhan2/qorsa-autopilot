@@ -84,6 +84,53 @@ def describe(task: Task) -> str:
     return "\n".join(lines)
 
 
+async def prunable(project_id: int) -> tuple[list[Task], list[Task]]:
+    """Осиротевшие задачи: что можно удалить и что придётся оставить.
+
+    Удаляем только то, по чему НИЧЕГО не происходило: ни попыток, ни строк
+    расхода, ни ручного закрытия. Такая задача — чистый след прошлого
+    прогона планировщика, и держать её значит топить живой план в мусоре:
+    на проекте 8 их накопилось 84 при 26 живых.
+
+    Всё, у чего есть история, остаётся. Сирота с попытками или с расходом —
+    это работа, которую делали и за которую платили, а не опечатка
+    планировщика; удалить её значит стереть единственный след того, что она
+    была. Такие показываем отдельно, решать по ним человеку.
+    """
+    from .db import Run
+
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Task).where(Task.project_id == project_id,
+                               Task.orphaned.is_(True))
+            .order_by(Task.id))).scalars().all()
+        with_runs = set((await s.execute(
+            select(Run.task_id).where(Run.task_id.in_([t.id for t in rows] or [0]))
+        )).scalars().all())
+
+    safe, keep = [], []
+    for t in rows:
+        touched = (t.attempts or 0) > 0 or t.id in with_runs \
+            or t.status in ("done", "escalated", NEEDS_HUMAN) \
+            or bool(t.defects) or bool(t.cc_session_id)
+        (keep if touched else safe).append(t)
+    return safe, keep
+
+
+async def prune(project_id: int, apply: bool = False) -> tuple[int, int]:
+    """Удалить безопасные сироты. Без `apply` только считает."""
+    from sqlalchemy import delete
+
+    safe, keep = await prunable(project_id)
+    if apply and safe:
+        async with Session() as s:
+            await s.execute(delete(Task).where(Task.id.in_([t.id for t in safe])))
+            await s.commit()
+        log.warning("проект %s: удалено осиротевших задач без истории — %s",
+                    project_id, len(safe))
+    return len(safe), len(keep)
+
+
 async def pending(project_id: int | None = None) -> list[Task]:
     """Что ждёт живых рук: manual/external и всё, что упёрлось в needs_human."""
     async with Session() as s:

@@ -613,3 +613,137 @@ def test_real_quota_wall_is_still_detected(monkeypatch):
     with pytest.raises(LimitReached) as exc:
         asyncio.run(CliBackend().ask("вопрос"))
     assert exc.value.retry_after == 2 * 3600
+
+
+# ---------- второй тормоз: расход подписки ----------
+
+async def test_subscription_budget_stops_build(db, monkeypatch):
+    """У build должен остаться ограничитель и после перехода на подписку.
+
+    Раньше исполнитель писал свой расход как `backend="api"`, и его держал
+    денежный потолок. Это было неправдой: сессия Claude Code денег не тратит.
+    Стоило записать её честно — и у полосы не осталось бы вообще никакого
+    тормоза, потому что `spent_today()` на подписке всегда ноль.
+    """
+    from autopilot.db import cli_spent_today, spent_today
+    from conftest import make_tasks
+
+    p = await make_project()
+    await make_tasks(p.id, 2, lane="build")
+    await make_tasks(p.id, 2, lane="verify", start_idx=10)
+    await make_tasks(p.id, 2, lane="chat", start_idx=20)
+
+    monkeypatch.setattr(cfg, "daily_cli_budget_usd", 1.0)
+    async with Session() as s:
+        s.add(Run(task_id=1, kind="execute", ok=True, backend="cli", cost_usd=5.0))
+        await s.commit()
+
+    assert await spent_today() == 0.0, "подписка просочилась в денежный счётчик"
+    assert await cli_spent_today() == 5.0
+
+    ex, ver, comm = FakeExecutor(), FakeVerifier(), FakeCommunicator()
+    sched = Scheduler(ex, ver, comm)
+    await sched.tick()
+    await sched.drain()
+
+    assert sched.budget_paused is True
+    assert ex.calls == [], "build поехал при исчерпанном потолке подписки"
+    assert ver.calls == [], "verify поехал при исчерпанном потолке подписки"
+    assert comm.processed, "chat должен работать всегда"
+
+
+async def test_money_budget_untouched_by_subscription(db, monkeypatch):
+    """Обратная сторона: расход подписки не съедает денежный бюджет.
+
+    Иначе суточный бюджет вставал бы на пустом месте — всё идёт по подписке,
+    не потрачено ни рубля, а работа остановлена.
+    """
+    from conftest import make_tasks
+
+    p = await make_project()
+    await make_tasks(p.id, 2, lane="build")
+
+    monkeypatch.setattr(cfg, "daily_budget_usd", 1.0)
+    monkeypatch.setattr(cfg, "daily_cli_budget_usd", 1000.0)
+    async with Session() as s:
+        s.add(Run(task_id=1, kind="execute", ok=True, backend="cli", cost_usd=50.0))
+        await s.commit()
+
+    ex = FakeExecutor()
+    sched = Scheduler(ex, FakeVerifier(), FakeCommunicator())
+    await sched.tick()
+    await sched.drain()
+
+    assert sched.budget_paused is False, "подписка засчитана как деньги"
+    assert ex.calls, "build встал, хотя денег не потрачено"
+
+
+async def test_executor_writes_subscription_not_money(db):
+    """Строка расхода исполнителя помечена подпиской, а не деньгами."""
+    from autopilot import executor as ex_mod
+
+    assert ex_mod.RUN_BACKEND == "cli", (
+        "сессия Claude Code идёт по подписке — писать её как деньги значит "
+        "врать в обе стороны сразу")
+
+
+async def test_limit_stops_dispatch_inside_the_same_tick(db, monkeypatch):
+    """Упор в квоту останавливает выдачу немедленно, а не со следующего тика.
+
+    Гонка, найденная плавающим тестом: `_on_limit` возвращает задачу в очередь
+    как `ready`, и тот же самый проход `_dispatch` подхватывает её снова —
+    в уже закрытое окно. Три тика давали четыре вызова судьи.
+
+    В бою это опаснее, чем красный тест: правило «упёрлись — встала вся
+    работа» переставало работать ровно в тот момент, ради которого писалось,
+    и остаток окна сгорал на заведомо пустых попытках.
+    """
+    from conftest import make_tasks
+
+    p = await make_project()
+    await make_tasks(p.id, 3, lane="verify")
+
+    ver = LimitedVerifier()
+    sched = Scheduler(FakeExecutor(), ver, FakeCommunicator())
+    await sched.tick()
+    await sched.drain()
+
+    assert ver.calls == 1, (
+        f"после упора в квоту в том же тике сделано ещё {ver.calls - 1} "
+        f"вызовов в закрытое окно")
+
+
+async def test_service_task_is_reused_not_bred(db):
+    """Якорь для расхода — один на проект, а не по одному на каждый вызов.
+
+    На проекте 8 их накопилось 35 штук: по одной служебной задаче на каждое
+    обращение к модели. Расход всё равно живёт в `Run`, задача нужна только
+    затем, чтобы было к чему его привязать.
+    """
+    from sqlalchemy import select
+
+    from autopilot.brief import Brief
+    from autopilot.db import Run
+
+    project = await make_project()
+
+    class Quiet:
+        name = "cli"
+
+        async def ask(self, prompt, *, system="", model="", max_tokens=8000,
+                      content=None):
+            return Reply(text="{}", backend="cli", seconds=1.0, cost_usd=0.01)
+
+    brief = Brief(backend=Quiet())
+    for _ in range(3):
+        await brief._call("промпт", None, project.id)
+
+    async with Session() as s:
+        anchors = (await s.execute(
+            select(Task).where(Task.project_id == project.id,
+                               Task.lane == "chat"))).scalars().all()
+        runs = (await s.execute(select(Run))).scalars().all()
+
+    assert len(anchors) == 1, f"на три вызова заведено {len(anchors)} служебных задач"
+    assert len(runs) == 3, "а вот строк расхода должно быть по одной на вызов"
+    assert {r.task_id for r in runs} == {anchors[0].id}

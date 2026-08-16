@@ -41,7 +41,7 @@ from sqlalchemy import select
 from . import guard
 from .config import cfg
 from .db import (AccessItem, ChatMessage, Project, Session, Task, close_run,
-                 open_run, utcnow)
+                 open_run, service_task, utcnow)
 from . import llm
 from .llm import LimitReached
 from .roles import CLIENT, OWNER
@@ -608,12 +608,14 @@ class Brief:
         return reply.text, reply.stop_reason
 
     async def _service_task(self, project_id: int) -> int:
-        async with Session() as s:
-            t = Task(project_id=project_id, lane="chat", title="сбор ТЗ",
-                     status="done")
-            s.add(t)
-            await s.commit()
-            return t.id
+        """Якорь для строк расхода. ОДИН на проект, а не по одному на вызов.
+
+        `Run` требует `task_id`, и раньше каждый вызов заводил новую служебную
+        задачу. На проекте 8 их накопилось 35 штук — по одной на каждое
+        обращение к модели. Расход при этом всё равно живёт в `Run`, задача
+        нужна только чтобы было к чему его привязать.
+        """
+        return await service_task(project_id, "сбор ТЗ")
 
     async def _charge(self, reply, task_id: int, project_id: int, run_id: int) -> None:
         """Записывает расход. Для CLI это оценка, а не списание — см. llm.Reply."""
@@ -1484,9 +1486,14 @@ class BriefRunner:
             await asyncio.sleep(self.interval)
 
     async def tick(self) -> int:
-        from .db import spent_today
+        from .db import cli_spent_today, spent_today
+        # Оба потолка: деньги и подписка. Бриф на CLI ест то же окно, что
+        # и build, и не считать его значит оставить окно без присмотра
         if await spent_today() >= cfg.daily_budget_usd:
-            log.debug("бюджет исчерпан — бриф не пересобираю")
+            log.debug("суточный бюджет денег исчерпан — бриф не пересобираю")
+            return 0
+        if await cli_spent_today() >= cfg.daily_cli_budget_usd:
+            log.debug("суточный потолок подписки исчерпан — бриф не пересобираю")
             return 0
 
         async with Session() as s:
