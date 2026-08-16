@@ -243,7 +243,7 @@ def test_cli_never_resumes_and_has_no_tools(monkeypatch):
         class P:
             returncode = 0
 
-            async def communicate(self):
+            async def communicate(self, input=None):
                 return (b'{"result": "{\\"verdict\\": \\"PASS\\"}", '
                         b'"total_cost_usd": 0.01, "usage": {}}', b"")
         return P()
@@ -257,7 +257,13 @@ def test_cli_never_resumes_and_has_no_tools(monkeypatch):
     assert "--resume" not in args, "судья продолжил чужую сессию — он оценит свою работу"
     assert "--max-turns" in args and args[args.index("--max-turns") + 1] == "1"
     assert args[args.index("--allowedTools") + 1] == "", "инструменты не отключены"
-    assert "Bash" in args[args.index("--disallowedTools") + 1]
+    # --disallowedTools НЕ передаём: перечисление инструментов по именам
+    # подтягивает их описания и учетверяет расход кэша (26k против 6.7k)
+    assert "--disallowedTools" not in args
+    # системный промпт ЗАМЕНЯЕТСЯ, а не дописывается, и динамические секции
+    # выключены — иначе каждый вызов создаёт ~40k токенов кэша впустую
+    assert "--system-prompt" in args and "--append-system-prompt" not in args
+    assert "--exclude-dynamic-system-prompt-sections" in args
     assert args[args.index("--model") + 1] == cfg.cli_model
     assert "opus" not in " ".join(args).lower(), "поднят Opus — квота нужна владельцу"
     # каталог временный: в репозитории проекта CLI подхватил бы чужой CLAUDE.md
@@ -277,7 +283,7 @@ def test_cli_limit_becomes_limit_reached(monkeypatch):
         class P:
             returncode = 1
 
-            async def communicate(self):
+            async def communicate(self, input=None):
                 return (b"", "Usage limit reached, resets in 3h".encode())
         return P()
 
@@ -360,3 +366,90 @@ async def test_cc_max_concurrent_caps_both_lanes(db, monkeypatch):
     assert sched.free_slots("build") == 0, "build полез поверх лимита сессий"
     # chat к Claude Code не ходит — его этот потолок не касается
     assert sched.free_slots("chat") == cfg.lane_limits["chat"]
+
+
+# ---------- живой CLI: то, на чём он падал ----------
+
+def test_prompt_goes_via_stdin_not_argv(monkeypatch):
+    """Промпт передаётся В STDIN, а не аргументом командной строки.
+
+    На Windows npm ставит claude как .CMD, запуск шёл через cmd.exe, а у него
+    командная строка ограничена 8191 символом. Промпт брифа — пятнадцать тысяч,
+    и вызов падал с обрубленной абракадаброй вместо внятной ошибки: cmd ещё
+    и калечил кириллицу.
+    """
+    seen = {}
+    long_prompt = "Требования клиента. " * 2000          # ~40 тысяч символов
+
+    async def fake_exec(*args, **kwargs):
+        seen["args"] = args
+        seen["stdin"] = kwargs.get("stdin")
+
+        class P:
+            returncode = 0
+
+            async def communicate(self, input=None):
+                seen["input"] = input
+                return (b'{"result": "ok", "total_cost_usd": 0.01, "usage": {}}', b"")
+        return P()
+
+    monkeypatch.setattr("shutil.which", lambda *a: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    asyncio.run(CliBackend().ask(long_prompt))
+
+    assert long_prompt not in " ".join(str(a) for a in seen["args"]), (
+        "длинный промпт уехал в argv — упрётся в лимит командной строки")
+    assert seen["input"] == long_prompt.encode("utf-8"), "промпт не ушёл в stdin"
+    assert seen["stdin"] is not None
+
+
+def test_windows_cmd_wrapper_resolved_to_real_exe(monkeypatch, tmp_path):
+    """`claude.CMD` — обёртка, которую CreateProcess запустить не может.
+
+    Рядом лежит настоящий claude.exe: берём его и обходимся без cmd.exe,
+    у которого и лимит строки, и порча кодировки.
+    """
+    from autopilot import llm as L
+
+    npm = tmp_path / "npm"
+    real = npm / "node_modules" / "@anthropic-ai" / "claude-code" / "bin"
+    real.mkdir(parents=True)
+    (real / "claude.exe").write_text("", encoding="utf-8")
+    wrapper = npm / "claude.CMD"
+    wrapper.write_text("@echo off", encoding="utf-8")
+
+    monkeypatch.setattr("shutil.which", lambda *a: str(wrapper))
+    resolved, launcher = L.resolve_cli("claude")
+    assert resolved.endswith("claude.exe") and launcher == [], (
+        "не нашли настоящий бинарь — пойдём через cmd.exe с его лимитами")
+
+    # настоящего бинаря нет — деваться некуда, идём через интерпретатор
+    (real / "claude.exe").unlink()
+    resolved, launcher = L.resolve_cli("claude")
+    assert resolved == str(wrapper) and launcher and "cmd" in launcher[0].lower()
+
+
+def test_reply_reports_actual_model(monkeypatch):
+    """Какая модель отвечала НА САМОМ ДЕЛЕ, а не какую мы просили.
+
+    CLI по умолчанию берёт Opus, чья недельная квота на порядок меньше
+    и нужна владельцу. Проверять надо по факту.
+    """
+    async def fake_exec(*args, **kwargs):
+        class P:
+            returncode = 0
+
+            async def communicate(self, input=None):
+                return (b'{"result": "ok", "total_cost_usd": 0.05, '
+                        b'"usage": {"cache_creation_input_tokens": 7000}, '
+                        b'"modelUsage": {"claude-sonnet-5": {}}}', b"")
+        return P()
+
+    monkeypatch.setattr("shutil.which", lambda *a: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    reply = asyncio.run(CliBackend().ask("вопрос"))
+    assert reply.models == ("claude-sonnet-5",)
+    assert "sonnet" in reply.model_names and "opus" not in reply.model_names
+    assert reply.cache_creation_tokens == 7000
