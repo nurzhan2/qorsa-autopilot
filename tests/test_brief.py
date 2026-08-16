@@ -477,3 +477,84 @@ async def test_payment_feature_is_not_commerce(db):
     assert "страница про доставку и оплату" in texts
     assert not any("450 000" in t for t in texts)
     assert data["goal"] is not None, "цель выброшена из-за слова «оплата»"
+
+
+# ---------- решения владельца: поставлены руками, прогоном не сносятся ----------
+
+CURATED_STACK = {
+    "text": "Бэкенд: FastAPI + PostgreSQL, монолит",
+    "evidence": [],
+    "curated": "решение владельца, не из переписки",
+}
+
+
+async def test_curated_item_needs_no_evidence(db):
+    """Правило evidence — против выдумок МОДЕЛИ, а не против решений человека.
+
+    Владелец вправе зафиксировать то, чего клиент не говорил: стек, например.
+    Без этого исключения зафиксированный стек вылетал бы на первой же проверке
+    как «ссылок нет».
+    """
+    p = await make_project()
+    await add_msg(p.id, "1", "нужен интернет-магазин с каталогом")
+    async with Session() as s:
+        messages = (await s.execute(select(ChatMessage))).scalars().all()
+
+    data = {"goal": None, "deliverables": [], "stack": [dict(CURATED_STACK)],
+            "constraints": [], "assets": [], "access_needed": [],
+            "open_questions": [], "out_of_scope": [], "confidence": 0.9}
+    checked, dropped = Brief().apply_evidence(data, messages)
+
+    assert len(checked["stack"]) == 1, f"решение владельца выброшено: {dropped}"
+    assert checked["stack"][0]["origin"] == "owner"
+    assert not dropped
+
+
+async def test_curated_survives_full_rebuild(db):
+    """Полный пересбор начинает с чистого листа — и стирал выбор архитектуры.
+
+    Три прогона планировщика подряд дали три разные архитектуры именно
+    поэтому: модель каждый раз выбирала её заново.
+    """
+    p = await make_project()
+    await add_msg(p.id, "1", "нужен интернет-магазин с каталогом товаров")
+
+    # владелец зафиксировал стек руками
+    async with Session() as s:
+        row = await s.get(Project, p.id)
+        row.brief = {"brief": {"deliverables": [], "stack": [dict(CURATED_STACK)],
+                               "constraints": [], "assets": [], "access_needed": [],
+                               "open_questions": [], "out_of_scope": [],
+                               "goal": None, "confidence": 0.9}}
+        await s.commit()
+        p = await s.get(Project, p.id)
+
+    # модель на пересборе про этот стек ничего не знает и предлагает своё
+    fake = FakeAnthropic(reply(
+        deliverables=[{"text": "каталог товаров", "evidence": ev("1")}],
+        stack=[{"text": "WordPress + WooCommerce", "evidence": ev("1")}]))
+    data = await Brief(client=fake).build(p)
+
+    texts = [i["text"] for i in data["stack"]]
+    assert "Бэкенд: FastAPI + PostgreSQL, монолит" in texts, (
+        f"зафиксированный владельцем стек снесён пересбором: {texts}")
+    kept = next(i for i in data["stack"] if i.get("curated"))
+    assert not kept.get("missing"), "решение владельца помечено как неподтверждённое"
+
+
+def test_curated_extract_and_restore():
+    """Выемка и возврат — то, чем brief_eval защищает решения человека."""
+    from autopilot.brief import curated_items, restore_curated
+
+    brief = {"stack": [dict(CURATED_STACK), {"text": "Redis", "evidence": []}],
+             "deliverables": [{"text": "каталог", "evidence": []}]}
+    manual = curated_items(brief)
+    assert list(manual) == ["stack"] and len(manual["stack"]) == 1
+
+    # возвращаем в пустой бриф — как после обнуления в brief_eval
+    restored = restore_curated({}, manual)
+    assert restored["stack"][0]["text"] == CURATED_STACK["text"]
+
+    # и не плодим дубль, если модель назвала то же самое
+    again = restore_curated({"stack": [dict(CURATED_STACK)]}, manual)
+    assert len(again["stack"]) == 1

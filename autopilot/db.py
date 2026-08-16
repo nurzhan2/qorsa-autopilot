@@ -347,6 +347,11 @@ class Run(Base):
     # процесс убили на середине. Отличать эти два состояния от нормального
     # прогона нужно глазами, поэтому колонка отдельная
     finished_at: Mapped[dt.datetime | None] = mapped_column(default=None)
+    # Стоимость не измерена, а ОЦЕНЕНА по времени вызова. Так бывает у
+    # оборванных вызовов: ответа нет, а квота сожжена. Смешивать догадку
+    # с замером нельзя — иначе через месяц не отличить одно от другого
+    cost_estimated: Mapped[bool] = mapped_column(default=False,
+                                                 server_default=text("0"))
 
 
 engine = create_async_engine(cfg.db_url, echo=False)
@@ -487,7 +492,8 @@ async def open_run(task_id: int, kind: str) -> int:
 
 
 async def close_run(run_id: int, *, ok: bool, backend: str, cost_usd: float,
-                    seconds: float, log_path: str = "") -> None:
+                    seconds: float, log_path: str = "",
+                    estimated: bool = False) -> None:
     """Дописать в строку то, что стало известно после вызова."""
     async with Session() as s:
         row = await s.get(Run, run_id)
@@ -496,6 +502,7 @@ async def close_run(run_id: int, *, ok: bool, backend: str, cost_usd: float,
         row.ok = ok
         row.backend = backend
         row.cost_usd = cost_usd
+        row.cost_estimated = estimated
         row.seconds = seconds
         if log_path:
             row.log_path = log_path

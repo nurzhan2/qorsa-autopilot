@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses as dc
+import datetime as dt
 import json
 import logging
 import os
@@ -36,7 +37,7 @@ import tempfile
 import time
 
 from . import guard
-from .config import cfg
+from .config import _num, cfg
 from .vault import anthropic_key, missing_secret_message
 
 log = logging.getLogger("llm")
@@ -47,7 +48,13 @@ API, CLI = "api", "cli"
 # Отличать обязательно: упор — это «подожди», ошибка — это «почини».
 LIMIT_MARKERS = (
     "usage limit", "rate limit", "quota", "limit reached", "limit exceeded",
-    "too many requests", "resets at", "try again later", "overloaded",
+    "too many requests", "try again later", "overloaded",
+    # Живой текст CLI: «You've hit your session limit · resets 5:50pm».
+    # Ни один из прежних маркеров под него не подошёл: там «session limit»,
+    # а не «usage limit», и «resets 5:50pm», а не «resets at». Упор приняли
+    # за поломку модели — то самое, ради чего этот список и заведён.
+    # В бою это стоило бы задаче засчитанной попытки и дороги в эскалацию.
+    "session limit", "hit your limit", "resets",
     "лимит", "превышен", "исчерпан",
 )
 
@@ -102,6 +109,24 @@ class Reply:
         return self.backend == API
 
 
+def estimated_cost(seconds: float) -> float:
+    """Во что обошёлся вызов, у которого НЕ БЫЛО ответа.
+
+    Оборванный вызов квоту жжёт, а сказать, сколько именно, некому: цифру
+    отдаёт CLI вместе с ответом, которого нет. Раньше в такую строку писался
+    ноль, и два получасовых таймаута на плане проекта 8 не сдвинули суточный
+    потолок подписки ни на цент — то есть тормоз не работал ровно там, где
+    был нужен.
+
+    Считаем по времени. Ставка снята с успешных прогонов: план — $0.93 за
+    11.3 минуты, бриф — $0.32 за 3.7 минуты, то есть около $0.08 в минуту.
+    Это заведомо грубо и заведомо занижено для коротких вызовов (там велика
+    доля кэша), но ноль неверен всегда, а эта цифра — лишь иногда.
+    """
+    rate = _num("CLI_COST_PER_MINUTE_USD", 0.08, float)
+    return max(0.0, float(seconds) / 60.0 * rate)
+
+
 def backend_for(consumer: str) -> str:
     """Какой бэкенд у этого потребителя: brief | plan | judge."""
     value = str(getattr(cfg, f"llm_backend_{consumer}", "") or cfg.llm_backend).strip().lower()
@@ -122,18 +147,48 @@ def looks_like_limit(text: str, returncode: int | None = None) -> bool:
     return returncode == 429
 
 
-def retry_after_from(text: str) -> float | None:
-    """Когда сбрасывается окно, если CLI это сказал."""
-    m = re.search(r"resets?\s+(?:at|in)\s+([^\n.]+)", str(text or ""), re.IGNORECASE)
-    if not m:
+def retry_after_from(text: str, now: dt.datetime | None = None) -> float | None:
+    """Когда сбрасывается окно, если CLI это сказал.
+
+    Две формы, обе живые:
+
+    * «resets in 3h» — сколько ждать, считаем напрямую;
+    * «resets 5:50pm (Asia/Qyzylorda)» — ВРЕМЯ, а не длительность. Разбирать
+      обязательно: без этого пауза берётся с потолка, и мы либо ломимся
+      в закрытую дверь, либо стоим лишний час впустую.
+
+    Часовой пояс из скобок игнорируем намеренно: CLI печатает его по
+    локальным настройкам той же машины, где мы работаем.
+    """
+    body = str(text or "")
+    m = re.search(r"resets?\s+(?:at|in)\s+([^\n.]+)", body, re.IGNORECASE)
+    if m:
+        tail = m.group(1)
+        hours = re.search(r"(\d+)\s*h", tail, re.IGNORECASE)
+        mins = re.search(r"(\d+)\s*m(?!\w)", tail, re.IGNORECASE)
+        if hours or mins:
+            return (int(hours.group(1)) * 3600 if hours else 0) + \
+                   (int(mins.group(1)) * 60 if mins else 0)
+
+    clock = re.search(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
+                      body, re.IGNORECASE)
+    if not clock:
         return None
-    tail = m.group(1)
-    hours = re.search(r"(\d+)\s*h", tail, re.IGNORECASE)
-    mins = re.search(r"(\d+)\s*m", tail, re.IGNORECASE)
-    if hours or mins:
-        return (int(hours.group(1)) * 3600 if hours else 0) + \
-               (int(mins.group(1)) * 60 if mins else 0)
-    return None
+    hour = int(clock.group(1))
+    minute = int(clock.group(2) or 0)
+    suffix = (clock.group(3) or "").lower()
+    if suffix == "pm" and hour < 12:
+        hour += 12
+    elif suffix == "am" and hour == 12:
+        hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+
+    current = now or dt.datetime.now()
+    target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= current:
+        target += dt.timedelta(days=1)      # окно откроется завтра
+    return (target - current).total_seconds()
 
 
 # ---------- реализации ----------
@@ -275,11 +330,23 @@ class CliBackend:
         # Каталог временный: в репозитории проекта CLI подхватил бы его
         # CLAUDE.md и настройки, а нам нужен чистый вызов
         workdir = tempfile.mkdtemp(prefix="qorsa-llm-")
+
+        # Потолок ответа у CLI ЕСТЬ, и передаётся он не флагом, а переменной
+        # окружения. Раньше здесь было записано, что CLI `max_tokens` не
+        # принимает вовсе, — это была ошибка, и стоила она двух получасовых
+        # прогонов и одного вот такого ответа:
+        #   «API Error: Claude's response exceeded the 32000 output token
+        #    maximum. To configure this behavior, set the
+        #    CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.»
+        # Без этой строки наши BRIEF_MAX_TOKENS и PLAN_MAX_TOKENS работали
+        # только на API, а на подписке молча не значили ничего.
+        env = {**os.environ, "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(int(max_tokens))}
+
         t0 = time.monotonic()
         proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
-                *args, cwd=workdir, stdin=asyncio.subprocess.PIPE,
+                *args, cwd=workdir, env=env, stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             # Дочерний claude не должен пережить родителя ни при каких
             # обстоятельствах: осиротевший процесс продолжает жечь ту же

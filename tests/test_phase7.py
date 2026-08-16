@@ -294,7 +294,7 @@ async def test_tight_frame_forbids_heavy_architecture(db, monkeypatch):
     planner = P.Planner(client=object(), communicator=FakeCommunicator())
     seen = {}
 
-    async def fake_attempt(prompt, proj):
+    async def fake_attempt(prompt, proj, brief=None):
         seen["prompt"] = prompt
         return ([{"title": "Собрать монолит", "deliverable_ref": "Клиентское приложение",
                   "acceptance": [{"type": "file_exists", "path": "package.json"}],
@@ -343,7 +343,7 @@ async def test_planner_plans_when_stack_is_declared(db, monkeypatch):
 
     planner = P.Planner(client=object(), communicator=FakeCommunicator())
 
-    async def fake_attempt(prompt, proj):
+    async def fake_attempt(prompt, proj, brief=None):
         assert "WordPress" in prompt, "стек из ТЗ не доехал до планировщика"
         return ([{"title": "Установить WooCommerce", "deliverable_ref": "Каталог",
                   "acceptance": [{"type": "file_exists", "path": "wp-config.php"}],

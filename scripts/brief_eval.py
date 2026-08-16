@@ -40,7 +40,8 @@ from sqlalchemy import func, select                                    # noqa: E
 
 from autopilot.brief import (LIST_FIELDS, ORIGIN_CONFIRMED, Brief,      # noqa: E402
                              _msg_key, agreement, check_coverage,
-                             missing_items, parse_requirements)
+                             curated_items, missing_items, parse_requirements,
+                             restore_curated)
 from autopilot import guard                                            # noqa: E402
 from autopilot.config import cfg
 from autopilot.llm import LimitReached, LLMError                                       # noqa: E402
@@ -161,6 +162,11 @@ async def show_chat(project_id: int) -> list[ChatMessage]:
 
 def _mark(item: dict) -> str:
     bits = []
+    if item.get("curated"):
+        # Решение владельца, а не находка модели. Видеть это надо сразу:
+        # такой пункт не подтверждается перепиской и не должен вводить
+        # в заблуждение при чтении брифа
+        bits.append("✋ ПОСТАВЛЕНО РУКАМИ")
     if item.get("origin") == ORIGIN_CONFIRMED:
         bits.append("⚑ ПОДТВЕРЖДЁННОЕ ПРЕДЛОЖЕНИЕ")
     if item.get("missing"):
@@ -375,12 +381,21 @@ async def _run_locked(project, project_id: int, stub: bool, draft: bool) -> int:
     # Прежнее состояние запоминаем — неудачный прогон обязан его вернуть.
     # Иначе диагностика уничтожает ровно то, что диагностирует: один упавший
     # прогон уже стирал собранный бриф проекта 8 подчистую.
+    # Обнуляем ТОЛЬКО то, что производит модель. Решения владельца
+    # (curated-пункты — зафиксированный стек, например) переживают полный
+    # пересбор: они поставлены человеком и от прогона не зависят. Без этого
+    # каждый прогон brief_eval стирал выбор архитектуры, и планировщик
+    # выбирал её заново — три прогона подряд дали три разные.
     async with Session() as s:
         p = await s.get(Project, project_id)
         saved = (p.brief, p.brief_ready, p.status)
-        p.brief = {}
+        manual = curated_items((p.brief or {}).get("brief") if isinstance(p.brief, dict) else None)
+        p.brief = {"brief": restore_curated({}, manual)} if manual else {}
         await s.commit()
         project = await s.get(Project, project_id)
+    if manual:
+        print(f"\n[решений владельца сохранено на пересбор: "
+              f"{sum(len(v) for v in manual.values())}]")
 
     try:
         data = await brief.build(project)

@@ -322,6 +322,19 @@ async def m010_run_finished_at(conn) -> None:
     await _add_column(conn, "runs", "finished_at", "DATETIME")
 
 
+async def m011_cost_estimated(conn) -> None:
+    """Стоимость измерена или оценена — это разные вещи.
+
+    У оборванного вызова ответа нет, а вместе с ним нет и цифры расхода.
+    Писать ноль неверно: квоту он сжёг. Пишем оценку по времени и помечаем
+    её, чтобы через месяц догадку нельзя было принять за замер.
+    """
+    await ensure_tables(conn)
+    await _add_column(conn, "runs", "cost_estimated", "BOOLEAN DEFAULT 0")
+    await conn.execute(text(
+        "UPDATE runs SET cost_estimated = 0 WHERE cost_estimated IS NULL"))
+
+
 MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline: схема фазы 1", m001_baseline),
     (2, "ingest: переписка, транспорты, привязка чатов", m002_ingest),
@@ -333,6 +346,7 @@ MIGRATIONS: list[tuple[int, str, object]] = [
     (8, "учёт: чем платили за вызов модели", m008_llm_backend),
     (9, "приёмка: замечания судьи вне критерия", m009_judge_observations),
     (10, "учёт: прогон знает своё начало и свой конец", m010_run_finished_at),
+    (11, "учёт: стоимость измерена или оценена по времени", m011_cost_estimated),
 ]
 
 
