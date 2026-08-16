@@ -82,6 +82,17 @@ class Reply:
     output_tokens: int = 0
     backend: str = API
     seconds: float = 0.0
+    # Какая модель РЕАЛЬНО отвечала. Не то же самое, что мы попросили:
+    # CLI по умолчанию берёт Opus, а его недельная квота на порядок меньше
+    # и нужна владельцу. Проверять надо по факту, а не по нашему намерению.
+    models: tuple[str, ...] = ()
+    # Токены создания кэша. У CLI их десятки тысяч на каждый вызов —
+    # это его системный промпт, и он съедает квоту независимо от нашего
+    cache_creation_tokens: int = 0
+
+    @property
+    def model_names(self) -> str:
+        return ", ".join(self.models) if self.models else "?"
 
     @property
     def billed(self) -> bool:
@@ -170,6 +181,33 @@ class ApiBackend:
                      input_tokens=tin, output_tokens=tout, backend=API, seconds=seconds)
 
 
+def resolve_cli(binary: str) -> tuple[str | None, list[str]]:
+    """Путь к CLI и, если без него никак, обёртка-интерпретатор.
+
+    npm на Windows ставит `claude.CMD` — обёртку, которую CreateProcess
+    запустить не может, а cmd.exe запускает, но режет командную строку
+    на 8191 символе и портит кириллицу. Рядом при этом лежит настоящий
+    `claude.exe`; берём его и обходимся без интерпретатора вовсе.
+    """
+    found = shutil.which(binary)
+    if not found:
+        return None, []
+    if not found.lower().endswith((".cmd", ".bat")):
+        return found, []
+
+    root = os.path.dirname(found)
+    for candidate in (
+        os.path.join(root, "node_modules", "@anthropic-ai", "claude-code",
+                     "bin", "claude.exe"),
+        os.path.join(root, "claude.exe"),
+    ):
+        if os.path.exists(candidate):
+            log.debug("вместо обёртки %s беру %s", found, candidate)
+            return candidate, []
+    # настоящего бинаря не нашли — придётся через интерпретатор
+    return found, [os.environ.get("COMSPEC", "cmd.exe"), "/c"]
+
+
 class CliBackend:
     """`claude -p` — подписка вместо денег.
 
@@ -189,26 +227,47 @@ class CliBackend:
             # не увидев, и это была бы приёмка на пустом месте
             raise LLMError("CLI-бэкенд не умеет картинки — для screenshot-проверок "
                            "нужен LLM_BACKEND_JUDGE=api")
-        if not shutil.which(self.binary):
+        resolved, launcher = resolve_cli(self.binary)
+        if not resolved:
             raise LLMError(
                 f"не нашёл {self.binary!r} в PATH. Claude Code CLI не установлен "
                 f"или не в PATH; поставь его либо переключись на API "
                 f"(LLM_BACKEND_*=api)")
 
+        # Промпт уходит В STDIN, а не аргументом.
+        #
+        # На Windows npm ставит claude как claude.CMD, запуск идёт через
+        # cmd.exe, а у него командная строка ограничена 8191 символом. Промпт
+        # брифа — пятнадцать тысяч, и вызов падал с обрубленной абракадаброй
+        # вместо внятной ошибки: cmd ещё и калечил кириллицу. Через stdin
+        # длина не ограничена ничем и кодировка своя.
         args = [
-            self.binary, "-p", prompt,
+            *launcher, resolved, "-p",
             "--output-format", "json",
             # Ни одного инструмента: это вызов модели, а не агент. С Read
-            # и Bash модель уходит изучать репозиторий и жжёт ходы впустую
+            # и Bash модель уходит изучать репозиторий и жжёт ходы впустую.
+            #
+            # Пустой allowlist, и НИКАКОГО --disallowedTools: замерено на живом
+            # CLI, что перечисление инструментов по именам подтягивает их
+            # описания в контекст и учетверяет расход кэша (26k против 6.7k
+            # токенов на вызов). Запрещать поимённо то, что и так не разрешено,
+            # — платить за список запретов.
             "--allowedTools", "",
-            "--disallowedTools", "Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch",
             "--max-turns", "1",
-            # sonnet намеренно: недельная квота Opus на порядок меньше
-            # и нужна владельцу для ручной работы
+            # sonnet намеренно и ВСЕГДА явно: по умолчанию CLI берёт Opus,
+            # чья недельная квота на порядок меньше и нужна владельцу
             "--model", model or cfg.cli_model,
+            # ЗАМЕНА системного промпта, а не дописывание к нему, плюс отказ
+            # от динамических секций. Замерено на живом CLI: с дефолтным
+            # промптом каждый вызов создаёт ~40 тысяч токенов кэша, с этими
+            # двумя флагами — НОЛЬ. Это двадцатикратная разница в расходе
+            # пятичасового окна, то есть разница между «работает весь день»
+            # и «встало после трёх вызовов». Нам нужен чистый вызов модели,
+            # инструкции Claude Code про инструменты и репозиторий здесь
+            # только мешают.
+            "--system-prompt", system or "Ты отвечаешь строго по инструкции ниже.",
+            "--exclude-dynamic-system-prompt-sections",
         ]
-        if system:
-            args += ["--append-system-prompt", system]
         # --resume НЕ передаётся никогда, см. docstring модуля
 
         # Каталог временный: в репозитории проекта CLI подхватил бы его
@@ -217,11 +276,12 @@ class CliBackend:
         t0 = time.monotonic()
         try:
             proc = await asyncio.create_subprocess_exec(
-                *args, cwd=workdir,
+                *args, cwd=workdir, stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             try:
-                out, err = await asyncio.wait_for(proc.communicate(),
-                                                  timeout=cfg.cli_timeout_sec)
+                out, err = await asyncio.wait_for(
+                    proc.communicate(input=prompt.encode("utf-8")),
+                    timeout=cfg.cli_timeout_sec)
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.wait()
@@ -252,6 +312,15 @@ class CliBackend:
             raise LLMError(f"{self.binary}: {body[:300]}")
 
         usage = data.get("usage") or {}
+        # Какая модель отвечала НА САМОМ ДЕЛЕ. CLI по умолчанию берёт Opus,
+        # и одна опечатка в имени модели молча увела бы работу на квоту,
+        # которая нужна владельцу. Проверяем по факту
+        models = tuple(sorted((data.get("modelUsage") or {}).keys()))
+        if any("opus" in m.lower() for m in models):
+            log.warning("CLI ответил моделью %s — просили %s. Квота Opus нужна "
+                        "владельцу, проверь --model", ", ".join(models),
+                        model or cfg.cli_model)
+
         return Reply(
             text=str(data.get("result") or ""),
             stop_reason=str(data.get("stop_reason") or ""),
@@ -259,7 +328,8 @@ class CliBackend:
             cost_usd=float(data.get("total_cost_usd") or 0.0),
             input_tokens=int(usage.get("input_tokens") or 0),
             output_tokens=int(usage.get("output_tokens") or 0),
-            backend=CLI, seconds=seconds)
+            cache_creation_tokens=int(usage.get("cache_creation_input_tokens") or 0),
+            models=models, backend=CLI, seconds=seconds)
 
 
 def make(consumer: str, client=None):
