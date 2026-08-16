@@ -296,6 +296,32 @@ def stack_declared(brief: dict) -> bool:
                for i in (brief.get("stack") or []) if isinstance(i, dict))
 
 
+def stack_not_in_brief(chosen, brief: dict) -> list[str]:
+    """Что из выбранного стека в ТЗ НЕ названо.
+
+    Пометка «взят из ТЗ» говорит человеку: этот выбор сделал клиент, проверять
+    нечего. Ставил её код — по одному лишь факту, что в брифе есть хоть строчка
+    про стек. На живом плане проекта 8 в ТЗ стояло «мобильные приложения под
+    iOS и Android, тип не уточнён», а помеченным как «из ТЗ» оказался
+    Node.js + PostgreSQL + Prisma + Socket.IO. То есть ярлык «не проверяй»
+    висел ровно на том, что придумала модель.
+
+    Сверяем по НАЗВАНИЮ технологии, а не по словам вокруг: «Flutter» и
+    «мобильные приложения для iOS и Android» — не одно и то же, второе как раз
+    и означает, что тип не выбран.
+    """
+    from .groups import normalize
+
+    declared = normalize(" ".join(str(item_text(i)) for i in (brief.get("stack") or [])
+                                  if isinstance(i, dict)))
+    missing = []
+    for item in chosen or []:
+        head = normalize(re.split(r"[—\-(:,]", str(item))[0]).split()
+        if head and head[0] not in declared:
+            missing.append(str(item))
+    return missing
+
+
 def classify(task: dict, declared: str | None = None) -> str:
     """Класс проверяемости. Код умеет ТОЛЬКО ПОНИЖАТЬ, никогда не повышать.
 
@@ -707,7 +733,15 @@ class Planner:
         if stack_declared(brief) and decision:
             decision = dict(decision)
             decision.setdefault("rationale", "")
-            decision["from_brief"] = True
+            # «Взят из ТЗ» — сильное утверждение: оно говорит человеку, что
+            # проверять выбор не надо. Ставим его только если в ТЗ названо
+            # ВСЁ выбранное, а не хоть что-то
+            invented = stack_not_in_brief(decision.get("chosen"), brief)
+            decision["from_brief"] = not invented
+            if invented:
+                decision["not_in_brief"] = invented
+                notes.append("стек только частично из ТЗ; выбрано планировщиком: "
+                             + "; ".join(invented))
         decisions_path = await self._write_decisions(project, decision)
 
         stats = autonomy(tasks)

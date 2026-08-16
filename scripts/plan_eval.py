@@ -54,6 +54,13 @@ def show_stack(decision: dict, path: str | None) -> None:
         return
     if decision.get("from_brief"):
         print("  ВЗЯТ ИЗ ТЗ — планировщик его не выбирал")
+    invented = decision.get("not_in_brief") or []
+    if invented:
+        # Разница существенная: то, что назвал клиент, обсуждению не подлежит,
+        # а выбранное планировщиком надо смотреть глазами
+        print(f"  ЧАСТИЧНО ИЗ ТЗ: {len(invented)} позиц. выбрал планировщик сам —")
+        for item in invented:
+            print(f"      ⚠ {item}")
     for item in decision.get("chosen") or []:
         print(f"  • {item}")
     if decision.get("rationale"):
