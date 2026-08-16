@@ -265,6 +265,26 @@ async def test_manual_report_lists_criteria(db):
     assert "Сборка темы" not in text, "задачи агента в ручной список не идут"
 
 
+async def test_manual_show_lists_judge_observations(db):
+    """Замечания вне критерия должны дойти до глаз владельца.
+
+    Иначе они честно не влияют на приёмку и так же честно пропадают —
+    а из них выходят следующие задачи.
+    """
+    p = await make_project()
+    task = await make_task(p.id, [{"type": "shell", "cmd": "npm run build"}],
+                           executor="manual", lane="build")
+    async with Session() as s:
+        row = await s.get(Task, task.id)
+        row.observations = ["тестов на вебхук нет", "секрет шлюза лежит в коде"]
+        await s.commit()
+        row = await s.get(Task, task.id)
+
+    text = manual.describe(row)
+    assert "тестов на вебхук нет" in text
+    assert "на приёмку не влияет" in text, "не видно, что это не дефект"
+
+
 # ---------- автономность по времени ----------
 
 def test_autonomy_by_time():
@@ -528,3 +548,201 @@ def test_judge_json_truncated_stays_unreadable():
 
     assert parse_judge_json("")[0] is None
     assert parse_judge_json("совсем без json")[0] is None
+
+
+# ---------- судья отвечает на ЗАЯВЛЕННЫЙ вопрос, а не ревьюит проект ----------
+
+# Живая задача 394 проекта 8. Критерий выполнен в дифе буквально, а судья
+# вернул FAIL с девятью дефектами про middleware, идемпотентность, try/catch
+# и отсутствие тестов. Замечания верные, но ни одно не про критерий: на живом
+# проекте такая задача провалится MAX_ATTEMPTS раз и уедет в эскалацию.
+CRIT_394 = ("В коде обработчика вебхука присутствует проверка подписи/секрета "
+            "от платёжного шлюза и переход заказа в статус paid при успешном "
+            "событии")
+
+
+class FakeJudge:
+    """Бэкенд, отдающий заранее заданный ответ судьи."""
+
+    name = "cli"
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.prompts: list[str] = []
+
+    async def ask(self, prompt, *, system="", model="", max_tokens=8000, content=None):
+        from autopilot.llm import Reply
+        self.prompts.append(prompt)
+        body = (self.payload if isinstance(self.payload, str)
+                else json.dumps(self.payload, ensure_ascii=False))
+        return Reply(text=body, backend="cli")
+
+
+def test_judge_prompt_does_not_presume_defects():
+    """Формулировка «исходи из того, что дефекты есть» и толкала на ревью."""
+    from autopilot.verifier import JUDGE_PROMPT
+
+    assert "исходи из того" not in JUDGE_PROMPT.lower()
+    assert "criterion_part" in JUDGE_PROMPT, "нечем привязать дефект к критерию"
+    assert "observations" in JUDGE_PROMPT, "замечаниям вне критерия некуда деться"
+
+
+def test_defect_attribution_needs_a_piece_of_the_criterion():
+    """Как evidence в брифе: ссылка обязана указывать на что-то настоящее."""
+    from autopilot.verifier import attribute_defects, part_of_criterion
+
+    assert part_of_criterion("проверка подписи", CRIT_394) is True
+    assert part_of_criterion("переход заказа в статус paid", CRIT_394) is True
+    # склонение и порядок слов модель тасует свободно
+    assert part_of_criterion("проверку подписи от шлюза", CRIT_394) is True
+    # а это она придумала: в критерии нет ни слова про middleware
+    assert part_of_criterion("middleware для raw body", CRIT_394) is False
+    assert part_of_criterion("", CRIT_394) is False
+    assert part_of_criterion("и", CRIT_394) is False, "предлог — не выдержка"
+
+    kept, notes = attribute_defects(CRIT_394, {
+        "defects": [
+            {"defect": "нет middleware для raw body", "criterion_part": "raw body"},
+            {"defect": "нет идемпотентности", "criterion_part": ""},
+            {"defect": "статус не меняется", "criterion_part": "переход заказа в статус paid"},
+            "дефект строкой, без привязки",
+        ],
+        "observations": ["тестов на вебхук нет"],
+    })
+    assert len(kept) == 1 and "статус не меняется" in kept[0]
+    # ничего не потеряно: отброшенное переезжает в замечания
+    assert len(notes) == 4
+    assert any("тестов на вебхук нет" in n for n in notes)
+    assert any("middleware" in n for n in notes)
+
+
+def test_quoting_the_object_does_not_smuggle_a_review_defect():
+    """Выдержка обязана быть НАРУШЕННЫМ ТРЕБОВАНИЕМ, а не упоминанием объекта.
+
+    Первая версия проверки ловилась ровно на это: «обработчика вебхука» —
+    настоящая часть критерия, и с ней в вердикт проходило любое замечание
+    про то, как этот обработчик написан.
+    """
+    from autopilot.verifier import attribute_defects, defect_touches_criterion
+
+    assert defect_touches_criterion("подпись не проверяется", CRIT_394) is True
+    assert defect_touches_criterion("нет middleware для сырого тела", CRIT_394) is False
+
+    kept, notes = attribute_defects(CRIT_394, {
+        "verdict": "FAIL",
+        "defects": [{"defect": "нет middleware для сырого тела запроса",
+                     "criterion_part": "обработчика вебхука"}],
+    })
+    assert kept == []
+    assert notes and "middleware" in notes[0]
+
+
+async def test_judge_passes_when_criterion_met_but_code_imperfect(db):
+    """Тот самый случай 394: критерий выполнен, прочие недостатки — в observations."""
+    p = await make_project()
+    task = await make_task(p.id, [{"type": "llm", "criteria": CRIT_394}],
+                           verify_class="assisted")
+    fake = FakeJudge({
+        "verdict": "FAIL",
+        "defects": [
+            {"defect": "нет middleware для сырого тела запроса",
+             "criterion_part": "обработчика вебхука"},
+            {"defect": "обработчик не идемпотентен", "criterion_part": ""},
+            {"defect": "нет try/catch вокруг разбора тела", "criterion_part": ""},
+        ],
+        "observations": ["тестов на вебхук нет", "импорты в дифе не видны"],
+    })
+
+    verdict = await Verifier(backend=fake).run(task, p)
+
+    assert verdict.ok is True, "выполненный критерий снова завален общим ревью"
+    assert verdict.defects == []
+    assert verdict.observations, "замечания судьи пропали совсем"
+    assert any("идемпотент" in n for n in verdict.observations)
+    assert any("тестов" in n for n in verdict.observations)
+    # приёмка при этом остаётся недоказанной: судила модель
+    assert verdict.unproven is True and verdict.confirmed is False
+
+    async with Session() as s:
+        row = await s.get(Task, task.id)
+    assert row.observations, "замечания не дошли до владельца"
+
+
+async def test_judge_still_fails_on_a_real_criterion_miss(db):
+    """Обратная сторона: дефект, привязанный к критерию, по-прежнему валит."""
+    p = await make_project()
+    task = await make_task(p.id, [{"type": "llm", "criteria": CRIT_394}],
+                           verify_class="assisted")
+    fake = FakeJudge({
+        "verdict": "FAIL",
+        "defects": [{"defect": "подпись не проверяется нигде",
+                     "criterion_part": "проверка подписи/секрета"}],
+        "observations": [],
+    })
+
+    verdict = await Verifier(backend=fake).run(task, p)
+    assert verdict.ok is False
+    assert any("подпись не проверяется" in d for d in verdict.defects)
+    assert any("критерий:" in d for d in verdict.defects), "не видно, чем обосновано"
+
+
+async def test_judge_pass_keeps_observations(db):
+    """PASS не повод выбрасывать замечания: из них выйдут следующие задачи."""
+    p = await make_project()
+    task = await make_task(p.id, [{"type": "llm", "criteria": CRIT_394}],
+                           verify_class="assisted")
+    fake = FakeJudge({"verdict": "PASS", "defects": [],
+                      "observations": ["секрет шлюза лежит в коде"]})
+
+    verdict = await Verifier(backend=fake).run(task, p)
+    assert verdict.ok is True
+    assert verdict.observations == ("секрет шлюза лежит в коде",)
+
+
+async def test_judge_prompt_carries_the_criterion(db):
+    """Судье уходит именно критерий задачи, а не её название."""
+    p = await make_project()
+    task = await make_task(p.id, [{"type": "llm", "criteria": CRIT_394}],
+                           verify_class="assisted", title="Интеграция шлюза")
+    fake = FakeJudge({"verdict": "PASS", "defects": [], "observations": []})
+    await Verifier(backend=fake).run(task, p)
+
+    assert CRIT_394 in fake.prompts[0]
+
+
+def test_json_picked_by_key_not_by_position():
+    """Из прозы берётся НУЖНЫЙ объект, а не первый попавшийся.
+
+    Живой случай на плане проекта 8: модель начала объяснением, в котором
+    был свой маленький объект. Вынули его, валидация сказала «tasks должен
+    быть непустым списком», прогон ушёл на вторую попытку — а настоящий план
+    лежал ниже в том же ответе. Тринадцать минут работы модели впустую.
+    """
+    raw = ('Сначала поясню формат: {"type": "shell", "cmd": "flutter build"}.\n'
+           'Теперь сам план:\n'
+           '{"stack_decision": {"chosen": ["Flutter"]}, '
+           '"tasks": [{"title": "Каркас приложения"}]}')
+
+    data, extracted = parse_judge_json(raw, require=("tasks",))
+    assert extracted is True
+    assert data["tasks"][0]["title"] == "Каркас приложения"
+
+    # без ключа поведение прежнее: берём первый объект
+    first, _ = parse_judge_json(raw)
+    assert first["type"] == "shell"
+
+
+def test_json_without_the_key_still_returned():
+    """Если нужного ключа нет нигде, отдаём что нашли — отвергнет валидация.
+
+    Молчаливое «ответа нет» тут хуже: оно прячет от нас настоящую причину.
+    """
+    raw = 'Не смог составить план.\n{"error": "мало данных"}'
+    data, extracted = parse_judge_json(raw, require=("tasks",))
+    assert data == {"error": "мало данных"} and extracted is True
+
+
+def test_whole_answer_without_the_key_is_not_mistaken_for_a_fragment():
+    """Чистый JSON без нужного ключа не должен молча превращаться в None."""
+    data, extracted = parse_judge_json('{"verdict": "PASS"}', require=("tasks",))
+    assert data == {"verdict": "PASS"}

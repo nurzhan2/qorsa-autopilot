@@ -41,6 +41,7 @@ from sqlalchemy import func, select                                    # noqa: E
 from autopilot.brief import (LIST_FIELDS, ORIGIN_CONFIRMED, Brief,      # noqa: E402
                              _msg_key, agreement, check_coverage,
                              missing_items, parse_requirements)
+from autopilot import guard                                            # noqa: E402
 from autopilot.config import cfg
 from autopilot.llm import LimitReached, LLMError                                       # noqa: E402
 from autopilot.db import consumed_today, ChatMessage, Project, Session, init_db        # noqa: E402
@@ -350,6 +351,14 @@ async def run(project_id: int, stub: bool, draft: bool) -> int:
         print("  переписки нет — брифу не из чего собираться")
         return 1
 
+    # Замок на проект: второй прогон по тому же проекту не начнётся. Он не
+    # просто дублировал бы работу — перед полным пересбором бриф чистится,
+    # и два таких прогона перетирают результат друг друга
+    with guard.project_lock(project_id, "brief_eval"):
+        return await _run_locked(project, project_id, stub, draft)
+
+
+async def _run_locked(project, project_id: int, stub: bool, draft: bool) -> int:
     if stub:
         print("\n[режим --stub: модель НЕ вызывается, работает офлайн-заглушка]")
         brief = Brief(client=StubModel())
@@ -460,8 +469,20 @@ def main() -> int:
     if args.samples is not None:
         cfg.brief_samples = args.samples
     if args.list or not args.project:
-        return asyncio.run(show_projects())
-    return asyncio.run(run(args.project, args.stub, args.draft))
+        return guard.run(show_projects())
+    # guard.run, а не asyncio.run: сигнал обязан превратиться в исключение
+    # ВНУТРИ корутины, иначе восстановление брифа не отработает. Именно так
+    # прогон, оборванный на десятой минуте, оставил бриф проекта 8 обнулённым:
+    # процесс убили, до except дело не дошло
+    try:
+        return guard.run(run(args.project, args.stub, args.draft))
+    except guard.BusyProject as e:
+        print(f"\n{e}", file=sys.stderr)
+        return 4
+    except guard.Interrupted as e:
+        print(f"\n{e}. Прежний бриф возвращён на место, дочерний claude убит.",
+              file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

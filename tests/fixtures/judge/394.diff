@@ -1,0 +1,32 @@
+diff --git a/src/routes/payments.js b/src/routes/payments.js
+index 3f2a1c4..9b7e5d2 100644
+--- a/src/routes/payments.js
++++ b/src/routes/payments.js
+@@ -12,6 +12,52 @@ router.post('/payments/create', async (req, res) => {
+   res.json({ confirmation_url: payment.confirmation.confirmation_url });
+ });
+
++function verifyWebhookSignature(req) {
++  const received = req.headers['x-yookassa-signature'];
++  const expected = crypto
++    .createHmac('sha256', process.env.YOOKASSA_WEBHOOK_SECRET)
++    .update(JSON.stringify(req.body))
++    .digest('hex');
++  return received === expected;
++}
++
++router.post('/payments/webhook', async (req, res) => {
++  if (!verifyWebhookSignature(req)) {
++    return res.status(403).json({ error: 'bad signature' });
++  }
++
++  const event = req.body;
++  if (event.event === 'payment.succeeded') {
++    const orderId = event.object.metadata.order_id;
++    await Order.update({ status: 'paid', paid_at: new Date() }, { where: { id: orderId } });
++  }
++
++  res.json({ ok: true });
++});
++
+ module.exports = router;

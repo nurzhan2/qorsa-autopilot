@@ -349,8 +349,13 @@ class Scheduler:
                     task.id, task.title, verdict.summary())
         notify = getattr(self.communicator, "notify_owner", None)
         if notify is not None:
+            # Замечания судьи вне критерия решение не меняют, но человеку,
+            # который сейчас будет решать, знать о них полезно
+            extra = (f"\nСудья заметил попутно {len(verdict.observations)} вещ(и) "
+                     f"вне критерия — они на приёмку не влияли."
+                     if getattr(verdict, "observations", ()) else "")
             await notify(f"Задача {task.id} «{task.title}» сделана, но приёмка "
-                         f"ничего не доказала — {verdict.why_unproven()}.\n"
+                         f"ничего не доказала — {verdict.why_unproven()}.{extra}\n"
                          f"Посмотреть — /show {task.id}, подтвердить — /confirm {task.id}")
 
     async def _on_fail(self, lane: str, task: Task, project: Project, defects: list[str]) -> None:

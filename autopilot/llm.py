@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses as dc
 import json
 import logging
@@ -34,6 +35,7 @@ import shutil
 import tempfile
 import time
 
+from . import guard
 from .config import cfg
 from .vault import anthropic_key, missing_secret_message
 
@@ -274,10 +276,16 @@ class CliBackend:
         # CLAUDE.md и настройки, а нам нужен чистый вызов
         workdir = tempfile.mkdtemp(prefix="qorsa-llm-")
         t0 = time.monotonic()
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args, cwd=workdir, stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            # Дочерний claude не должен пережить родителя ни при каких
+            # обстоятельствах: осиротевший процесс продолжает жечь ту же
+            # квоту пятичасового окна, отвечать некому, и заметить это
+            # можно только по опустевшему окну
+            guard.watch_child(proc)
             try:
                 out, err = await asyncio.wait_for(
                     proc.communicate(input=prompt.encode("utf-8")),
@@ -287,29 +295,50 @@ class CliBackend:
                 await proc.wait()
                 raise LLMError(f"{self.binary} не ответил за {cfg.cli_timeout_sec}s")
         finally:
+            # сюда попадает и отмена по сигналу: процесс убиваем сами,
+            # ждать его в этот момент уже нечем
+            if proc is not None:
+                if getattr(proc, "returncode", 0) is None:
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        proc.kill()
+                guard.forget_child(proc)
             shutil.rmtree(workdir, ignore_errors=True)
         seconds = time.monotonic() - t0
 
         stdout = (out or b"").decode(errors="replace")
         stderr = (err or b"").decode(errors="replace")
-        if looks_like_limit(stdout + stderr, proc.returncode):
-            raise LimitReached(f"квота подписки исчерпана: {(stderr or stdout)[:300]}",
-                               retry_after_from(stdout + stderr))
-        if proc.returncode != 0:
-            raise LLMError(f"{self.binary} вернул {proc.returncode}: "
-                           f"{(stderr or stdout)[:300]}")
 
-        try:
-            data = json.loads(stdout)
-        except ValueError as e:
-            raise LLMError(f"{self.binary} отдал не-JSON: {stdout[:300]!r}") from e
-
-        if data.get("is_error"):
-            body = str(data.get("result") or "")
-            if looks_like_limit(body):
+        # РАЗБИРАЕМ РАНЬШЕ, ЧЕМ ИЩЕМ УПОР В КВОТУ, и это не косметика.
+        #
+        # Раньше `looks_like_limit` шёл первым и обыскивал весь stdout —
+        # то есть ОТВЕТ САМОЙ МОДЕЛИ. План приложения доставки, честно
+        # расписавший «rate limit» для API, был объявлен упором в квоту:
+        # `is_error:false`, `stop_reason:end_turn`, сто тысяч токенов
+        # выхода — и всё выброшено, а вместе с этим по правилам limits.py
+        # встала вся работа и владельцу ушло уведомление. Двадцать шесть
+        # минут работы модели в мусор из-за слова в тексте.
+        #
+        # Успешный конверт упором не бывает по определению: про исчерпание
+        # квоты нам говорит оболочка, а не содержимое ответа.
+        data = None
+        if stdout.strip():
+            try:
+                data = json.loads(stdout)
+            except ValueError:
+                data = None
+        if isinstance(data, dict) and not data.get("is_error") and proc.returncode == 0:
+            pass                      # успех, вниз к разбору полей
+        else:
+            body = ""
+            if isinstance(data, dict):
+                body = str(data.get("result") or "")
+            body = body or stderr or stdout
+            if looks_like_limit(body, proc.returncode):
                 raise LimitReached(f"квота подписки исчерпана: {body[:300]}",
                                    retry_after_from(body))
-            raise LLMError(f"{self.binary}: {body[:300]}")
+            if data is None:
+                raise LLMError(f"{self.binary} отдал не-JSON: {stdout[:300]!r}")
+            raise LLMError(f"{self.binary} вернул {proc.returncode}: {body[:300]}")
 
         usage = data.get("usage") or {}
         # Какая модель отвечала НА САМОМ ДЕЛЕ. CLI по умолчанию берёт Opus,

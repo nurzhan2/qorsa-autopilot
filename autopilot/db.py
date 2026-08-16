@@ -179,6 +179,11 @@ class Task(Base):
     attempts: Mapped[int] = mapped_column(default=0)
     cc_session_id: Mapped[str | None] = mapped_column(default=None)
     defects: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # Замечания судьи ВНЕ заявленного критерия. В defects им не место:
+    # оттуда задача уходит на повтор и в эскалацию, а «нет тестов» при
+    # выполненном критерии — повод завести новую задачу, а не завалить эту
+    observations: Mapped[list[str]] = mapped_column(JSON, default=list,
+                                                    server_default=text("'[]'"))
     last_error: Mapped[str] = mapped_column(default="")
     cost_usd: Mapped[float] = mapped_column(default=0.0)
     updated_at: Mapped[dt.datetime] = mapped_column(default=utcnow, server_default=text("CURRENT_TIMESTAMP"))
@@ -333,7 +338,15 @@ class Run(Base):
                                          server_default=text("'api'"))
     seconds: Mapped[float] = mapped_column(default=0.0)
     log_path: Mapped[str] = mapped_column(default="")
+    # ВРЕМЯ НАЧАЛА, и теперь по-настоящему: строка заводится ДО вызова модели.
+    # Раньше она создавалась после, и started_at был временем окончания —
+    # мелочь, которая путала разбор длительностей и прятала оборванные
+    # прогоны: у брошенного вызова строки не появлялось вовсе
     started_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
+    # Пусто — значит вызов не закончился: либо идёт прямо сейчас, либо
+    # процесс убили на середине. Отличать эти два состояния от нормального
+    # прогона нужно глазами, поэтому колонка отдельная
+    finished_at: Mapped[dt.datetime | None] = mapped_column(default=None)
 
 
 engine = create_async_engine(cfg.db_url, echo=False)
@@ -435,6 +448,38 @@ async def account_signature(account_id: int | None) -> str:
 
 
 BOT_SIGNATURE_FALLBACK = "🤖 Бот по техническим вопросам (не человек).\n\n"
+
+
+async def open_run(task_id: int, kind: str) -> int:
+    """Завести строку расхода ДО вызова модели и вернуть её id.
+
+    Так `started_at` означает то, что написано, а вызов, оборванный на
+    середине, оставляет след: строка есть, `finished_at` пуст. Раньше строка
+    появлялась после ответа, и прерванный прогон выглядел так, будто его
+    не было — при том, что квоту он сжёг.
+    """
+    async with Session() as s:
+        row = Run(task_id=task_id, kind=kind, ok=False, started_at=utcnow())
+        s.add(row)
+        await s.commit()
+        return row.id
+
+
+async def close_run(run_id: int, *, ok: bool, backend: str, cost_usd: float,
+                    seconds: float, log_path: str = "") -> None:
+    """Дописать в строку то, что стало известно после вызова."""
+    async with Session() as s:
+        row = await s.get(Run, run_id)
+        if row is None:
+            return
+        row.ok = ok
+        row.backend = backend
+        row.cost_usd = cost_usd
+        row.seconds = seconds
+        if log_path:
+            row.log_path = log_path
+        row.finished_at = utcnow()
+        await s.commit()
 
 
 async def spent_today() -> float:
