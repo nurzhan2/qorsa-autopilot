@@ -450,6 +450,27 @@ async def account_signature(account_id: int | None) -> str:
 BOT_SIGNATURE_FALLBACK = "🤖 Бот по техническим вопросам (не человек).\n\n"
 
 
+async def service_task(project_id: int, title: str) -> int:
+    """Служебная задача-якорь для строк расхода: одна на проект и название.
+
+    `Run` привязан к задаче, а бриф и план задачами не являются — им нужен
+    якорь. Раньше он заводился на каждый вызов, и на проекте 8 набралось
+    35 служебных строк: мусор, который ничего не рассказывает, потому что
+    сам расход лежит в `Run`.
+    """
+    async with Session() as s:
+        found = (await s.execute(
+            select(Task.id).where(Task.project_id == project_id,
+                                  Task.lane == "chat", Task.title == title)
+            .limit(1))).scalar_one_or_none()
+        if found is not None:
+            return int(found)
+        row = Task(project_id=project_id, lane="chat", title=title, status="done")
+        s.add(row)
+        await s.commit()
+        return row.id
+
+
 async def open_run(task_id: int, kind: str) -> int:
     """Завести строку расхода ДО вызова модели и вернуть её id.
 
@@ -494,6 +515,27 @@ async def spent_today() -> float:
         rows = (await s.execute(
             select(Run.cost_usd).where(Run.started_at >= since,
                                        Run.backend == "api"))).scalars().all()
+    return float(sum(rows))
+
+
+async def cli_spent_today() -> float:
+    """ОЦЕНКА расхода подписки за последние 24 часа, только `backend="cli"`.
+
+    Это не деньги и никогда ими не станет: CLI отдаёт `total_cost_usd`
+    как оценку того, во что вызов обошёлся бы на API. Но другого счётчика
+    расхода квоты у нас нет, а тормоз полосе `build` нужен — иначе после
+    перевода исполнителя на подписку у неё не остаётся вообще никакого
+    ограничителя: `spent_today()` считает только API и на подписке всегда
+    показывает ноль.
+
+    Считается по тому же скользящему окну, что и деньги, — пятичасовое окно
+    подписки мы всё равно не видим, а сутки хотя бы сопоставимы между собой.
+    """
+    since = utcnow() - dt.timedelta(hours=24)
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Run.cost_usd).where(Run.started_at >= since,
+                                       Run.backend == "cli"))).scalars().all()
     return float(sum(rows))
 
 
