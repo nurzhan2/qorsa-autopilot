@@ -182,6 +182,21 @@ def show_brief(data: dict) -> None:
     print(f"  ЦЕЛЬ: {goal['text'] if goal else '— не определена —'}{_mark(goal or {})}")
     if goal:
         print(f"        evidence: {', '.join(goal.get('evidence', []))}")
+
+    # Рамки проекта — сразу после цели. Это не работа, но именно они решают,
+    # какое решение вообще уместно, поэтому видеть их надо рано
+    for field, label in (("deadline", "СРОК"), ("budget", "БЮДЖЕТ")):
+        item = data.get(field)
+        if isinstance(item, dict) and str(item.get("text") or "").strip():
+            extra = ""
+            if field == "deadline" and item.get("date"):
+                extra = f"  (дата: {item['date']})"
+            if field == "budget" and item.get("amount"):
+                extra = f"  ({item['amount']} {item.get('currency') or ''})".rstrip() + ")"
+                extra = f"  ({item['amount']} {item.get('currency') or ''})"
+            print(f"  {label}: {item['text']}{extra}{_mark(item)}")
+            print(f"        evidence: {', '.join(item.get('evidence', []))}")
+
     for field in LIST_FIELDS:
         items = data.get(field) or []
         if not items:

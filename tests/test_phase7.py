@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from conftest import FakeCommunicator, make_project
 
@@ -190,7 +192,7 @@ def test_task_from_nowhere_still_dropped():
     assert any("не найден в ТЗ" in n for n in notes)
 
 
-# ---------- 5. стек — вопрос, а не решение ----------
+# ---------- 5. стек выбирает планировщик ----------
 
 def test_stack_declared_predicate():
     assert P.stack_declared({"stack": [{"text": "WordPress", "evidence": ["1"]}]}) is True
@@ -198,77 +200,6 @@ def test_stack_declared_predicate():
     assert P.stack_declared({"stack": []}) is False
     assert P.stack_declared({}) is False
     assert P.stack_declared({"stack": [{"text": "  "}]}) is False
-
-
-async def test_planner_asks_about_stack_instead_of_choosing(db, monkeypatch):
-    """Стека в ТЗ нет — планировщик ставит блокирующий вопрос и НЕ планирует.
-
-    На живом проекте молчаливый выбор React Native попал в первую задачу,
-    от которой зависели все остальные. Клиент об этом не знал.
-    """
-    p = await make_project()
-    async with Session() as s:
-        row = await s.get(Project, p.id)
-        row.brief = {"brief": {
-            "goal": {"text": "приложение доставки", "evidence": ["1"]},
-            "deliverables": [{"text": "Клиентская часть", "evidence": ["1"],
-                              "priority": "must"}],
-            "stack": [],
-        }}
-        await s.commit()
-        project = await s.get(Project, p.id)
-
-    comm = FakeCommunicator()
-    planner = P.Planner(client=object(), communicator=comm)
-    planned = []
-    monkeypatch.setattr(planner, "_attempt",
-                        lambda *a, **k: planned.append(1) or [])
-    monkeypatch.setattr(planner, "_suggest_stack",
-                        _async("Предлагаю React Native. Это предложение, "
-                               "требующее согласования с клиентом."))
-
-    result = await planner.plan(project)
-
-    assert result is None, "планировщик выбрал стек за клиента"
-    assert not planned, "модель планирования всё-таки вызвана"
-
-    async with Session() as s:
-        row = await s.get(Project, p.id)
-    questions = (row.brief or {}).get("brief", {}).get("open_questions") or []
-    assert questions, "вопрос о стеке не поставлен"
-    assert questions[0]["blocking"] is True
-    assert "технолог" in questions[0]["text"].lower()
-    assert row.brief_ready is False, "блокирующий вопрос не держит проект"
-    assert comm.owner_notes, "владельцу не сообщили"
-
-
-async def test_planner_plans_when_stack_is_declared(db, monkeypatch):
-    """Стек в ТЗ есть — планируем по нему и вопрос не задаём."""
-    p = await make_project()
-    async with Session() as s:
-        row = await s.get(Project, p.id)
-        row.brief = {"brief": {
-            "goal": {"text": "сайт", "evidence": ["1"]},
-            "deliverables": [{"text": "Каталог", "evidence": ["1"], "priority": "must"}],
-            "stack": [{"text": "WordPress + WooCommerce", "evidence": ["1"]}],
-        }}
-        await s.commit()
-        project = await s.get(Project, p.id)
-
-    planner = P.Planner(client=object(), communicator=FakeCommunicator())
-    called = []
-
-    async def fake_attempt(prompt, project):
-        called.append(prompt)
-        return [{"title": "Установить WooCommerce", "deliverable_ref": "Каталог",
-                 "acceptance": [{"type": "file_exists", "path": "wp-config.php"}],
-                 "verify_class": "auto", "executor": "claude_code",
-                 "depends_on": [], "estimate_min": 30}]
-    monkeypatch.setattr(planner, "_attempt", fake_attempt)
-
-    result = await planner.plan(project)
-    assert result is not None and called, "не стал планировать при заданном стеке"
-    assert len(result["tasks"]) == 1
 
 
 def _async(value):
@@ -300,3 +231,306 @@ def test_dry_scrub_does_not_store(tmp_path, monkeypatch):
     out2, names2 = scrub(text, project_id=1, chat_id="c", vault=v, store=True)
     assert "SuperSecret123" not in out2
     assert len(v.names()) == 1, "боевой прогон секрет не сохранил"
+
+
+# ---------- фаза 8: срок и бюджет как рамки решения ----------
+
+HEAVY = ("микросервис", "kubernetes", "k8s", "api gateway", "kong",
+         "rabbitmq", "kafka", "очеред", "service mesh", "redis")
+
+
+def _brief_with_frame(deadline="через 2 недели, к началу сентября",
+                      budget="150 000 рублей"):
+    return {
+        "goal": {"text": "приложение доставки в отели одного города", "evidence": ["1"]},
+        "deliverables": [{"text": "Клиентское приложение", "evidence": ["1"],
+                          "priority": "must"}],
+        "constraints": [{"text": "около 50 заказов в день на старте", "evidence": ["1"]}],
+        "stack": [],
+        "deadline": {"text": deadline, "date": None, "evidence": ["1"]},
+        "budget": {"text": budget, "amount": 150000, "currency": "RUB",
+                   "evidence": ["1"]},
+    }
+
+
+def test_constraints_block_carries_frame_to_prompt():
+    """Срок, бюджет и нагрузка попадают в промпт планировщика.
+
+    Без этих трёх строчек планировщик выбирал микросервисы за API Gateway
+    на приложение для одного города с полусотней заказов в день.
+    """
+    block = P.constraints_block(_brief_with_frame())
+    assert "Срок" in block and "2 недели" in block
+    assert "Бюджет" in block and "150" in block
+    assert "Нагрузка" in block and "50 заказов" in block
+    assert "поместиться" in block, "не объяснили, что это границы решения"
+
+    # рамок нет — блока нет, пустой заголовок в промпт не тащим
+    assert P.constraints_block({"goal": {"text": "сайт"}}) == ""
+
+
+def test_prompt_tells_planner_to_prefer_simple():
+    """Правило по умолчанию прописано в промпте явно."""
+    assert "САМОЕ ПРОСТОЕ РЕШЕНИЕ" in P.SYSTEM
+    for word in ("Микросервисы", "Kubernetes"):
+        assert word in P.SYSTEM
+    assert "stack_decision" in P.SYSTEM, "модель не просят обосновать выбор"
+
+
+async def test_tight_frame_forbids_heavy_architecture(db, monkeypatch):
+    """Две недели и 150К — план не должен содержать тяжёлой инфраструктуры.
+
+    Проверяем контракт кода: рамки доехали до промпта, а решение записано
+    в артефакт. Сам выбор делает модель, и здесь она подменена — иначе тест
+    проверял бы не наш код, а её вкус.
+    """
+    p = await make_project()
+    async with Session() as s:
+        row = await s.get(Project, p.id)
+        row.brief = {"brief": _brief_with_frame()}
+        await s.commit()
+        project = await s.get(Project, p.id)
+
+    planner = P.Planner(client=object(), communicator=FakeCommunicator())
+    seen = {}
+
+    async def fake_attempt(prompt, proj):
+        seen["prompt"] = prompt
+        return ([{"title": "Собрать монолит", "deliverable_ref": "Клиентское приложение",
+                  "acceptance": [{"type": "file_exists", "path": "package.json"}],
+                  "verify_class": "auto", "executor": "claude_code",
+                  "depends_on": [], "estimate_min": 120}],
+                {"chosen": ["Монолит на Django", "PostgreSQL"],
+                 "rationale": "50 заказов в день и две недели — делить нечего",
+                 "driven_by": ["срок 2 недели", "бюджет 150 000"],
+                 "rejected": [{"option": "Микросервисы",
+                               "why": "нагрузка не требует, срок не позволяет"}]})
+    monkeypatch.setattr(planner, "_attempt", fake_attempt)
+
+    result = await planner.plan(project)
+    assert result is not None
+
+    # 1) рамки реально доехали до модели
+    prompt = seen["prompt"].lower()
+    assert "рамки проекта" in prompt
+    assert "2 недели" in prompt and "150" in prompt and "50 заказов" in prompt
+
+    # 2) выбранное решение — не тяжёлое
+    chosen = " ".join(result["stack_decision"]["chosen"]).lower()
+    assert not any(w in chosen for w in ("микросервис", "kubernetes", "kong")), chosen
+
+    # 3) решение записано артефактом, который переживёт сессию
+    path = Path(result["decisions_path"])
+    assert path.exists() and path.name == "DECISIONS.md"
+    text = path.read_text(encoding="utf-8")
+    assert "Монолит на Django" in text
+    assert "Микросервисы" in text and "не требует" in text, "не записали отброшенное"
+    assert "срок 2 недели" in text
+
+
+async def test_planner_plans_when_stack_is_declared(db, monkeypatch):
+    """Стек в ТЗ есть — планируем по нему и не подменяем."""
+    p = await make_project()
+    async with Session() as s:
+        row = await s.get(Project, p.id)
+        row.brief = {"brief": {
+            "goal": {"text": "сайт", "evidence": ["1"]},
+            "deliverables": [{"text": "Каталог", "evidence": ["1"], "priority": "must"}],
+            "stack": [{"text": "WordPress + WooCommerce", "evidence": ["1"]}],
+        }}
+        await s.commit()
+        project = await s.get(Project, p.id)
+
+    planner = P.Planner(client=object(), communicator=FakeCommunicator())
+
+    async def fake_attempt(prompt, proj):
+        assert "WordPress" in prompt, "стек из ТЗ не доехал до планировщика"
+        return ([{"title": "Установить WooCommerce", "deliverable_ref": "Каталог",
+                  "acceptance": [{"type": "file_exists", "path": "wp-config.php"}],
+                  "verify_class": "auto", "executor": "claude_code",
+                  "depends_on": [], "estimate_min": 30}],
+                {"chosen": ["WordPress + WooCommerce"], "rationale": "взят из ТЗ"})
+    monkeypatch.setattr(planner, "_attempt", fake_attempt)
+
+    result = await planner.plan(project)
+    assert result is not None and len(result["tasks"]) == 1
+    assert result["stack_decision"].get("from_brief") is True
+
+
+# ---------- бриф извлекает деньги и сроки, но не торгуется ----------
+
+def test_money_filter_separates_our_fee_from_product_features():
+    """Деньги внутри продукта — функциональность, а не коммерция.
+
+    Прежний фильтр убивал и то и другое одним корнем слова. На живом ТЗ он
+    выбросил бы промокоды, минимальную сумму заказа и расчёт стоимости
+    доставки — то есть три настоящих требования.
+    """
+    # наши деньги и сроки — не зона брифа
+    for text in ("предоплата 50 процентов",
+                 "порядок оплаты работ",
+                 "бюджет проекта обсудим позже",
+                 "сколько стоит разработка"):
+        assert B.is_commercial(text) is True, text
+
+    # деньги внутри продукта клиента — законные требования
+    for text in ("промокоды и скидки для покупателей",
+                 "минимальная сумма заказа 3000 ₽",
+                 "расчёт стоимости доставки по расстоянию",
+                 "оплата картой и СБП в корзине",
+                 "чтобы люди сами оформляли заказ и оплачивали онлайн"):
+        assert B.is_commercial(text) is False, text
+
+
+def test_reference_fields_in_schema():
+    """deadline и budget — часть схемы и часть пустого брифа."""
+    assert B.REFERENCE_FIELDS == ("deadline", "budget")
+    empty = B.empty_brief()
+    assert empty["deadline"] is None and empty["budget"] is None
+    assert "deadline" in B.SYSTEM and "budget" in B.SYSTEM
+    assert "извлекать ОБЯЗАН, обсуждать — НЕТ" in B.SYSTEM
+
+
+async def test_brief_extracts_deadline_and_budget_but_not_as_work(db, monkeypatch):
+    """«Хочу к сентябрю, бюджет 150К» -> заполненные deadline и budget,
+    и НИ ОДНОГО пункта deliverables про деньги."""
+    p = await make_project()
+    await add_msg(p.id, "Нужно приложение доставки. Первая версия к началу "
+                        "сентября, бюджет 150 тысяч рублей.", mid="1")
+
+    brief = B.Brief(communicator=FakeCommunicator())
+
+    async def fake_attempt(prompt, project):
+        return {
+            "goal": {"text": "приложение доставки", "evidence": ["telegram:c1:1"]},
+            "deliverables": [{"text": "Приложение доставки", "priority": "must",
+                              "priority_reason": "«нужно приложение»",
+                              "evidence": ["telegram:c1:1"]}],
+            "stack": [], "constraints": [], "assets": [], "access_needed": [],
+            "open_questions": [], "out_of_scope": [],
+            "deadline": {"text": "первая версия к началу сентября",
+                         "date": "2026-09-01", "evidence": ["telegram:c1:1"]},
+            "budget": {"text": "150 тысяч рублей", "amount": 150000,
+                       "currency": "RUB", "evidence": ["telegram:c1:1"]},
+            "confidence": 0.9, "unreadable": [],
+        }
+    monkeypatch.setattr(brief, "_attempt", fake_attempt)
+
+    async with Session() as s:
+        project = await s.get(Project, p.id)
+    data = await brief.build(project)
+
+    assert data is not None
+    assert data["deadline"]["text"] == "первая версия к началу сентября"
+    assert data["budget"]["amount"] == 150000
+
+    # и ни одного пункта работ про деньги
+    texts = " ".join(B.item_text(d) for d in data["deliverables"]).lower()
+    for word in ("бюджет", "предоплат", "150", "оплата работ"):
+        assert word not in texts, f"деньги уехали в объём работ: {word}"
+
+    # срок доехал до проекта — оттуда его берут таблица и WFQ
+    async with Session() as s:
+        row = await s.get(Project, p.id)
+    assert row.deadline is not None and row.deadline.isoformat() == "2026-09-01"
+
+
+def test_deadline_parsed_only_from_machine_date():
+    """Словесный срок в дату не превращаем: ошибка молча сдвинет приоритет."""
+    assert B.parse_brief_deadline(
+        {"deadline": {"text": "к сентябрю", "date": "2026-09-01"}}).isoformat() == "2026-09-01"
+    assert B.parse_brief_deadline({"deadline": {"text": "к концу августа"}}) is None
+    assert B.parse_brief_deadline({"deadline": {"text": "х", "date": "скоро"}}) is None
+    assert B.parse_brief_deadline({}) is None
+
+
+# ---------- вопросы клиента к нам ----------
+
+def test_client_questions_survive_money_filter():
+    """Вопрос клиента про стоимость доставки не должен глушиться фильтром.
+
+    Вопрос ничего не обещает клиенту, а потерять его — значит не узнать,
+    что объём работ до сих пор не определён.
+    """
+    brief = B.Brief()
+    data = {
+        "goal": {"text": "приложение", "evidence": ["telegram:c1:1"]},
+        "deliverables": [],
+        "open_questions": [
+            {"text": "Нужен ли расчёт стоимости по доставке?", "blocking": True,
+             "evidence": ["telegram:c1:1"]},
+            {"text": "Про платёжные системы я не совсем понимаю, что нужно",
+             "blocking": True, "evidence": ["telegram:c1:1"]},
+        ],
+        "stack": [], "constraints": [], "assets": [], "access_needed": [],
+        "out_of_scope": [], "confidence": 0.8, "unreadable": [],
+    }
+    msgs = [_msg("1", "client", "Нужен ли расчёт стоимости по доставке! "
+                                "Про платежные системы я не совсем понимаю что нужно")]
+    checked, dropped = brief.apply_evidence(data, msgs)
+
+    kept = [q["text"] for q in checked["open_questions"]]
+    assert len(kept) == 2, f"вопросы клиента потерялись: {dropped}"
+    assert any("стоимост" in t.lower() for t in kept)
+
+
+def test_prompt_asks_for_client_questions():
+    assert "ВОПРОСЫ, КОТОРЫЕ КЛИЕНТ ЗАДАЛ НАМ" in B.SYSTEM
+
+
+def _msg(mid, role, text):
+    from autopilot.db import ChatMessage
+    m = ChatMessage(transport="telegram", chat_id="c1", tg_message_id=mid,
+                    project_id=1, direction="in", sender_id="42",
+                    sender_role=role, text=text)
+    m.id = int(mid)
+    return m
+
+
+def test_deadline_in_deep_past_is_rejected():
+    """Прошлогодняя дата — ошибка разбора, а не просроченный проект.
+
+    Поймано на живом чате: модель не знала сегодняшнего числа и превратила
+    «начало сентября» в прошлогоднее. WFQ даёт просроченному проекту
+    четырёхкратный вес — один неверный год поднял бы его над всеми навсегда.
+    """
+    import datetime as dt
+
+    old = (dt.date.today() - dt.timedelta(days=365)).isoformat()
+    assert B.parse_brief_deadline({"deadline": {"text": "к сентябрю", "date": old}}) is None
+
+    soon = (dt.date.today() + dt.timedelta(days=20)).isoformat()
+    assert B.parse_brief_deadline({"deadline": {"text": "скоро", "date": soon}}) is not None
+
+    # недавно просроченный срок — законная ситуация, его не глушим
+    recent = (dt.date.today() - dt.timedelta(days=5)).isoformat()
+    assert B.parse_brief_deadline({"deadline": {"text": "вчера", "date": recent}}) is not None
+
+
+def test_brief_prompt_carries_today():
+    """Без сегодняшнего числа относительный срок превращается в дату наугад."""
+    import inspect
+
+    src = inspect.getsource(B.Brief.build_prompt)
+    assert "# Сегодня" in src
+
+
+def test_constraints_block_counts_days_left_itself():
+    """Остаток до срока считает КОД, а не модель.
+
+    Модель не знает сегодняшнего числа: «сентябрь 2026» она прочитала как
+    «через 14 месяцев», хотя до него было две недели. От этой цифры зависит
+    выбор решения — гадать её нельзя.
+    """
+    import datetime as dt
+
+    soon = (dt.date.today() + dt.timedelta(days=14)).isoformat()
+    block = P.constraints_block({
+        "deadline": {"text": "к началу сентября", "date": soon, "evidence": ["1"]}})
+    assert "Сегодня:" in block, "планировщик не знает текущей даты"
+    assert "это 14 дней от сегодня" in block
+
+    past = (dt.date.today() - dt.timedelta(days=3)).isoformat()
+    overdue = P.constraints_block({
+        "deadline": {"text": "вчера", "date": past, "evidence": ["1"]}})
+    assert "СРОК УЖЕ ПРОШЁЛ 3 дней назад" in overdue

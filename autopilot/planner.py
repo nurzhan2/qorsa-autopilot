@@ -39,8 +39,11 @@ from .brief import (BriefFailed, SecretLeak, assert_no_secrets, item_text,
                     same_item)
 from . import checks
 from .config import cfg
+from pathlib import Path
+
 from .db import AccessItem, Project, Run, Session, Task, utcnow
 from .vault import anthropic_key, missing_secret_message
+from .verifier import parse_judge_json
 from .vault import vault as default_vault
 
 log = logging.getLogger("plan")
@@ -109,8 +112,34 @@ SYSTEM_TEMPLATE = """Ты технический директор. Из гото
 6. Доступы (хостинг, домен, аналитика) уже отслеживаются отдельным чеклистом.
    НЕ создавай задачи вида «получить доступ к панели» — это не работа.
 
+7. СТЕК ВЫБИРАЕШЬ ТЫ, но обосновываешь ОГРАНИЧЕНИЯМИ, а не вкусом.
+   Если в ТЗ стек указан — планируй по нему и не подменяй, в stack_decision
+   так и напиши: «взят из ТЗ».
+
+   Если не указан — правило по умолчанию: САМОЕ ПРОСТОЕ РЕШЕНИЕ, закрывающее
+   требования. Монолит, одна база, готовые сервисы вместо своей инфраструктуры.
+
+   Микросервисы, отдельный кэш-слой, очереди сообщений, свой API Gateway,
+   Kubernetes и прочая тяжёлая инфраструктура появляются ТОЛЬКО если в ТЗ
+   есть цифры, которые их требуют: тысячи запросов в секунду, десятки тысяч
+   заказов в день, несколько команд разработки, требование по отказоустойчивости.
+   Пятьдесят заказов в день, один город и две недели срока — это монолит,
+   и никакие «на вырост» этого не меняют: за архитектуру на вырост платит
+   клиент, а пользуется ей никто.
+
+   Смотри на РАМКИ ПРОЕКТА (срок и бюджет ниже, если они известны). Решение,
+   которое в них не помещается, — неправильное решение, каким бы красивым
+   оно ни было.
+
 Отвечай СТРОГО одним JSON-объектом без markdown:
 {
+  "stack_decision": {
+    "chosen": ["конкретные технологии списком"],
+    "rationale": "почему именно так, со ссылкой на ограничения проекта",
+    "driven_by": ["срок 2 недели", "бюджет 150 тысяч", "50 заказов в день"],
+    "rejected": [{"option": "что рассматривалось и отброшено",
+                  "why": "на каком основании"}]
+  },
   "tasks": [
     {
       "title": "коротко и по делу",
@@ -140,6 +169,53 @@ class CycleInPlan(RuntimeError):
 # ---------- проверки, которые делает КОД ----------
 
 valid_checks = checks.valid_checks
+
+
+def constraints_block(brief: dict) -> str:
+    """Рамки проекта для промпта: срок, бюджет, ожидаемая нагрузка.
+
+    Без них планировщик выбирает решение в вакууме — и выбирает дорогое.
+    На живом проекте отсутствие двух строчек («две недели», «150 тысяч»)
+    дало микросервисы за API Gateway с PostgreSQL и Redis на приложение
+    для одного города с полусотней заказов в день.
+    """
+    import datetime as _dt
+
+    today = _dt.date.today()
+    rows: list[str] = []
+    for field, label in (("deadline", "Срок"), ("budget", "Бюджет")):
+        item = brief.get(field)
+        if isinstance(item, dict) and str(item.get("text") or "").strip():
+            row = f"* {label}: {item['text']}"
+            if field == "deadline" and item.get("date"):
+                # Считаем остаток КОДОМ. Модель не знает сегодняшнего числа и
+                # уже ошиблась на год: «сентябрь 2026» она прочитала как
+                # «через 14 месяцев», хотя до него две недели. От этой цифры
+                # зависит выбор решения, гадать её нельзя
+                try:
+                    left = (_dt.date.fromisoformat(str(item["date"])[:10]) - today).days
+                    row += (f"  (это {left} дней от сегодня)" if left >= 0
+                            else f"  (СРОК УЖЕ ПРОШЁЛ {abs(left)} дней назад)")
+                except ValueError:
+                    pass
+            rows.append(row)
+
+    # нагрузка обычно спрятана в constraints — вытаскиваем её явно
+    for item in (brief.get("constraints") or []):
+        text = item_text(item) if isinstance(item, dict) else ""
+        if any(w in text.lower() for w in ("заказ", "польз", "нагруз", "трафик", "в день")):
+            rows.append(f"* Нагрузка: {text}")
+
+    if not rows:
+        return ""
+    # Сегодняшнее число — первой строкой и только если рамки вообще есть:
+    # без него «к сентябрю» превращается в срок наугад
+    return ("# РАМКИ ПРОЕКТА (решение обязано поместиться сюда)\n"
+            + f"* Сегодня: {today.isoformat()}\n"
+            + "\n".join(rows)
+            + "\n\nЭто не требования и не задачи — это границы, внутри которых "
+              "выбирается решение. Архитектура, которая в них не помещается, "
+              "неправильная, какой бы правильной она ни выглядела вообще.")
 
 
 def stack_declared(brief: dict) -> bool:
@@ -310,6 +386,13 @@ class Planner:
             parts.append(f"## {field}\n" + "\n".join(rows))
         lines.append("# ТЗ\n" + "\n\n".join(parts))
 
+        frame = constraints_block(brief)
+        if frame:
+            # Рамки идут ПОСЛЕ ТЗ: это не требование, а то, внутри чего решение
+            # обязано поместиться. Без них планировщик предлагал микросервисы
+            # на приложение с полусотней заказов в день и двумя неделями срока
+            lines.append(frame)
+
         if access:
             names = ", ".join(f"{a.kind}: {a.name}" for a in access)
             lines.append("# Доступы (отслеживаются отдельно, задач по ним НЕ создавай)\n"
@@ -319,16 +402,17 @@ class Planner:
 
     # ---------- вызов модели ----------
 
-    async def _call(self, prompt: str, project_id: int) -> str:
+    async def _call(self, prompt: str, project_id: int) -> tuple[str, str]:
         assert_no_secrets(prompt, self.vault)
         if self.client is None:
             raise PlanFailed(missing_secret_message("ANTHROPIC_API_KEY"))
         t0 = time.monotonic()
         resp = await self.client.messages.create(
-            model=self.model, max_tokens=8000, system=SYSTEM,
+            model=self.model, max_tokens=cfg.plan_max_tokens, system=SYSTEM,
             messages=[{"role": "user", "content": prompt}])
         await self._charge(resp, time.monotonic() - t0, project_id)
-        return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        return text, str(getattr(resp, "stop_reason", "") or "")
 
     async def _charge(self, resp, seconds: float, project_id: int) -> None:
         from .verifier import PRICE_IN, PRICE_OUT
@@ -479,20 +563,6 @@ class Planner:
             log.info("проект %s: планировать нечего — в брифе нет deliverables", project.id)
             return None
 
-        if not stack_declared(brief):
-            # Стек не выбирают за клиента молча.
-            #
-            # На живом проекте ТЗ не содержало о технологиях НИ СЛОВА, а план
-            # начинался с «Инициализация проекта React Native» — и дальше все
-            # задачи зависели от этой первой. Выбор был сделан моделью, подан
-            # как данность и зацементирован графом зависимостей. Клиент об этом
-            # не знал и согласия не давал.
-            #
-            # Планировать по невыбранному стеку нельзя: цена ошибки — весь
-            # проект. Поэтому вместо плана — блокирующий вопрос с предложением
-            # и обоснованием. Предложить можно, решить нельзя.
-            await self._ask_about_stack(project, brief)
-            return None
 
         async with Session() as s:
             access = (await s.execute(
@@ -500,7 +570,7 @@ class Planner:
 
         prompt = self.build_prompt(project, brief, access)
         try:
-            tasks = await self._attempt(prompt, project)
+            tasks, decision = await self._attempt(prompt, project)
         except SecretLeak as e:
             log.critical("проект %s: %s — запрос НЕ отправлен", project.id, e)
             await self._escalate(project, f"планирование остановлено: {e}")
@@ -526,6 +596,12 @@ class Planner:
         rank = {title: i for i, title in enumerate(order)}
         tasks.sort(key=lambda t: rank.get(t["title"], 0))
 
+        if stack_declared(brief) and decision:
+            decision = dict(decision)
+            decision.setdefault("rationale", "")
+            decision["from_brief"] = True
+        decisions_path = await self._write_decisions(project, decision)
+
         stats = autonomy(tasks)
         await self._persist(project, tasks, stats)
         if not stats["suitable"]:
@@ -533,22 +609,36 @@ class Planner:
                         "проект малопригоден для автопилота",
                         project.id, stats["auto_ratio"] * 100, cfg.autonomy_min_ratio * 100)
             await self._notify(project, stats)
-        return {"tasks": tasks, "stats": stats, "notes": notes, "order": order}
+        return {"tasks": tasks, "stats": stats, "notes": notes, "order": order,
+                "stack_decision": decision, "decisions_path": decisions_path}
 
-    async def _attempt(self, prompt: str, project: Project) -> list[dict]:
+    async def _attempt(self, prompt: str, project: Project) -> tuple[list[dict], dict]:
         errors: list[str] = []
         current = prompt
         for attempt in range(1, cfg.plan_max_attempts + 1):
-            raw = await self._call(current, project.id)
-            cleaned = raw.replace("```json", "").replace("```", "").strip()
-            try:
-                data = json.loads(cleaned)
-            except Exception:
-                errors = ["ответ не разобрался как JSON"]
+            raw, stop_reason = await self._call(current, project.id)
+            # тот же терпимый разбор, что у судьи и у брифа: модель регулярно
+            # предваряет JSON прозой, и строгий json.loads давал ложный провал
+            data, extracted = parse_judge_json(raw)
+            if extracted:
+                log.warning("проект %s: план начат прозой, JSON извлечён из текста",
+                            project.id)
+            if data is None:
+                if stop_reason == "max_tokens":
+                    # На 32 пунктах ТЗ план в 8000 токенов не помещался, и
+                    # обрыв выглядел как «модель отдала мусор». Это враньё:
+                    # JSON был правильный, он просто не дописался
+                    errors = [f"ответ не поместился в {cfg.plan_max_tokens} токенов "
+                              f"и оборвался — подними PLAN_MAX_TOKENS"]
+                    log.error("проект %s: ответ планировщика обрезан по лимиту",
+                              project.id)
+                else:
+                    errors = ["ответ не разобрался как JSON"]
             else:
                 errors = self.validate(data)
                 if not errors:
-                    return data["tasks"]
+                    decision = data.get("stack_decision")
+                    return data["tasks"], (decision if isinstance(decision, dict) else {})
             log.warning("проект %s: план, попытка %s не прошла валидацию: %s",
                         project.id, attempt, "; ".join(errors)[:300])
             current = (prompt + "\n\n# Предыдущий ответ отвергнут, исправь:\n- "
@@ -612,62 +702,59 @@ class Planner:
         log.info("проект %s: план записан — %s задач, автономность %.0f%%",
                  project.id, stats["tasks"], stats["auto_ratio"] * 100)
 
-    async def _ask_about_stack(self, project: Project, brief: dict) -> None:
-        """Блокирующий вопрос о стеке + наше предложение с обоснованием."""
-        suggestion = await self._suggest_stack(project, brief)
-        question = {
-            "text": ("На каких технологиях делаем? В ТЗ стек не зафиксирован, "
-                     "а от него зависит весь план работ.\n" + suggestion),
-            "blocking": True,
-            "evidence": [],
-            "origin": "planner",
-        }
-        async with Session() as s:
-            p = await s.get(Project, project.id)
-            if p is None:
-                return
-            payload = dict(p.brief or {})
-            body = dict(payload.get("brief") or {})
-            questions = [q for q in (body.get("open_questions") or [])
-                         if isinstance(q, dict)
-                         and "стек" not in str(q.get("text", "")).lower()]
-            body["open_questions"] = [question] + questions
-            payload["brief"] = body
-            p.brief = payload
-            p.brief_ready = False        # блокирующий вопрос держит проект
-            p.updated_at = utcnow()
-            await s.commit()
+    async def _write_decisions(self, project: Project, decision: dict) -> str | None:
+        """Решение по стеку — отдельным артефактом, который переживёт сессию.
 
-        log.warning("проект %s: стек не зафиксирован в ТЗ — планирование "
-                    "остановлено, вопрос клиенту поставлен", project.id)
-        if self.communicator is not None:
-            notify = getattr(self.communicator, "notify_owner", None)
-            if notify is not None:
-                await notify(f"Проект {project.id} «{project.title}»: в ТЗ нет стека, "
-                             f"планировать не начинаю.\n{suggestion}")
+        Через месяц вопрос «почему тут React Native, а не Flutter» возникнет
+        обязательно, и ответ на него должен лежать в репозитории проекта,
+        а не в логе давно закрытого прогона.
+        """
+        if not decision:
+            return None
+        root = Path(project.workspace or (cfg.workspaces / f"p{project.id}"))
+        path = root / "docs" / "DECISIONS.md"
+        chosen = decision.get("chosen") or []
+        driven = decision.get("driven_by") or []
+        rejected = decision.get("rejected") or []
 
-    async def _suggest_stack(self, project: Project, brief: dict) -> str:
-        """Предложение по стеку. Это ПРЕДЛОЖЕНИЕ, а не выбор — так и подписано."""
-        goal = ""
-        if isinstance(brief.get("goal"), dict):
-            goal = str(brief["goal"].get("text") or "")
-        items = "; ".join(item_text(d) for d in (brief.get("deliverables") or [])
-                          if isinstance(d, dict))[:1500]
-        if self.client is None:
-            return "Предложить стек не могу: нет ключа модели."
+        lines = [
+            "# Технические решения",
+            "",
+            f"Проект: {project.title}",
+            f"Записано: {utcnow().date().isoformat()}",
+            "",
+            "## Стек",
+            "",
+        ]
+        lines += [f"* {c}" for c in chosen] or ["* (не выбран)"]
+        lines += ["", "## Почему так", "", str(decision.get("rationale") or "—"), ""]
+        if driven:
+            lines += ["## Чем продиктовано", ""]
+            lines += [f"* {d}" for d in driven] + [""]
+        if rejected:
+            lines += ["## Что отброшено и почему", ""]
+            for item in rejected:
+                if isinstance(item, dict):
+                    lines.append(f"* **{item.get('option')}** — {item.get('why')}")
+                else:
+                    lines.append(f"* {item}")
+            lines.append("")
+        lines += [
+            "---",
+            "",
+            "Решение принято планировщиком из ограничений проекта (срок, бюджет,",
+            "нагрузка, число платформ), а не из предпочтений. Если ограничения",
+            "изменились — перепланируй, файл перезапишется.",
+            "",
+        ]
         try:
-            resp = await self.client.messages.create(
-                model=self.model, max_tokens=700,
-                messages=[{"role": "user", "content":
-                           "Ты технический директор. Предложи стек для проекта и "
-                           "объясни выбор в 3-4 предложениях. Явно скажи, что это "
-                           "предложение, требующее согласования с клиентом.\n\n"
-                           f"Цель: {goal}\nЧто нужно сделать: {items}"}])
-            return "".join(b.text for b in resp.content
-                           if getattr(b, "type", "") == "text").strip()
-        except Exception:
-            log.exception("не смог сформулировать предложение по стеку")
-            return "Предложение по стеку сформулировать не удалось — реши сам."
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("\n".join(lines), encoding="utf-8")
+        except OSError:
+            log.exception("не смог записать %s", path)
+            return None
+        log.info("проект %s: решение по стеку записано в %s", project.id, path)
+        return str(path)
 
     async def _escalate(self, project: Project, text: str) -> None:
         async with Session() as s:
