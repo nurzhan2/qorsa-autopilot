@@ -63,6 +63,24 @@ def build_prompt(task: Task, project: Project) -> str:
     return to_env_names(_raw_prompt(task, project))
 
 
+def _why_failed(data: dict) -> str:
+    """Почему сессия агента не удалась — словами, а не «None».
+
+    CLI на исчерпании ходов отдаёт `is_error: true` и `result: null`, и в лог
+    уезжало голое «None». Настоящая причина видна по соседним полям, и без
+    неё непонятно, чинить промпт, поднимать потолок ходов или смотреть код.
+    """
+    turns = int(data.get("num_turns") or 0)
+    stop = str(data.get("stop_reason") or "")
+    result = data.get("result")
+    if result:
+        return vault.mask(str(result))[:500]
+    if turns >= cfg.max_turns or stop == "tool_use":
+        return (f"агент упёрся в потолок ходов: сделано {turns} при "
+                f"MAX_TURNS={cfg.max_turns}, работа не закончена")
+    return f"сессия оборвалась без объяснения (ходов {turns}, stop={stop!r})"
+
+
 class Executor:
     async def run(self, task: Task, project: Project) -> dict:
         workspace = Path(project.workspace or cfg.workspaces / f"p{project.id}")
@@ -72,12 +90,29 @@ class Executor:
         prompt = to_env_names(raw)
         env = await self._secret_env(raw, project)
 
-        args = [cfg.claude_bin, "-p"]
+        # ТОТ ЖЕ разбор пути, что у вызовов модели: npm на Windows ставит
+        # `claude.CMD`, а `create_subprocess_exec` обёртки исполнять не умеет
+        # и падает с «не найден файл», хотя файл на месте. В llm.py это
+        # починили в фазе 9, а сюда правка не дошла — полосу build ни разу
+        # не запускали живьём, и первый же настоящий прогон встал на этом:
+        # три задачи подряд ушли в эскалацию, не начав работу.
+        resolved, launcher = llm.resolve_cli(cfg.claude_bin)
+        if not resolved:
+            raise RuntimeError(
+                f"не нашёл claude-бинарь {cfg.claude_bin!r} (CLAUDE_BIN): "
+                f"Claude Code CLI не установлен или не в PATH")
+        args = [*launcher, resolved, "-p"]
         if task.cc_session_id:
             # продолжаем ТОТ ЖЕ контекст — иначе на 3-й итерации агент забудет, что уже пробовал
             args += ["--resume", task.cc_session_id]
         args += [
-            prompt,
+            # ПРОМПТ ИДЁТ В STDIN, а не аргументом. Командная строка Windows
+            # ограничена 32767 символами, а промпт исполнителя содержит весь
+            # бриф: на проекте 8 это 56 тысяч символов. CreateProcess падает
+            # с WinError 206, который Python отдаёт как FileNotFoundError, —
+            # и первый живой прогон выглядел как «бинарь не найден», хотя
+            # бинарь был на месте. Ровно ту же ловушку фаза 9 уже проходила
+            # на вызовах модели, но до исполнителя правка не дошла.
             "--output-format", "json",
             "--allowedTools", "Bash,Read,Edit,Write,Glob,Grep",
             "--permission-mode", "acceptEdits",
@@ -92,20 +127,25 @@ class Executor:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args, cwd=str(workspace), env=env,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
-        except FileNotFoundError:
+        except FileNotFoundError as e:
             spent = time.monotonic() - t0
             await close_run(run_id, ok=False, backend=RUN_BACKEND,
                             cost_usd=llm.estimated_cost(spent), seconds=spent,
                             estimated=True)
-            raise RuntimeError(f"не нашёл claude-бинарь {cfg.claude_bin!r} (CLAUDE_BIN)") from None
+            # WinError 206 приходит сюда же, хотя означает совсем другое:
+            # не «нет файла», а «слишком длинная командная строка»
+            raise RuntimeError(f"не запустился {resolved!r}: {e}") from None
 
         # Дочерний claude не должен нас пережить: брошенный процесс дожигает
         # то же пятичасовое окно, что и работа владельца руками
         guard.watch_child(proc)
         try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=cfg.task_timeout_sec)
+            out, err = await asyncio.wait_for(
+                proc.communicate(input=prompt.encode("utf-8")),
+                timeout=cfg.task_timeout_sec)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
@@ -131,14 +171,28 @@ class Executor:
         try:
             data = json.loads(out.decode(errors="replace"))
         except Exception:
+            # Ответа нет — но сессия шла и квоту съела. Оценка по времени:
+            # ноль здесь означал бы, что работы не было
+            await close_run(run_id, ok=False, backend=RUN_BACKEND,
+                            cost_usd=llm.estimated_cost(elapsed),
+                            seconds=elapsed, estimated=True,
+                            log_path=str(log_path))
             tail = vault.mask((err or out or b"").decode(errors="replace")[:500])
             raise RuntimeError(f"bad output: {tail!r}") from None
 
-        if data.get("is_error"):
-            raise RuntimeError(vault.mask(str(data.get("result")))[:500])
-
         cost = float(data.get("total_cost_usd") or 0)
         sid = data.get("session_id")
+
+        if data.get("is_error"):
+            # СТРОКУ ЗАКРЫВАЕМ ОБЯЗАТЕЛЬНО. На первом живом прогоне три сессии
+            # упёрлись в потолок ходов, сожгли $9.39 квоты по счёту самого CLI
+            # — и остались открытыми строками с нулём. Суточный потолок этих
+            # денег не увидел, то есть тормоз опять не сработал там, где нужен.
+            await close_run(run_id, ok=False, backend=RUN_BACKEND,
+                            cost_usd=cost or llm.estimated_cost(elapsed),
+                            seconds=elapsed, estimated=not cost,
+                            log_path=str(log_path))
+            raise RuntimeError(_why_failed(data)) from None
 
         await close_run(run_id, ok=True, backend=RUN_BACKEND, cost_usd=cost,
                         seconds=elapsed, log_path=str(log_path))

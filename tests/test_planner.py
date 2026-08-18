@@ -694,3 +694,18 @@ async def test_fixed_stack_marked_in_prompt(db):
     await Planner(client=fake).plan(p)
 
     assert "ЗАФИКСИРОВАНО ВЛАДЕЛЬЦЕМ" in fake.prompts[0]
+
+
+def test_prompt_separates_architecture_from_libraries():
+    """`chosen` — решение об архитектуре, а не список зависимостей.
+
+    На живом прогоне зафиксированный стек из 14 позиций всё равно отвергался:
+    модель дописывала в chosen драйвер к уже выбранной базе («SQLAlchemy async
+    + asyncpg»), а на повторе вовсе отказалась планировать и выдала прозу.
+    Отказ планировать — худший ответ: у владельца не остаётся ни плана,
+    ни возможности поправить.
+    """
+    from autopilot.planner import SYSTEM
+
+    assert "НЕ ПИШИ" in SYSTEM, "в промпте нет запрета тащить библиотеки в chosen"
+    assert "план всё равно надо выдать" in SYSTEM, "нет запрета отказываться планировать"

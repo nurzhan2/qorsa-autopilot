@@ -746,3 +746,168 @@ def test_whole_answer_without_the_key_is_not_mistaken_for_a_fragment():
     """Чистый JSON без нужного ключа не должен молча превращаться в None."""
     data, extracted = parse_judge_json('{"verdict": "PASS"}', require=("tasks",))
     assert data == {"verdict": "PASS"}
+
+
+async def test_judge_sees_brand_new_files(db, tmp_path):
+    """Работа агента на пустом проекте — это НОВЫЕ файлы, и их надо показать.
+
+    В `git diff` новые файлы не видны вовсе. На проекте, который начинают
+    с нуля, судья получал бы пустой диф и честно отвечал «проверять нечего» —
+    то есть первая же живая задача провалилась бы не по делу.
+    """
+    import subprocess
+
+    repo = tmp_path / "workspace"
+    repo.mkdir()
+    for cmd in (["git", "init", "-q"],
+                ["git", "config", "user.email", "t@t"],
+                ["git", "config", "user.name", "t"]):
+        subprocess.run(cmd, cwd=repo, check=True, capture_output=True)
+    (repo / "main.py").write_text("def handler():\n    return 42\n", encoding="utf-8")
+
+    diff = await Verifier()._diff(str(repo))
+    assert "main.py" in diff, "судья не увидел созданный агентом файл"
+    assert "return 42" in diff, "в дифе нет содержимого новой работы"
+
+
+async def test_diff_empty_outside_a_repo(db, tmp_path):
+    """Не репозиторий — не диф. Молча брать чужой соседний репозиторий нельзя."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "x.txt").write_text("hi", encoding="utf-8")
+    assert await Verifier()._diff(str(plain)) == ""
+
+
+async def test_executor_resolves_the_cmd_wrapper(db, monkeypatch, tmp_path):
+    """Исполнитель обязан запускать claude.exe, а не обёртку claude.CMD.
+
+    Первый живой прогон полосы build встал ровно на этом: npm на Windows
+    ставит `claude.CMD`, `create_subprocess_exec` его не исполняет, и три
+    задачи подряд ушли в эскалацию, не начав работу. В llm.py это починили
+    ещё в фазе 9 — до исполнителя правка не дошла, потому что живьём его
+    не запускали.
+    """
+    import asyncio as aio
+
+    from autopilot.executor import Executor
+
+    bin_dir = tmp_path / "npm"
+    real = bin_dir / "node_modules" / "@anthropic-ai" / "claude-code" / "bin"
+    real.mkdir(parents=True)
+    (bin_dir / "claude.CMD").write_text("@echo off", encoding="utf-8")
+    (real / "claude.exe").write_text("", encoding="utf-8")
+
+    seen = {}
+
+    async def fake_exec(*args, **kwargs):
+        seen["argv"] = [str(a) for a in args]
+
+        class P:
+            returncode = 0
+            pid = None
+
+            async def communicate(self, input=None):
+                return (b'{"result": "ok", "total_cost_usd": 0.0, '
+                        b'"session_id": "s1"}', b"")
+        return P()
+
+    monkeypatch.setattr("shutil.which", lambda *a: str(bin_dir / "claude.CMD"))
+    monkeypatch.setattr(aio, "create_subprocess_exec", fake_exec)
+
+    p = await make_project()
+    task = await make_task(p.id, [{"type": "shell", "cmd": "echo ok"}], lane="build")
+    await Executor().run(task, p)
+
+    assert seen["argv"][0].lower().endswith("claude.exe"), (
+        f"исполнитель зовёт обёртку, а не бинарь: {seen['argv'][0]}")
+
+
+async def test_executor_sends_prompt_via_stdin(db, monkeypatch):
+    """Промпт исполнителя НЕ помещается в командную строку Windows.
+
+    Предел — 32767 символов, а промпт содержит весь бриф: на проекте 8 это
+    56 тысяч. CreateProcess падает с WinError 206, который Python отдаёт
+    как FileNotFoundError, и первый живой прогон выглядел как «бинарь
+    не найден», хотя бинарь был на месте. Ту же ловушку фаза 9 уже проходила
+    на вызовах модели — до исполнителя правка не дошла.
+    """
+    import asyncio as aio
+
+    from autopilot.executor import Executor
+
+    seen = {}
+
+    async def fake_exec(*args, **kwargs):
+        seen["argv"] = [str(a) for a in args]
+        seen["stdin"] = kwargs.get("stdin")
+
+        class P:
+            returncode = 0
+            pid = None
+
+            async def communicate(self, input=None):
+                seen["input"] = input
+                return b'{"result": "ok", "total_cost_usd": 0.0}', b""
+        return P()
+
+    monkeypatch.setattr("shutil.which", lambda *a: "/usr/bin/claude")
+    monkeypatch.setattr(aio, "create_subprocess_exec", fake_exec)
+
+    p = await make_project()
+    async with Session() as s:
+        row = await s.get(Project, p.id)
+        # бриф размером с настоящий: именно он и переполнял командную строку
+        row.brief = {"brief": {"deliverables": [{"text": "пункт " + "щ" * 400}
+                                                for _ in range(100)]}}
+        await s.commit()
+        p = await s.get(Project, p.id)
+
+    task = await make_task(p.id, [{"type": "shell", "cmd": "echo ok"}], lane="build")
+    await Executor().run(task, p)
+
+    joined = " ".join(seen["argv"])
+    assert len(joined) < 32767, "командная строка снова длиннее предела Windows"
+    assert "пункт" not in joined, "промпт уехал в аргументы, а не в stdin"
+    assert seen["input"] and b"\xd0\xbf\xd1\x83\xd0\xbd\xd0\xba\xd1\x82" in seen["input"], (
+        "промпт не дошёл до агента через stdin")
+
+
+async def test_failed_session_is_still_charged_and_explained(db, monkeypatch):
+    """Сессия, упёршаяся в потолок ходов, стоит денег и обязана их показать.
+
+    Первый живой прогон: три сессии исчерпали MAX_TURNS, сожгли $9.39 квоты
+    по счёту самого CLI — и оставили ОТКРЫТЫЕ строки с нулём. Суточный
+    потолок этих денег не увидел. В лог при этом уезжало голое «None»:
+    CLI на исчерпании ходов отдаёт `result: null`.
+    """
+    import asyncio as aio
+
+    from autopilot.db import Run
+    from autopilot.executor import Executor
+
+    async def fake_exec(*args, **kwargs):
+        class P:
+            returncode = 0
+            pid = None
+
+            async def communicate(self, input=None):
+                return (b'{"is_error": true, "result": null, "num_turns": 41, '
+                        b'"stop_reason": "tool_use", "total_cost_usd": 2.74}', b"")
+        return P()
+
+    monkeypatch.setattr("shutil.which", lambda *a: "/usr/bin/claude")
+    monkeypatch.setattr(aio, "create_subprocess_exec", fake_exec)
+
+    p = await make_project()
+    task = await make_task(p.id, [{"type": "shell", "cmd": "echo ok"}], lane="build")
+
+    with pytest.raises(RuntimeError) as exc:
+        await Executor().run(task, p)
+    assert "потолок ходов" in str(exc.value), f"причина скрыта: {exc.value}"
+
+    async with Session() as s:
+        row = (await s.execute(select(Run))).scalars().one()
+    assert row.finished_at is not None, "строка расхода осталась открытой"
+    assert row.ok is False
+    assert row.cost_usd == 2.74, "сожжённая квота не записана"
+    assert row.cost_estimated is False, "это замер CLI, а не наша оценка"

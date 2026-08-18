@@ -1,0 +1,214 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Qorsa Autopilot</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  /* Оформление сознательно скучное: воздух, границы вместо заливок, один
+     акцентный цвет. Это приборная панель, а не витрина — на ней смотрят
+     на цифры, а не на градиенты. */
+  :root {
+    --bg: #ffffff;
+    --fg: #1d1d1f;
+    --dim: #86868b;
+    --line: #d2d2d7;
+    --accent: #0071e3;
+    --warn: #bf4800;
+    --ok: #1d7a44;
+    --radius: 12px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000; --fg: #f5f5f7; --dim: #86868b; --line: #2c2c2e;
+      --accent: #0a84ff; --warn: #ff9f0a; --ok: #30d158;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 1080px; margin: 0 auto; padding: 64px 32px 96px; }
+  h1 { font-size: 40px; font-weight: 600; letter-spacing: -0.02em; margin: 0 0 4px; }
+  h2 {
+    font-size: 13px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--dim); margin: 56px 0 16px;
+  }
+  .sub { color: var(--dim); font-size: 13px; margin: 0 0 40px; }
+  .card {
+    border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 20px 24px; margin-bottom: 12px;
+  }
+  .card.attention { border-color: var(--warn); }
+  .row { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; }
+  .title { font-size: 17px; font-weight: 600; }
+  .meta { color: var(--dim); font-size: 13px; }
+  .meta b { font-weight: 600; color: var(--fg); }
+  .tag {
+    display: inline-block; border: 1px solid var(--line); border-radius: 999px;
+    padding: 1px 10px; font-size: 12px; color: var(--dim); margin-right: 6px;
+  }
+  .tag.warn { border-color: var(--warn); color: var(--warn); }
+  .tag.ok { border-color: var(--ok); color: var(--ok); }
+  .bar { height: 2px; background: var(--line); border-radius: 2px; margin: 14px 0 4px; }
+  .bar > i { display: block; height: 2px; background: var(--accent); border-radius: 2px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th {
+    text-align: left; font-weight: 500; color: var(--dim); padding: 6px 12px 6px 0;
+    border-bottom: 1px solid var(--line); font-size: 12px;
+  }
+  td { padding: 7px 12px 7px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  button {
+    font: inherit; font-size: 13px; color: var(--accent); background: none;
+    border: 1px solid var(--line); border-radius: 999px; padding: 3px 14px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.quiet { color: var(--dim); }
+  .spend { display: flex; gap: 48px; flex-wrap: wrap; }
+  .spend div { min-width: 180px; }
+  .num { font-size: 28px; font-weight: 600; letter-spacing: -0.01em; }
+  .defect { color: var(--warn); font-size: 13px; margin-top: 6px; }
+  .note { color: var(--dim); font-size: 13px; margin-top: 4px; }
+  .empty { color: var(--dim); font-size: 14px; padding: 8px 0; }
+  .paused { color: var(--warn); }
+</style>
+
+<main>
+  <h1>Автопилот</h1>
+  <p class="sub" id="head">загружаю…</p>
+
+  <h2>Ждут меня</h2>
+  <div id="attention"></div>
+
+  <h2>Проекты</h2>
+  <div id="projects"></div>
+
+  <h2>Расход за сутки</h2>
+  <div class="card spend" id="spend"></div>
+
+  <h2>Последние вызовы</h2>
+  <div class="card"><table id="runs"></table></div>
+</main>
+
+<script>
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => (
+  {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function act(url) {
+  const r = await fetch(url, {method: "POST"});
+  const data = await r.json();
+  if (data.message) alert(data.message);
+  else if (data.defects && data.defects.length) alert(data.defects.join("\n"));
+  load();
+}
+
+function attentionCard(t) {
+  const why = t.waits_confirmation
+    ? "приёмка прошла, но ничего не доказала"
+    : (t.status === "escalated" ? "исчерпаны попытки" : "нужен разбор");
+  return `<div class="card attention">
+    <div class="row">
+      <span class="title">${esc(t.title)}</span>
+      <span class="meta">#${t.id} · проект ${t.project_id}</span>
+    </div>
+    <div class="meta" style="margin-top:6px">
+      <span class="tag warn">${esc(t.status_ru)}</span>${esc(why)} ·
+      попыток ${t.attempts}
+    </div>
+    ${(t.defects || []).map(d => `<div class="defect">✗ ${esc(d)}</div>`).join("")}
+    ${(t.observations || []).map(o =>
+        `<div class="note">· вне критерия: ${esc(o)}</div>`).join("")}
+    <div style="margin-top:14px">
+      ${t.waits_confirmation
+        ? `<button onclick="act('/api/task/${t.id}/confirm')">Подтвердить</button>`
+        : `<button onclick="act('/api/task/${t.id}/done')">Я сделал, проверь</button>`}
+    </div>
+  </div>`;
+}
+
+function projectCard(p) {
+  const tasks = p.tasks.filter(t => t.status !== "done");
+  return `<div class="card">
+    <div class="row">
+      <span class="title">${esc(p.title)}</span>
+      <span class="meta">${esc(p.company)} · ${esc(p.client)}</span>
+    </div>
+    <div class="meta" style="margin-top:8px">
+      <span class="tag">${esc(p.status_ru)}</span>
+      <span class="tag">${esc(p.progress)}</span>
+      ${p.brief_ready ? '<span class="tag ok">ТЗ собрано</span>'
+                      : '<span class="tag warn">ТЗ не собрано</span>'}
+      ${p.ready_for_work ? '<span class="tag ok">готов к работе</span>'
+                         : '<span class="tag">галочки нет</span>'}
+      <b>$${p.cost.toFixed(2)}</b> · автономность ${p.autonomy}%
+    </div>
+    <div class="bar"><i style="width:${p.percent}%"></i></div>
+    ${p.waiting.length
+      ? `<div class="note">ждём от клиента: ${p.waiting.map(esc).join(", ")}</div>`
+      : ""}
+    ${p.last_action ? `<div class="note">${esc(p.last_action)}</div>` : ""}
+    ${tasks.length ? `<table style="margin-top:16px">
+      <tr><th>задача</th><th>статус</th><th>класс</th><th>кто</th><th>попыток</th></tr>
+      ${tasks.map(t => `<tr>
+        <td>${esc(t.title)}</td>
+        <td>${esc(t.status_ru)}</td>
+        <td>${esc(t.verify_class)}</td>
+        <td>${esc(t.executor)}</td>
+        <td>${t.attempts}</td></tr>`).join("")}
+    </table>` : '<div class="empty">открытых задач нет</div>'}
+  </div>`;
+}
+
+function render(s) {
+  document.getElementById("head").innerHTML =
+    `${s.now} UTC · ` +
+    (s.paused
+      ? `<span class="paused">работа на паузе</span> ·
+         <button class="quiet" onclick="act('/api/pause?on=false')">снять паузу</button>`
+      : `<button class="quiet" onclick="act('/api/pause?on=true')">поставить на паузу</button>`);
+
+  document.getElementById("attention").innerHTML =
+    s.attention.length ? s.attention.map(attentionCard).join("")
+                       : '<div class="empty">ничего не ждёт — всё либо идёт, либо сделано</div>';
+
+  document.getElementById("projects").innerHTML = s.projects.map(projectCard).join("");
+
+  const sp = s.spend;
+  document.getElementById("spend").innerHTML = `
+    <div>
+      <div class="meta">деньги, API</div>
+      <div class="num">$${sp.api.toFixed(2)}</div>
+      <div class="meta">из $${sp.api_limit} · вызовов ${sp.api_calls}</div>
+    </div>
+    <div>
+      <div class="meta">подписка, оценка</div>
+      <div class="num">~$${sp.cli.toFixed(2)}</div>
+      <div class="meta">из $${sp.cli_limit} · вызовов ${sp.cli_calls} · ${sp.cli_minutes} мин</div>
+    </div>`;
+
+  document.getElementById("runs").innerHTML =
+    `<tr><th>что</th><th>задача</th><th>итог</th><th>чем платили</th>
+         <th>минут</th><th>начат</th></tr>` +
+    s.runs.map(r => `<tr>
+      <td>${esc(r.kind)}</td>
+      <td>${r.task_id}</td>
+      <td>${r.finished ? (r.ok ? "ответ" : "обрыв") : "идёт"}</td>
+      <td>${r.backend === "cli" ? "подписка" : "деньги"}
+          ${r.cost ? `$${r.cost.toFixed(2)}` : ""}
+          ${r.estimated ? '<span class="tag">оценка</span>' : ""}</td>
+      <td>${r.minutes}</td>
+      <td class="meta">${esc(r.started)}</td></tr>`).join("");
+}
+
+async function load() {
+  try {
+    render(await (await fetch("/api/state")).json());
+  } catch (e) {
+    document.getElementById("head").textContent = "нет связи с автопилотом";
+  }
+}
+load();
+setInterval(load, 3000);
+</script>
