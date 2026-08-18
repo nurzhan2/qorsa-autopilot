@@ -9,3 +9,7 @@ cryptography>=42
 # нужен для проверок dom и screenshot; после установки:
 #   python -m playwright install chromium
 playwright>=1.40
+# локальный дашборд (scripts/dashboard.py). Слушает только петлю;
+# наружу отдавать нечего — там имена клиентов, суммы и чеклисты
+fastapi>=0.110
+uvicorn>=0.29

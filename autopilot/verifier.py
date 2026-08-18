@@ -690,18 +690,35 @@ class Verifier:
         return False, "судья: " + "; ".join(defects), notes
 
     async def _diff(self, cwd: str) -> str:
-        """git diff без shell-специфики: `2>/dev/null ||` под Windows не работает."""
-        for args in (["git", "--no-pager", "diff", "HEAD~1"], ["git", "--no-pager", "diff"]):
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *args, cwd=cwd,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-                out, _ = await proc.communicate()
-            except (FileNotFoundError, NotADirectoryError):
-                return ""
-            if proc.returncode == 0 and out.strip():
-                return out.decode(errors="replace")
+        """git diff без shell-специфики: `2>/dev/null ||` под Windows не работает.
+
+        **Новые файлы в `git diff` не видны вовсе.** На проекте, который агент
+        начинает с нуля, вся его работа — это новые файлы, то есть судья
+        получил бы пустой диф и честно ответил «проверять нечего». Поэтому
+        сначала `git add -N .`: он не добавляет содержимое в индекс, а лишь
+        объявляет намерение, и после него diff показывает новые файлы целиком.
+        """
+        await self._git(["git", "add", "-N", "."], cwd)
+        # HEAD~1 — если история есть; HEAD — первый коммит; голый diff —
+        # репозиторий без коммитов вовсе
+        for args in (["git", "--no-pager", "diff", "HEAD~1"],
+                     ["git", "--no-pager", "diff", "HEAD"],
+                     ["git", "--no-pager", "diff"]):
+            out = await self._git(args, cwd)
+            if out.strip():
+                return out
         return ""
+
+    @staticmethod
+    async def _git(args: list[str], cwd: str) -> str:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args, cwd=cwd,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await proc.communicate()
+        except (FileNotFoundError, NotADirectoryError, OSError):
+            return ""
+        return out.decode(errors="replace") if proc.returncode == 0 else ""
 
     async def _ask(self, task: Task, project: Project, *, prompt: str = "",
                    content=None, max_tokens: int = 800):
