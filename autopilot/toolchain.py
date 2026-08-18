@@ -116,8 +116,30 @@ def needed_by_stack(brief: dict | None) -> set[str]:
     return {tool for name, tool in STACK_TOOLS if name in text}
 
 
+def _server_reachable(host: str, port: int, timeout: float = 0.5) -> bool:
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def installed(tool: str) -> bool:
-    """Есть ли инструмент в системе."""
+    """Есть ли инструмент в системе — или, для сервера, доступен ли он.
+
+    `psql` — особый случай. Проверять наличие клиента CLI неверно: приложение
+    ходит в базу драйвером (asyncpg), а не через `psql`, и сервер вполне
+    работает без установленного клиента. Живой случай проекта 8: PostgreSQL 17
+    поднят на 5432, а `psql` в PATH нет — и без этой поправки код завёл бы
+    ложную задачу «установить PostgreSQL», которая уже установлен и работает.
+
+    Поэтому для базы спрашиваем не бинарь, а порт: отвечает ли кто-то на
+    localhost:5432. Отвечает — считаем, что PostgreSQL есть.
+    """
+    if tool in ("psql", "pg_isready"):
+        return shutil.which(tool) is not None or _server_reachable("localhost", 5432)
     return shutil.which(tool) is not None
 
 
