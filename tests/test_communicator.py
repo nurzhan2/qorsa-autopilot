@@ -215,3 +215,49 @@ def test_quiet_hours_window(monkeypatch):
     monkeypatch.setattr(cfg, "quiet_start", 0)
     monkeypatch.setattr(cfg, "quiet_end", 0)
     assert not in_quiet_hours(dt.datetime(2026, 1, 1, 3, 0))
+
+
+async def test_test_redirect_shields_the_client(db, monkeypatch):
+    """Предохранитель: пока задан TEST_REDIRECT_CHAT, клиент не получает ничего.
+
+    Ошибиться тут — значит написать живому клиенту во время отладки, поэтому
+    проверяем оба свойства: клиенту НЕ ушло, а на тестовый id ушло с пометкой.
+    """
+    monkeypatch.setattr(cfg, "test_redirect_chat", "8166436802")
+    monkeypatch.setattr(cfg, "tg_owner", "owner-chat")
+    p = await make_project(tg_chat_id="client-chat")
+    await make_access(p.id, "FTP хостинга", "ftp", "needed")
+    spy = Spy()
+    comm = Communicator(send_fn=spy)
+
+    async with Session() as s:
+        items = (await s.execute(select(AccessItem))).scalars().all()
+    m = await comm.remind_access(p, items)          # это TO_CLIENT
+    assert m.route == TO_CLIENT
+    async with Session() as s:
+        stored = await s.get(Message, m.id)
+        stored.send_after = utcnow() - dt.timedelta(seconds=1)
+        await s.commit()
+
+    assert await comm.pump_once() == 1
+    assert spy.to("client-chat") == [], "клиент получил сообщение при активном предохранителе"
+    got = spy.to("8166436802")
+    assert len(got) == 1, "на тестовый чат ничего не пришло"
+    assert got[0].startswith("[тест, предназначалось клиенту]")
+    assert "FTP хостинга" in got[0]
+
+
+async def test_test_redirect_leaves_owner_alone(db, monkeypatch):
+    """Владельца и менеджера предохранитель не трогает — они и так внутренние."""
+    monkeypatch.setattr(cfg, "test_redirect_chat", "8166436802")
+    monkeypatch.setattr(cfg, "manager_separate", False)
+    monkeypatch.setattr(cfg, "tg_owner", "owner-chat")
+    p = await make_project(tg_chat_id="client-chat")
+    spy = Spy()
+    comm = Communicator(send_fn=spy)
+
+    m = await comm.incoming(p, "сколько будет стоить доработка?")   # TO_OWNER
+    assert m.route == TO_OWNER
+    assert await comm.pump_once() == 1
+    assert len(spy.to("owner-chat")) == 1, "уведомление владельцу не дошло"
+    assert spy.to("8166436802") == [], "внутреннее сообщение зря перенаправлено на тест"

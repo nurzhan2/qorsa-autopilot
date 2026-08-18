@@ -13,3 +13,6 @@ playwright>=1.40
 # наружу отдавать нечего — там имена клиентов, суммы и чеклисты
 fastapi>=0.110
 uvicorn>=0.29
+
+# драйвер PostgreSQL для боевой базы проектов (DATABASE_URL в vault)
+asyncpg>=0.29

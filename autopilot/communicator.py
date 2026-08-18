@@ -467,6 +467,22 @@ class Communicator:
         # Компанию берём у ПРОЕКТА, а не у сообщения и не из настроек процесса:
         # проект — единственное место, где принадлежность зафиксирована жёстко
         account = await account_code(project.account_id)
+        if m.route == TO_CLIENT and cfg.test_redirect_chat:
+            # ПРЕДОХРАНИТЕЛЬ: во время тестов клиент не получает ничего.
+            # Всё, что ему предназначалось, уходит на тестовый id с явной
+            # пометкой — чтобы по нему было сразу видно, что это отладка,
+            # а не настоящая переписка. Обычным ботом, без бизнес-соединения:
+            # притворяться владельцем в тестовый чат незачем и опасно.
+            log.warning("[ТЕСТ] сообщение проекта %s клиенту перенаправлено "
+                        "на %s (адресат был %s:%s)", project.id,
+                        cfg.test_redirect_chat, m.transport, m.chat_id)
+            transport = self.transport_for(account, "telegram")
+            text = ("[тест, предназначалось клиенту]\n" + text)
+            if transport is None:
+                await self.send_fn(cfg.test_redirect_chat, text)
+                return cfg.test_redirect_chat
+            return await transport.send(cfg.test_redirect_chat, text)
+
         if m.route == TO_CLIENT:
             name, chat = m.transport, m.chat_id
             if not chat:
