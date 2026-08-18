@@ -98,6 +98,20 @@ def test_stack_names_what_criteria_forget(monkeypatch):
     assert [m["tool"] for m in missing] == ["psql"]
 
 
+def test_postgres_is_present_when_the_server_answers(monkeypatch):
+    """Для базы важен работающий сервер, а не установленный клиент psql.
+
+    Живой случай проекта 8: PostgreSQL 17 поднят на 5432, но psql в PATH нет.
+    Без поправки код завёл бы ложную задачу «установить PostgreSQL».
+    """
+    monkeypatch.setattr(toolchain.shutil, "which", lambda t: None)  # psql-клиента нет
+    monkeypatch.setattr(toolchain, "_server_reachable", lambda h, p, timeout=0.5: True)
+    assert toolchain.installed("psql") is True
+    # а если и клиента нет, и сервер молчит — тогда действительно нет
+    monkeypatch.setattr(toolchain, "_server_reachable", lambda h, p, timeout=0.5: False)
+    assert toolchain.installed("psql") is False
+
+
 def test_setup_tasks_are_manual_and_first():
     """Ставить SDK агент не должен: он уже раздул каталог до 3.7 ГБ."""
     missing = [{"tool": "flutter", "name": "Flutter SDK", "how": "docs",
