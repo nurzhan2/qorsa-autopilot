@@ -40,6 +40,7 @@ from .brief import (BriefFailed, SecretLeak, assert_no_secrets, item_text,
                     same_item)
 from . import checks
 from . import guard
+from . import toolchain
 from . import llm
 from .config import cfg
 from pathlib import Path
@@ -94,6 +95,16 @@ SYSTEM_TEMPLATE = """Ты технический директор. Из гото
             (на сайте без WooCommerce страницы корзины нет)
    Проверяй каждый критерий этим вопросом: «а если задачу не делать, он
    упадёт?». Если нет — критерий негодный, придумай другой.
+
+   КРИТЕРИЙ ОБЯЗАН БЫТЬ САМОДОСТАТОЧНЫМ. В shell-командах называй окружение
+   явно: не `pytest tests/`, а `.venv/Scripts/python -m pytest tests/` (или
+   `.venv/bin/python` — пиши тот вариант, что подходит целевой системе).
+   То же для любого инструмента, который ставится в проект, а не в систему.
+     ПЛОХО:  cd backend && pytest tests/test_cart.py
+     ХОРОШО: cd backend && .venv/Scripts/python -m pytest tests/test_cart.py
+   Это не педантизм: голая команда попадает в окружение того, кто её запустил.
+   Живой случай — агент сделал задачу, поднял окружение, получил 17 passed,
+   а приёмка выполнила ту же команду в другом окружении и провалила работу.
 
 3. verify_class — честная оценка:
      auto     — среди acceptance есть shell/http/file_exists/dom
@@ -764,6 +775,20 @@ class Planner:
             return None
 
         tasks, notes = self.normalize(tasks, brief, access)
+
+        # Окружение — ПЕРВЫМИ задачами, если критерии требуют того, чего
+        # на машине нет. Иначе автономность остаётся арифметикой: агент
+        # пишет разумный код, а приёмка падает на отсутствующем flutter
+        # и несуществующем localhost:8000. Проверено первым живым прогоном
+        missing = toolchain.missing_tools(tasks, brief)
+        if missing:
+            setup = toolchain.setup_tasks(missing)
+            tasks = setup + tasks
+            for row in missing:
+                notes.append(f"окружения нет: {row['name']} — заведена ручная "
+                             f"задача подготовки, без неё не проверить "
+                             f"{len(row['tasks'])} задач(и)")
+
         for note in notes:
             log.warning("проект %s: %s", project.id, note)
         if not tasks:
