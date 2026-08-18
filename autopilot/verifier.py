@@ -275,6 +275,47 @@ def part_of_criterion(part: str, criteria: str) -> bool:
     return len(pw & cw) / len(pw) >= PART_WORD_MATCH
 
 
+# Где искать окружение, которое агент создал сам. Порядок важен: сначала
+# корень проекта, потом типичные подкаталоги монолита.
+VENV_DIRS = (".venv", "venv", "backend/.venv", "backend/venv", "api/.venv")
+
+
+def project_venv(cwd: str) -> Path | None:
+    """Окружение, созданное агентом в каталоге проекта, если оно там есть."""
+    root = Path(cwd)
+    for name in VENV_DIRS:
+        for sub in ("Scripts", "bin"):          # Windows и всё остальное
+            path = root / name / sub
+            if (path / "python.exe").exists() or (path / "python").exists():
+                return path
+    return None
+
+
+def shell_env(cwd: str) -> dict | None:
+    """Окружение для shell-критерия, с `.venv` проекта в PATH.
+
+    Разумное умолчание, а не догадка о чужом проекте: этот проект агент
+    создал сам, и `.venv` в нём — его же работа. Живой случай: задача «API
+    корзины» была сделана — агент поднял окружение, прогнал `pytest`
+    и получил 17 passed, — а верификатор выполнил тот же `pytest` голой
+    командой, попал в СВОЁ окружение и провалил задачу на ошибке импорта.
+    Работа честно сделана, приёмка честно провалена, виноват был не код.
+
+    Явно названный в критерии путь (`.venv/Scripts/python -m pytest`) сильнее:
+    он просто не зависит от PATH. Здесь мы лишь подставляем умолчание тем
+    критериям, которые окружение не назвали.
+    """
+    venv = project_venv(cwd)
+    if venv is None:
+        return None
+    env = dict(os.environ)
+    env["PATH"] = str(venv) + os.pathsep + env.get("PATH", "")
+    env["VIRTUAL_ENV"] = str(venv.parent)
+    # PYTHONHOME от родителя увёл бы дочерний python в чужой интерпретатор
+    env.pop("PYTHONHOME", None)
+    return env
+
+
 def _unpack(result) -> tuple[bool, str, list[str]]:
     """Проверка возвращает (ok, сообщение) или (ok, сообщение, замечания)."""
     if len(result) == 3:
@@ -621,8 +662,9 @@ class Verifier:
 
     async def _shell(self, cmd: str, cwd: str) -> tuple[bool, str]:
         os.makedirs(cwd, exist_ok=True)
+        env = shell_env(cwd)
         proc = await asyncio.create_subprocess_shell(
-            cmd, cwd=cwd,
+            cmd, cwd=cwd, env=env,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=SHELL_TIMEOUT_SEC)
@@ -697,7 +739,17 @@ class Verifier:
         получил бы пустой диф и честно ответил «проверять нечего». Поэтому
         сначала `git add -N .`: он не добавляет содержимое в индекс, а лишь
         объявляет намерение, и после него diff показывает новые файлы целиком.
+
+        Но только если `cwd` — КОРЕНЬ своего репозитория. Каталог, лежащий
+        внутри чужого git-дерева (у автопилота такое бывает: workspace внутри
+        репозитория проекта, а pytest-tmp внутри домашнего каталога), — не
+        наш проект. Трогать `git add` там нельзя: заденем чужой индекс, а
+        покажем чужой диф, который к задаче отношения не имеет.
         """
+        toplevel = (await self._git(
+            ["git", "rev-parse", "--show-toplevel"], cwd)).strip()
+        if not toplevel or Path(toplevel).resolve() != Path(cwd).resolve():
+            return ""
         await self._git(["git", "add", "-N", "."], cwd)
         # HEAD~1 — если история есть; HEAD — первый коммит; голый diff —
         # репозиторий без коммитов вовсе

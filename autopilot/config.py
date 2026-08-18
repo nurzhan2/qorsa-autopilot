@@ -37,7 +37,11 @@ class Config:
     cc_model = os.getenv("CC_MODEL", "sonnet")
     judge_model = os.getenv("JUDGE_MODEL", "claude-sonnet-4-6")
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
-    max_turns = _i("MAX_TURNS", 40)
+    # 40 не хватало: на первом живом прогоне ВСЕ три первые итерации упёрлись
+    # в потолок ходов. Это чистая потеря — сессия сгорает целиком и не отдаёт
+    # ничего, а квоту съедает полностью ($2.7–3.4 за такой обрыв). Один
+    # длинный проход дешевле двух оборванных.
+    max_turns = _i("MAX_TURNS", 80)
     max_attempts = _i("MAX_ATTEMPTS", 4)
     task_timeout_sec = _i("TASK_TIMEOUT_SEC", 1800)
 
