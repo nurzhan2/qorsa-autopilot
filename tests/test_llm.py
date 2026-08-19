@@ -624,6 +624,40 @@ def test_real_quota_wall_is_still_detected(monkeypatch):
     assert exc.value.retry_after == 2 * 3600
 
 
+def test_failed_call_with_real_generation_is_not_a_quota_wall(monkeypatch):
+    """`is_error:true` С реальной генерацией — обычная ошибка, а не упор.
+
+    Одной починки формулировки мало: план, упомянувший «rate limit» в СВОЁМ
+    тексте, мог оборваться на чём угодно (потолок выходных токенов, например)
+    и всё равно попасть в `result` при `is_error:true` — под старой логикой
+    это снова читалось бы как упор в квоту. Настоящий упор отличается тем,
+    что генерации не было ВООБЩЕ: ни стоимости, ни токенов вывода. Здесь они
+    есть — значит модель честно работала и просто не завершила ответ, а не
+    «подожди» от CLI.
+    """
+    async def fake_exec(*args, **kwargs):
+        class P:
+            returncode = 1
+            pid = None
+
+            async def communicate(self, input=None):
+                body = json.dumps({
+                    "is_error": True,
+                    "result": ("Настроить rate limit на API: не больше 100 "
+                              "запросов в минуту к внешнему сервису."),
+                    "total_cost_usd": 0.42,
+                    "usage": {"output_tokens": 32000},
+                })
+                return body.encode(), b""
+        return P()
+
+    monkeypatch.setattr("shutil.which", lambda *a: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(LLMError):
+        asyncio.run(CliBackend().ask("составь план"))
+
+
 # ---------- второй тормоз: расход подписки ----------
 
 async def test_subscription_budget_stops_build(db, monkeypatch):

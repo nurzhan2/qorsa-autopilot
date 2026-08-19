@@ -386,7 +386,23 @@ class CliBackend:
             if isinstance(data, dict):
                 body = str(data.get("result") or "")
             body = body or stderr or stdout
-            if looks_like_limit(body, proc.returncode):
+
+            # Слова в `result` — ЭТО ОТВЕТ МОДЕЛИ, даже когда is_error:true:
+            # single-turn вызов вполне может оборваться на генерации (потолок
+            # выходных токенов, например), написав что-то своё про «rate
+            # limit» — план, честно упомянувший это слово, снова попал бы
+            # под маркер. Настоящий упор в квоту опознаётся тем, что генерации
+            # НЕ БЫЛО ВООБЩЕ: запрос отклонён ДО работы модели, значит нет ни
+            # стоимости, ни токенов вывода. Это и есть «конверт», а не текст:
+            # 429 кодом возврата или полное отсутствие биллинга у неудачного
+            # вызова. Пока была хоть какая-то генерация — считаем это обычной
+            # ошибкой, что бы модель ни написала.
+            usage = data.get("usage") if isinstance(data, dict) else None
+            had_generation = bool(isinstance(data, dict) and (
+                data.get("total_cost_usd") or (usage or {}).get("output_tokens")))
+            is_limit = proc.returncode == 429 or (
+                not had_generation and looks_like_limit(body))
+            if is_limit:
                 raise LimitReached(f"квота подписки исчерпана: {body[:300]}",
                                    retry_after_from(body))
             if data is None:

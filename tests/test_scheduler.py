@@ -114,6 +114,55 @@ async def test_no_double_build(db):
     assert peak["value"] == 1, f"проект держал {peak['value']} build-слотов разом"
 
 
+async def test_dependent_task_waits_for_done(db):
+    """Задача с depends_on не уходит в build, пока зависимость не done.
+
+    Живой случай: 499 («API корзины») зависит от 514 («инициализация
+    бэкенда»), и на живом прогоне порядок совпал случайно — тестовой защиты
+    от обратного не было вообще. `_pick()`/`_deps_done()` гейтуют это по
+    названию задачи (см. scheduler.py), а не по id, и до сих пор без единого
+    теста.
+
+    Бьём напрямую по `_pick()`, а не через `tick()`+`drain()`: у фейкового
+    исполнителя и приёмщика нулевая задержка, и «фундамент» успевал пройти
+    весь путь build→verify→done за те же несколько тиков, которые давались
+    циклу на проверку — тест был бы про скорость фейков, а не про гейт.
+    """
+    p = await make_project()
+    async with Session() as s:
+        base = Task(project_id=p.id, order_idx=0, lane="build",
+                    title="фундамент", status="ready",
+                    verify_class="auto", executor="claude_code", depends_on=[])
+        dependent = Task(project_id=p.id, order_idx=1, lane="build",
+                         title="зависимая", status="ready",
+                         verify_class="auto", executor="claude_code",
+                         depends_on=["фундамент"])
+        s.add_all([base, dependent])
+        await s.commit()
+        base_id, dep_id = base.id, dependent.id
+
+    sched = make_sched()
+
+    # зависимость ещё не done — «_pick» обязан выбрать «фундамент», а не
+    # «зависимую», сколько бы раз его ни звать: состояние между вызовами
+    # не меняется, и ничего не может внезапно сделать «зависимую» доступной
+    for _ in range(3):
+        pair = await sched._pick("build", cfg.lane_exclusive["build"])
+        assert pair is not None, "независимая задача не выбрана — тест ничего не проверяет"
+        assert pair[0].id == base_id, (
+            f"«_pick» выбрал {pair[0].title!r}, хотя её зависимость не done")
+
+    # зависимость закрыта — теперь «_pick» обязан суметь выбрать «зависимую»
+    async with Session() as s:
+        row = await s.get(Task, base_id)
+        row.status = "done"
+        await s.commit()
+
+    pair = await sched._pick("build", cfg.lane_exclusive["build"])
+    assert pair is not None and pair[0].id == dep_id, (
+        "зависимая задача не стала доступна после done у зависимости")
+
+
 async def test_budget_guard(db, monkeypatch):
     """Превышен DAILY_BUDGET_USD — build и verify встают, chat работает."""
     p = await make_project()
