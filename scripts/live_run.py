@@ -24,6 +24,7 @@ Claude Code пишет код в изолированном каталоге, а
 from __future__ import annotations
 
 import argparse
+import contextlib
 import asyncio
 import subprocess
 import sys
@@ -46,6 +47,7 @@ from autopilot.db import (Project, Run, Session, Task, cli_spent_today,  # noqa:
 from autopilot.executor import Executor                               # noqa: E402
 from autopilot.llm import LimitReached, LLMError                      # noqa: E402
 from autopilot.manual import NEEDS_HUMAN, needs_human                 # noqa: E402
+from autopilot.textenc import decode_console                          # noqa: E402
 from autopilot.verifier import Verifier                               # noqa: E402
 
 LINE = "─" * 78
@@ -65,6 +67,80 @@ def prepare_workspace(project_id: int) -> Path:
 
 async def spent() -> float:
     return await cli_spent_today()
+
+
+def _needs_server(task: Task) -> str | None:
+    """Порт, в который стучится http-критерий задачи, если он есть."""
+    import re
+    for check in task.acceptance or []:
+        if isinstance(check, dict) and check.get("type") == "http":
+            m = re.search(r"localhost:(\d+)|127\.0\.0\.1:(\d+)",
+                          str(check.get("url") or ""))
+            if m:
+                return m.group(1) or m.group(2)
+    return None
+
+
+@contextlib.asynccontextmanager
+async def _server_if_needed(task: Task, workspace: Path):
+    """Поднять бэкенд агента на время приёмки, если критерий требует localhost.
+
+    Точка входа берётся стандартная для зафиксированного стека —
+    `app.main:app` через uvicorn в окружении проекта. Это не догадка о чужом
+    проекте: стек выбрал владелец, а `.venv` создал сам агент. Не удалось
+    поднять — приёмка просто увидит закрытый порт, как и раньше.
+    """
+    port = _needs_server(task)
+    backend = workspace / "backend"
+    venv_py = None
+    for sub in ("Scripts", "bin"):
+        cand = backend / ".venv" / sub / ("python.exe" if sub == "Scripts" else "python")
+        if cand.exists():
+            venv_py = cand
+            break
+    if not port or venv_py is None or not (backend / "app").exists():
+        yield
+        return
+
+    print(f"  поднимаю сервер агента для приёмки: uvicorn app.main:app :{port}")
+    proc = await asyncio.create_subprocess_exec(
+        str(venv_py), "-m", "uvicorn", "app.main:app", "--port", port,
+        "--host", "127.0.0.1", cwd=str(backend),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    try:
+        import httpx
+
+        # НАСТОЯЩИЙ readiness-поллинг: опрашиваем порт, пока не ответит или
+        # не истечёт READY_TIMEOUT. Отказ соединения в первую секунду — это
+        # «ещё не встал», а не «не работает»: TCP-порт не слушается, пока
+        # uvicorn не закончил импорт приложения, а импорт занимает время.
+        # Раньше проверка стучалась один раз сразу — задача 499 падала не
+        # по своей вине, приёмка ловила именно это окно.
+        READY_TIMEOUT, POLL_EVERY = 30.0, 0.5
+        deadline = asyncio.get_event_loop().time() + READY_TIMEOUT
+        ready = False
+        while asyncio.get_event_loop().time() < deadline:
+            if proc.returncode is not None:
+                err = decode_console((await proc.stderr.read())[-400:])
+                print(f"  сервер не поднялся: {err}")
+                break
+            try:
+                async with httpx.AsyncClient(timeout=1) as c:
+                    await c.get(f"http://127.0.0.1:{port}/")
+                ready = True
+                break
+            except Exception:
+                await asyncio.sleep(POLL_EVERY)
+        if ready:
+            print("  сервер отвечает")
+        elif proc.returncode is None:
+            print(f"  сервер не ответил за {READY_TIMEOUT:.0f}с — критерии "
+                 f"всё равно проверю, но порт скорее всего ещё закрыт")
+        yield
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
 
 
 async def run_task(task_id: int, workspace: Path) -> dict:
@@ -115,12 +191,17 @@ async def run_task(task_id: int, workspace: Path) -> dict:
         build_sec = time.monotonic() - t0
         print(f"  сборка: {build_sec / 60:.1f} мин")
 
-        try:
-            verdict = await verifier.run(fresh, proj)
-        except LimitReached as e:
-            print(f"  УПОР В КВОТУ на приёмке: {e}")
-            return {"task": task_id, "title": task.title, "outcome": "квота",
-                    "iterations": iterations}
+        # Сервер для http-критериев поднимаем МЫ, на время приёмки. Это работа
+        # тест-стенда, а не верификатора: агент написал приложение, но его
+        # процесс закончился вместе со сборкой, а критерий стучится в живой
+        # localhost. Ровно на этом застряла задача 499 в прошлый раз.
+        async with _server_if_needed(fresh, workspace):
+            try:
+                verdict = await verifier.run(fresh, proj)
+            except LimitReached as e:
+                print(f"  УПОР В КВОТУ на приёмке: {e}")
+                return {"task": task_id, "title": task.title, "outcome": "квота",
+                        "iterations": iterations}
 
         seconds = time.monotonic() - t0
         quota = await spent() - before
