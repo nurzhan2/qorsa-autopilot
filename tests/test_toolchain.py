@@ -132,10 +132,16 @@ def test_missing_tools_ignores_project_level_ones(monkeypatch):
     tasks = [{"title": "тесты", "acceptance": [{"type": "shell", "cmd": "pytest tests/"}]}]
     assert toolchain.missing_tools(tasks) == []
 
+    # "flutter build apk" называет Flutter буквально, а Android SDK —
+    # только косвенно: без него сборка apk не пройдёт никогда, хотя слова
+    # adb в команде нет. Живой случай: задача 536 узнала об этом уже ПОСЛЕ
+    # провала, план не завёл установочную задачу заранее
     tasks = [{"title": "сборка", "acceptance": [{"type": "shell", "cmd": "flutter build apk"}]}]
     missing = toolchain.missing_tools(tasks)
-    assert [m["tool"] for m in missing] == ["flutter"]
-    assert "docs.flutter.dev" in missing[0]["how"]
+    tools = {m["tool"]: m for m in missing}
+    assert set(tools) == {"flutter", "adb"}
+    assert "docs.flutter.dev" in tools["flutter"]["how"]
+    assert "developer.android.com" in tools["adb"]["how"]
 
 
 def test_stack_names_what_criteria_forget(monkeypatch):
