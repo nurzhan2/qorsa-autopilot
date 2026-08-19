@@ -90,13 +90,25 @@ def commands_in(cmd: str) -> set[str]:
 
 
 def needed_by(acceptance) -> set[str]:
-    """Инструменты, которые требуются критериям приёмки задачи."""
+    """Инструменты, которые требуются критериям приёмки задачи.
+
+    Кроме имени команды, критерий может называть инструмент КОСВЕННО:
+    `flutter build apk` не содержит слова `adb`, но без Android SDK не
+    соберётся никогда. Живой случай: задача 536 попала в `needs_human` уже
+    ПОСЛЕ провала — план не завёл для неё установочную задачу заранее, ровно
+    потому что здесь стояла только буквальная `commands_in()`.
+    """
     out: set[str] = set()
     for check in acceptance or []:
         if not isinstance(check, dict):
             continue
         if check.get("type") == "shell":
-            out |= commands_in(str(check.get("cmd") or ""))
+            cmd = str(check.get("cmd") or "")
+            out |= commands_in(cmd)
+            low = cmd.lower()
+            for phrase, tool in EXTRA_HINTS.items():
+                if phrase in low:
+                    out.add(tool)
         elif check.get("type") in ("http", "dom", "screenshot"):
             # Проверка по адресу требует, чтобы кто-то этот адрес поднял.
             # Отдельным инструментом это не назвать, но задача «поднять
