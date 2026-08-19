@@ -37,7 +37,8 @@ import tempfile
 import time
 
 from . import guard
-from .config import _num, cfg
+from .config import cfg
+from .textenc import decode_console
 from .vault import anthropic_key, missing_secret_message
 
 log = logging.getLogger("llm")
@@ -107,24 +108,6 @@ class Reply:
     def billed(self) -> bool:
         """Списаны ли за это реальные деньги."""
         return self.backend == API
-
-
-def estimated_cost(seconds: float) -> float:
-    """Во что обошёлся вызов, у которого НЕ БЫЛО ответа.
-
-    Оборванный вызов квоту жжёт, а сказать, сколько именно, некому: цифру
-    отдаёт CLI вместе с ответом, которого нет. Раньше в такую строку писался
-    ноль, и два получасовых таймаута на плане проекта 8 не сдвинули суточный
-    потолок подписки ни на цент — то есть тормоз не работал ровно там, где
-    был нужен.
-
-    Считаем по времени. Ставка снята с успешных прогонов: план — $0.93 за
-    11.3 минуты, бриф — $0.32 за 3.7 минуты, то есть около $0.08 в минуту.
-    Это заведомо грубо и заведомо занижено для коротких вызовов (там велика
-    доля кэша), но ноль неверен всегда, а эта цифра — лишь иногда.
-    """
-    rate = _num("CLI_COST_PER_MINUTE_USD", 0.08, float)
-    return max(0.0, float(seconds) / 60.0 * rate)
 
 
 def backend_for(consumer: str) -> str:
@@ -372,8 +355,11 @@ class CliBackend:
             shutil.rmtree(workdir, ignore_errors=True)
         seconds = time.monotonic() - t0
 
-        stdout = (out or b"").decode(errors="replace")
-        stderr = (err or b"").decode(errors="replace")
+        # decode_console: --output-format json у claude всегда настоящий
+        # UTF-8, но упор/ошибка запуска на этой консоли (cp866) приходит
+        # не в UTF-8, и слепой decode(errors="replace") стирал бы причину
+        stdout = decode_console(out)
+        stderr = decode_console(err)
 
         # РАЗБИРАЕМ РАНЬШЕ, ЧЕМ ИЩЕМ УПОР В КВОТУ, и это не косметика.
         #

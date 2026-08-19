@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 import httpx
+from sqlalchemy import select
 
 from .checks import (DEFAULT_TIMEOUT_SEC, HUMAN_ONLY, REGISTRY, VIEWPORTS,
                      is_runnable, spec)
@@ -18,8 +19,9 @@ from .checks import suspicious as suspicious_reason
 from .config import cfg
 from . import llm
 from .llm import LLMError
-from .db import Project, Session, Task, close_run, open_run
-from .vault import anthropic_key, missing_secret_message
+from .textenc import decode_console
+from .db import AccessItem, Project, Session, Task, close_run, open_run
+from .vault import anthropic_key, missing_secret_message, vault
 
 log = logging.getLogger("verify")
 
@@ -316,6 +318,28 @@ def shell_env(cwd: str) -> dict | None:
     return env
 
 
+async def project_secret_env(project_id: int) -> dict[str, str]:
+    """Секреты проекта — те же, что получал исполнитель, для shell-критерия.
+
+    Живой случай: задача 514 («инициализация бэкенда») была сделана честно —
+    `DATABASE_URL` дошёл до агента через `Executor._secret_env()`, код
+    подключился к PostgreSQL и заработал. Приёмка гоняла ТОТ ЖЕ критерий
+    `alembic upgrade head` голым `os.environ` верификатора, где секрета нет:
+    настройки молча упали на захардкоженный дефолт с несуществующей ролью
+    БД, и `alembic` уронил задачу на чужой ошибке — не потому что код плох,
+    а потому что критерий проверяли без того, с чем код на самом деле писан.
+    Тот же урок, что уже был с `.venv`/PATH, только для секретов.
+    """
+    async with Session() as s:
+        refs = (await s.execute(
+            select(AccessItem.secret_ref)
+            .where(AccessItem.project_id == project_id,
+                   AccessItem.secret_ref.isnot(None)))).scalars().all()
+    if not refs:
+        return {}
+    return vault.env_for(*refs)
+
+
 def _unpack(result) -> tuple[bool, str, list[str]]:
     """Проверка возвращает (ok, сообщение) или (ok, сообщение, замечания)."""
     if len(result) == 3:
@@ -526,7 +550,7 @@ class Verifier:
     # --- обёртки под единый контракт (check, cwd, task, project) ---
 
     async def _check_shell(self, check, cwd, task, project):
-        return await self._shell(check["cmd"], cwd)
+        return await self._shell(check["cmd"], cwd, project)
 
     async def _check_http(self, check, cwd, task, project):
         return await self._http(check["url"], int(check.get("expect", 200) or 200))
@@ -660,9 +684,13 @@ class Verifier:
 
     # --- уровень 1: детерминированные ---
 
-    async def _shell(self, cmd: str, cwd: str) -> tuple[bool, str]:
+    async def _shell(self, cmd: str, cwd: str, project: Project | None = None) -> tuple[bool, str]:
         os.makedirs(cwd, exist_ok=True)
         env = shell_env(cwd)
+        if project is not None:
+            secrets = await project_secret_env(project.id)
+            if secrets:
+                env = {**(env or dict(os.environ)), **secrets}
         proc = await asyncio.create_subprocess_shell(
             cmd, cwd=cwd, env=env,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
@@ -674,7 +702,12 @@ class Verifier:
             return False, f"`{cmd}` не уложился в {SHELL_TIMEOUT_SEC}s"
         if proc.returncode == 0:
             return True, ""
-        tail = (out or b"").decode(errors="replace")[-1200:]
+        # decode_console, а не голый UTF-8: на этой консоли cp866, и слепой
+        # decode(errors="replace") превращал системные сообщения Windows
+        # («Система не может найти путь») и вывод flutter.bat в «������».
+        # Живой случай — дефект задачи 536, восстановить его после записи
+        # в базу было уже нельзя: байты потеряны на этапе decode()
+        tail = decode_console(out)[-1200:]
         return False, f"`{cmd}` exit={proc.returncode}\n{tail}"
 
     async def _http(self, url: str, expect: int) -> tuple[bool, str]:
@@ -770,7 +803,7 @@ class Verifier:
             out, _ = await proc.communicate()
         except (FileNotFoundError, NotADirectoryError, OSError):
             return ""
-        return out.decode(errors="replace") if proc.returncode == 0 else ""
+        return decode_console(out) if proc.returncode == 0 else ""
 
     async def _ask(self, task: Task, project: Project, *, prompt: str = "",
                    content=None, max_tokens: int = 800):
@@ -788,13 +821,15 @@ class Verifier:
                                            model=cfg.judge_model,
                                            max_tokens=max_tokens)
         except BaseException:
-            # см. llm.estimated_cost: у оборванного вызова цифры нет,
-            # а квота потрачена
+            # Ответа нет — значит нет и цифры расхода. Раньше здесь стояла
+            # оценка по времени, и это само было ошибкой в другую сторону:
+            # сон машины во время вызова засчитывался как минуты работы.
+            # Полезной работы не было — cost_usd=0. estimated=True не про
+            # цифру (она точная — ноль), а про то, что это не замер CLI
             spent = time.monotonic() - t0
             backend = getattr(self.backend, "name", llm.API)
             await close_run(run_id, ok=False, backend=backend,
-                            cost_usd=llm.estimated_cost(spent) if backend == llm.CLI else 0.0,
-                            seconds=spent, estimated=backend == llm.CLI)
+                            cost_usd=0.0, seconds=spent, estimated=True)
             raise
         await self._charge(task, project, reply, run_id)
         return reply

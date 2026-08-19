@@ -536,13 +536,15 @@ async def test_run_row_exists_before_the_model_answers(db):
     assert row.backend == "cli" and row.cost_usd == 0.02
 
 
-async def test_aborted_call_is_charged_by_time(db):
-    """Оборванный вызов жжёт квоту — и обязан двигать суточный потолок.
+async def test_aborted_call_is_recorded_at_zero_cost(db):
+    """Оборванный вызов не имеет подтверждённой цены — cost_usd=0.
 
-    Цифру расхода отдаёт CLI вместе с ответом, а у срубленного вызова ответа
-    нет. Раньше в строку писался ноль: два получасовых таймаута на плане
-    проекта 8 не сдвинули DAILY_CLI_BUDGET_USD ни на цент, то есть тормоз
-    не работал ровно там, где был нужен.
+    Раньше тут была оценка по времени: цифру расхода отдаёт CLI вместе
+    с ответом, а у срубленного вызова ответа нет, значит «сжёг примерно
+    N долларов». Сама оценка оказалась багом — сон машины во время вызова
+    засчитывался как минуты работы, и на живом прогоне это дало фантомные
+    $30+ на одной убитой задаче. Полезной работы не подтверждено — значит
+    и цена не подтверждена: пишем 0, а не гадаем.
     """
     from sqlalchemy import select
 
@@ -563,10 +565,8 @@ async def test_aborted_call_is_charged_by_time(db):
     async with Session() as s:
         row = (await s.execute(select(Run))).scalars().one()
     assert row.kind == "brief" and row.ok is False
-    assert row.cost_estimated is True, "догадка не отмечена как догадка"
-    assert row.cost_usd >= 0.0
-    # ставка берётся из времени вызова, а не с потолка
-    assert row.cost_usd == pytest.approx(llm.estimated_cost(row.seconds), rel=1e-6)
+    assert row.cost_usd == 0.0, "оборванный вызов не должен нести придуманную цену"
+    assert row.cost_estimated is True, "это не замер CLI — пометка должна остаться"
 
 
 def test_answer_mentioning_rate_limits_is_not_a_quota_wall(monkeypatch):
@@ -758,29 +758,20 @@ async def test_service_task_is_reused_not_bred(db):
     assert {r.task_id for r in runs} == {anchors[0].id}
 
 
-def test_estimated_cost_matches_observed_rate():
-    """Ставка снята с живых прогонов, а не выдумана.
+async def test_aborted_calls_do_not_move_the_subscription_brake(db, monkeypatch):
+    """Обратная сторона: оборванные вызовы БОЛЬШЕ НЕ двигают суточный потолок.
 
-    План на CLI: $0.93 за 11.3 минуты. Бриф: $0.32 за 3.7 минуты. Оценка
-    обязана попадать в тот же порядок — иначе потолок подписки будет врать
-    в разы, а не в проценты.
-    """
-    assert llm.estimated_cost(11.3 * 60) == pytest.approx(0.90, abs=0.15)
-    assert llm.estimated_cost(3.7 * 60) == pytest.approx(0.30, abs=0.10)
-    assert llm.estimated_cost(0) == 0.0
-
-
-async def test_aborted_calls_move_the_subscription_brake(db, monkeypatch):
-    """Проверка ради чего всё: оборванные вызовы тормозят build.
-
-    Часы тут не подменяем: `time.monotonic` зовёт и SQLAlchemy, и подмена
-    ломает пул соединений. Проверяем проводку — что путь провала берёт оценку
-    и что она доходит до счётчика подписки.
+    Прежняя версия этого теста проверяла противоположное — что оценка по
+    времени доходит до счётчика подписки, и это было осознанным решением.
+    Решение развернули: на живом прогоне тот же механизм посчитал часы сна
+    машины как работу и накрутил фантомные $30+ за одну убитую задачу,
+    упёршись в потолок раньше настоящих трат. Тормоз для реального упора
+    в квоту — отдельный механизм (`limits.py`, разбирает текст ответа CLI),
+    а не накопленная оценка по секундам.
     """
     from autopilot.db import cli_spent_today
 
     project = await make_project()
-    monkeypatch.setattr(llm, "estimated_cost", lambda seconds: 2.4)
 
     class Dead:
         name = "cli"
@@ -794,8 +785,8 @@ async def test_aborted_calls_move_the_subscription_brake(db, monkeypatch):
             await brief._call("промпт", None, project.id)
 
     spent = await cli_spent_today()
-    assert spent == pytest.approx(4.8), (
-        f"два оборванных вызова дали {spent:.2f} — тормоз не сдвинулся")
+    assert spent == pytest.approx(0.0), (
+        f"оборванные вызовы сдвинули счётчик на {spent:.2f} — цена не должна была быть придумана")
 
 
 def test_real_session_limit_text_is_recognised():

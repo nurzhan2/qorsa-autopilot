@@ -29,7 +29,7 @@ except (AttributeError, ValueError):
 
 from sqlalchemy import select                                          # noqa: E402
 
-from autopilot import manual                                          # noqa: E402
+from autopilot import manual, toolchain                               # noqa: E402
 from autopilot.config import cfg                                      # noqa: E402
 from autopilot.db import (Account, Project, Run, Session, Task,       # noqa: E402
                           AccessItem, cli_spent_today, consumed_today,
@@ -73,6 +73,18 @@ async def collect() -> dict:
         waiting_access.setdefault(a.project_id, []).append(f"{a.kind}: {a.name}")
 
     def task_row(t: Task) -> dict:
+        # «Ждёт окружение» ли задача — считаем только для того, что реально
+        # стоит и ждёт человека: на остальных это просто лишняя работа.
+        # Дефект «flutter build apk exit=1» и сама задача ждут одного и того
+        # же инструмента, поэтому смотрим и в дефекты, и в критерии — критерий
+        # называет `flutter build apk`, а слово `adb` в дефекте может и не
+        # встретиться вовсе.
+        env_hints = []
+        if t.status in ("needs_human", "escalated"):
+            criteria_text = " ".join(
+                str(c) for c in (t.acceptance or []) if isinstance(c, dict))
+            env_hints = toolchain.tool_hints_in_text(
+                " ".join(t.defects or []), criteria_text)
         return {
             "id": t.id, "title": t.title, "status": t.status,
             "status_ru": TASK_RU.get(t.status, t.status),
@@ -82,6 +94,7 @@ async def collect() -> dict:
             "observations": list(t.observations or []),
             "waits_confirmation": manual.waits_for_confirmation(t),
             "project_id": t.project_id,
+            "env_hints": env_hints,
         }
 
     rows = []
@@ -106,12 +119,28 @@ async def collect() -> dict:
             "tasks": [task_row(t) for t in live],
         })
 
-    attention = [task_row(t) for t in tasks
-                 if not t.orphaned and t.status in ("needs_human", "escalated")]
+    stuck = [task_row(t) for t in tasks
+             if not t.orphaned and t.status in ("needs_human", "escalated")]
+    # «ждёт окружение» — хотя бы один дефект/критерий упирается в инструмент,
+    # которого сейчас нет на машине: чинить код бессмысленно, пока его нет,
+    # проверка всё равно не пройдёт. Остальное — на глаза владельцу.
+    attention_env = [t for t in stuck if t["env_hints"]]
+    attention_review = [t for t in stuck if not t["env_hints"]]
+
+    # Тот же список инструментов, но одним сводным перечнем — что поставить,
+    # чтобы разблокировать разом, как раньше делалось для PostgreSQL/Flutter.
+    tools_needed: dict[str, dict] = {}
+    for t in attention_env:
+        for h in t["env_hints"]:
+            row = tools_needed.setdefault(h["tool"], {**h, "tasks": []})
+            row["tasks"].append(t["title"])
+    install_list = sorted(tools_needed.values(), key=lambda r: r["name"])
+
     both = await consumed_today()
     return {
         "projects": rows,
-        "attention": attention,
+        "attention": {"environment": attention_env, "review": attention_review},
+        "install_list": install_list,
         "runs": [{
             "id": r.id, "task_id": r.task_id, "kind": r.kind, "ok": bool(r.ok),
             "backend": r.backend, "cost": round(r.cost_usd or 0, 3),

@@ -15,6 +15,7 @@ from . import guard
 from . import llm
 from .db import (AccessItem, Project, Session, Task, close_run, open_run,
                  utcnow)
+from .textenc import decode_console
 from .vault import refs_in, to_env_names, vault
 
 log = logging.getLogger("exec")
@@ -137,10 +138,10 @@ class Executor:
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError as e:
+            # Процесс не стартовал вовсе — работы не было, cost_usd=0
             spent = time.monotonic() - t0
             await close_run(run_id, ok=False, backend=RUN_BACKEND,
-                            cost_usd=llm.estimated_cost(spent), seconds=spent,
-                            estimated=True)
+                            cost_usd=0.0, seconds=spent, estimated=True)
             # WinError 206 приходит сюда же, хотя означает совсем другое:
             # не «нет файла», а «слишком длинная командная строка»
             raise RuntimeError(f"не запустился {resolved!r}: {e}") from None
@@ -155,10 +156,14 @@ class Executor:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
+            # Раньше здесь стояла оценка по времени — и она же поймала на
+            # живых данных главный собственный промах: машина уснула на
+            # середине задачи 514, время ожидания досчиталось до 7+6 часов,
+            # и «оценка по времени» дала фантомные $30+ за прогон, который
+            # не сделал ни одного хода. Полезной работы не было — cost_usd=0
             spent = time.monotonic() - t0
             await close_run(run_id, ok=False, backend=RUN_BACKEND,
-                            cost_usd=llm.estimated_cost(spent), seconds=spent,
-                            estimated=True)
+                            cost_usd=0.0, seconds=spent, estimated=True)
             raise RuntimeError(f"timeout {cfg.task_timeout_sec}s") from None
         except BaseException:
             # отмена или сигнал: процесс убиваем сами, иначе он останется
@@ -175,15 +180,19 @@ class Executor:
         log_path.write_bytes(vault.mask_bytes(out or err or b""))
 
         try:
-            data = json.loads(out.decode(errors="replace"))
+            # --output-format json у claude всегда настоящий UTF-8, но
+            # decode_console не мешает: валидный UTF-8 побеждает первым
+            data = json.loads(decode_console(out))
         except Exception:
-            # Ответа нет — но сессия шла и квоту съела. Оценка по времени:
-            # ноль здесь означал бы, что работы не было
+            # Ответ не разобрать — цифры расхода нет. cost_usd=0: нечем
+            # подтвердить, что квота вообще потрачена не сном, а работой
             await close_run(run_id, ok=False, backend=RUN_BACKEND,
-                            cost_usd=llm.estimated_cost(elapsed),
-                            seconds=elapsed, estimated=True,
+                            cost_usd=0.0, seconds=elapsed, estimated=True,
                             log_path=str(log_path))
-            tail = vault.mask((err or out or b"").decode(errors="replace")[:500])
+            # decode_console, а не голый UTF-8: ошибка запуска на этой
+            # консоли (cp866) приходит не в UTF-8, и слепой decode
+            # стирал текст причины в «������»
+            tail = vault.mask(decode_console(err or out)[:500])
             raise RuntimeError(f"bad output: {tail!r}") from None
 
         cost = float(data.get("total_cost_usd") or 0)
@@ -194,9 +203,12 @@ class Executor:
             # упёрлись в потолок ходов, сожгли $9.39 квоты по счёту самого CLI
             # — и остались открытыми строками с нулём. Суточный потолок этих
             # денег не увидел, то есть тормоз опять не сработал там, где нужен.
+            #
+            # `cost` здесь — НАСТОЯЩАЯ цифра из ответа CLI, не наша оценка:
+            # ответ пришёл, просто с ошибкой. Если CLI вообще не назвал
+            # стоимость (cost == 0) — не гадаем по времени, а пишем 0.
             await close_run(run_id, ok=False, backend=RUN_BACKEND,
-                            cost_usd=cost or llm.estimated_cost(elapsed),
-                            seconds=elapsed, estimated=not cost,
+                            cost_usd=cost, seconds=elapsed, estimated=not cost,
                             log_path=str(log_path))
             raise RuntimeError(_why_failed(data)) from None
 

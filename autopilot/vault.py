@@ -151,7 +151,8 @@ class Vault:
     def mask_bytes(self, blob: bytes) -> bytes:
         if not blob:
             return blob
-        return self.mask(blob.decode(errors="replace")).encode()
+        from .textenc import decode_console
+        return self.mask(decode_console(blob)).encode()
 
 
 vault = Vault()

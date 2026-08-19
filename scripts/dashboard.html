@@ -79,8 +79,12 @@
   <h1>Автопилот</h1>
   <p class="sub" id="head">загружаю…</p>
 
-  <h2>Ждут меня</h2>
-  <div id="attention"></div>
+  <h2>Ждёт окружение</h2>
+  <div class="card" id="install_list" style="display:none"></div>
+  <div id="attention_env"></div>
+
+  <h2>Нужен разбор</h2>
+  <div id="attention_review"></div>
 
   <h2>Проекты</h2>
   <div id="projects"></div>
@@ -105,7 +109,9 @@ async function act(url) {
 }
 
 function attentionCard(t) {
-  const why = t.waits_confirmation
+  const why = t.env_hints && t.env_hints.length
+    ? "ждёт окружение — не отдана человеку, чинить код бессмысленно"
+    : t.waits_confirmation
     ? "приёмка прошла, но ничего не доказала"
     : (t.status === "escalated" ? "исчерпаны попытки" : "нужен разбор");
   return `<div class="card attention">
@@ -117,6 +123,8 @@ function attentionCard(t) {
       <span class="tag warn">${esc(t.status_ru)}</span>${esc(why)} ·
       попыток ${t.attempts}
     </div>
+    ${(t.env_hints || []).map(h =>
+        `<div class="defect">⛏ нужен ${esc(h.name)} — ${esc(h.how)}</div>`).join("")}
     ${(t.defects || []).map(d => `<div class="defect">✗ ${esc(d)}</div>`).join("")}
     ${(t.observations || []).map(o =>
         `<div class="note">· вне критерия: ${esc(o)}</div>`).join("")}
@@ -126,6 +134,18 @@ function attentionCard(t) {
         : `<button onclick="act('/api/task/${t.id}/done')">Я сделал, проверь</button>`}
     </div>
   </div>`;
+}
+
+function installListCard(items) {
+  if (!items.length) return "";
+  return `<div class="row"><span class="title">Поставить, чтобы разблокировать</span></div>
+    <table style="margin-top:12px">
+      <tr><th>инструмент</th><th>как поставить</th><th>ждут</th></tr>
+      ${items.map(i => `<tr>
+        <td>${esc(i.name)}</td>
+        <td>${esc(i.how)}</td>
+        <td class="meta">${i.tasks.map(esc).join(", ")}</td></tr>`).join("")}
+    </table>`;
 }
 
 function projectCard(p) {
@@ -169,8 +189,20 @@ function render(s) {
          <button class="quiet" onclick="act('/api/pause?on=false')">снять паузу</button>`
       : `<button class="quiet" onclick="act('/api/pause?on=true')">поставить на паузу</button>`);
 
-  document.getElementById("attention").innerHTML =
-    s.attention.length ? s.attention.map(attentionCard).join("")
+  const envList = document.getElementById("install_list");
+  if (s.install_list && s.install_list.length) {
+    envList.style.display = "";
+    envList.innerHTML = installListCard(s.install_list);
+  } else {
+    envList.style.display = "none";
+  }
+
+  document.getElementById("attention_env").innerHTML =
+    s.attention.environment.length ? s.attention.environment.map(attentionCard).join("")
+                       : '<div class="empty">окружения хватает всему, что ждёт</div>';
+
+  document.getElementById("attention_review").innerHTML =
+    s.attention.review.length ? s.attention.review.map(attentionCard).join("")
                        : '<div class="empty">ничего не ждёт — всё либо идёт, либо сделано</div>';
 
   document.getElementById("projects").innerHTML = s.projects.map(projectCard).join("");

@@ -11,9 +11,11 @@ import sys
 
 import pytest
 from conftest import make_project
+from cryptography.fernet import Fernet
 
 from autopilot import toolchain
-from autopilot.db import Session, Task
+from autopilot.db import AccessItem, Session, Task
+from autopilot.vault import Vault
 from autopilot.verifier import Verifier, project_venv, shell_env
 
 
@@ -65,6 +67,52 @@ def test_shell_env_is_none_without_a_venv(tmp_path):
     """Нет окружения — нет и подмены: ничего не выдумываем."""
     assert project_venv(str(tmp_path)) is None
     assert shell_env(str(tmp_path)) is None
+
+
+async def test_shell_criterion_sees_project_secrets(db, tmp_path, monkeypatch):
+    """Критерий-shell должен видеть ТЕ ЖЕ секреты, что и агент, который писал код.
+
+    Живой случай: задача 514 («инициализация бэкенда») была сделана честно —
+    `DATABASE_URL` дошёл до агента через окружение исполнителя, код подключился
+    к PostgreSQL и заработал. Приёмка гоняла тот же критерий `alembic upgrade
+    head`, но верификатор строил окружение из голого `os.environ`, где секрета
+    нет — настройки молча упали на захардкоженный дефолт с несуществующей
+    ролью БД, и alembic уронил задачу на чужой ошибке, а не на своей.
+    """
+    v = Vault(path=tmp_path / "secrets.enc", key=Fernet.generate_key())
+    v.set("DATABASE_URL", "postgresql://real:secret@localhost/db")
+    monkeypatch.setattr("autopilot.verifier.vault", v)
+
+    project_dir = tmp_path / "app"
+    project_dir.mkdir()
+
+    p = await make_project()
+    async with Session() as s:
+        row = await s.get(type(p), p.id)
+        row.workspace = str(project_dir)
+        await s.commit()
+
+    async with Session() as s:
+        s.add(AccessItem(project_id=p.id, name="БД", kind="other",
+                         status="received", secret_ref="{{SECRET:DATABASE_URL}}"))
+        await s.commit()
+
+    cmd = (f'{sys.executable} -c "import os,sys; '
+          f'sys.exit(0 if os.environ.get(\'DATABASE_URL\') == '
+          f'\'postgresql://real:secret@localhost/db\' else 1)"')
+    async with Session() as s:
+        task = Task(project_id=p.id, lane="verify", status="ready",
+                    title="инициализация бэкенда", verify_class="auto",
+                    executor="claude_code", depends_on=[],
+                    acceptance=[{"type": "shell", "cmd": cmd}])
+        s.add(task)
+        await s.commit()
+        task = await s.get(Task, task.id)
+        proj = await s.get(type(p), p.id)
+
+    verdict = await Verifier().run(task, proj)
+    assert verdict.ok is True, (
+        f"критерий не увидел секрет проекта, хотя агент его получал: {verdict.defects}")
 
 
 # ---------- чего не хватает на машине ----------
@@ -123,6 +171,33 @@ def test_setup_tasks_are_manual_and_first():
     assert t["setup"] is True
     assert t["acceptance"] == [{"type": "shell", "cmd": "flutter --version"}]
     assert "Flutter SDK" in t["title"]
+
+
+def test_tool_hints_flag_apk_build_without_naming_adb(monkeypatch):
+    """«flutter build apk» упал — дело в Android SDK, хотя слова adb в тексте нет.
+
+    Живой случай: задача 536 попала в needs_human с дефектом про
+    `flutter build apk`, хотя на машине не хватало именно Android SDK,
+    а не самой Flutter. Дашборду нужно отличить «ждёт окружение» от
+    «нужен разбор глазами» — без этого обе задачи выглядят одинаково.
+    """
+    monkeypatch.setattr(toolchain, "installed", lambda t: False)
+    hints = toolchain.tool_hints_in_text(
+        "`cd client_app && flutter build apk --debug` exit=1\nСборка не удалась")
+    tools = {h["tool"] for h in hints}
+    assert "adb" in tools
+    assert "flutter" in tools
+
+
+def test_tool_hints_empty_when_everything_installed(monkeypatch):
+    monkeypatch.setattr(toolchain, "installed", lambda t: True)
+    assert toolchain.tool_hints_in_text("flutter build apk failed, exit=1") == []
+
+
+def test_tool_hints_ignore_project_level_tools(monkeypatch):
+    """pytest ставит агент себе в .venv — отсутствие в PATH не повод для «ждёт окружение»."""
+    monkeypatch.setattr(toolchain, "installed", lambda t: False)
+    assert toolchain.tool_hints_in_text("pytest tests/ failed") == []
 
 
 def test_executor_prompt_forbids_downloading_sdk():

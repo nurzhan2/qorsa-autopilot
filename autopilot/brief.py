@@ -639,14 +639,16 @@ class Brief:
             reply = await self.backend.ask(prompt, system=SYSTEM, model=self.model,
                                            max_tokens=cfg.brief_max_tokens)
         except BaseException:
-            # Ответа нет — значит нет и цифры расхода. Ноль тут неверен:
-            # оборванный вызов квоту сжёг, и потолок подписки обязан это
-            # увидеть. Оцениваем по времени и помечаем, что это оценка
+            # Ответа нет — значит нет и цифры расхода. Раньше здесь стояла
+            # оценка по времени, и это само было ошибкой в другую сторону:
+            # сон машины во время вызова засчитывался как минуты работы,
+            # и один такой прогон дал фантомные $30+ на убитой задаче.
+            # Полезной работы не было — cost_usd=0. estimated=True не про
+            # цифру (она точная — ноль), а про то, что это не замер CLI
             spent = time.monotonic() - t0
             backend = getattr(self.backend, "name", "api")
             await close_run(run_id, ok=False, backend=backend,
-                            cost_usd=llm.estimated_cost(spent) if backend == llm.CLI else 0.0,
-                            seconds=spent, estimated=backend == llm.CLI)
+                            cost_usd=0.0, seconds=spent, estimated=True)
             raise
         await self._charge(reply, task_id, project_id, run_id)
         return reply.text, reply.stop_reason

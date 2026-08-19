@@ -46,6 +46,20 @@ TOOLS: dict[str, tuple[str, str]] = {
 # в PATH ничего не значит, потому что искать их надо в окружении проекта.
 IN_PROJECT = {"pytest", "alembic", "uvicorn", "pip"}
 
+# Фразы, которые не являются именем команды, но однозначно указывают на
+# инструмент из TOOLS. Критерий «flutter build apk» не содержит слова adb,
+# но без Android SDK не соберётся никогда — а именно так выглядел живой
+# дефект задачи 536: `flutter build apk` упал, но дело не в коде клиента.
+EXTRA_HINTS: dict[str, str] = {
+    "apk": "adb",
+    "aab": "adb",
+    "android sdk": "adb",
+    "android toolchain": "adb",
+    "gradle": "gradle",
+    ".ipa": "xcodebuild",
+    "xcode": "xcodebuild",
+}
+
 
 def commands_in(cmd: str) -> set[str]:
     """Какие программы зовёт shell-команда.
@@ -141,6 +155,32 @@ def installed(tool: str) -> bool:
     if tool in ("psql", "pg_isready"):
         return shutil.which(tool) is not None or _server_reachable("localhost", 5432)
     return shutil.which(tool) is not None
+
+
+def tool_hints_in_text(*texts: str) -> list[dict]:
+    """Какие инструменты из TOOLS упоминает произвольный текст и сейчас
+    отсутствуют на машине.
+
+    Нужен дашборду: `needs_human`-задача, чей дефект называет отсутствующий
+    инструмент, ждёт установки, а не разбора глазами — чинить код бессмысленно,
+    пока инструмента нет, проверка всё равно не пройдёт.
+    """
+    low = " ".join(t for t in texts if t).lower()
+    found: dict[str, None] = {}
+    for key in TOOLS:
+        if key in IN_PROJECT:
+            continue
+        if re.search(rf"\b{re.escape(key)}\b", low):
+            found[key] = None
+    for phrase, key in EXTRA_HINTS.items():
+        if phrase in low and key in TOOLS:
+            found[key] = None
+    out = []
+    for tool in found:
+        if not installed(tool):
+            name, how = TOOLS[tool]
+            out.append({"tool": tool, "name": name, "how": how})
+    return out
 
 
 def missing_tools(tasks, brief: dict | None = None) -> list[dict]:
