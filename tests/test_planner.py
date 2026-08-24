@@ -164,6 +164,50 @@ def test_pick_executor_downgrades():
                          "manual") == "manual"
 
 
+def test_pick_executor_does_not_downgrade_our_own_admin_panel():
+    """Живой случай проекта 8: 8 задач понижены до manual только за слово
+    в названии, хотя ни одна не требует клика в ЧУЖОМ интерфейсе — это
+    собственный код агента (Jinja2-админка, интеграция ЮKassa, локализация).
+
+    Разница не в корне слова, а в предлоге: «через админку» — работа
+    В ЧУЖОЙ системе, «Веб-админка: ...» как название — то, что мы САМИ
+    строим и проверяем file_exists/dom по своему же localhost.
+    """
+    file_check = {"type": "file_exists", "path": "backend/app/templates/admin/base.html"}
+    dom_check = {"type": "dom", "url": "http://localhost:8000/admin/products",
+                "selector": "table"}
+
+    # (заголовок, описание — как в реальном плане проекта 8, там и была
+    # ложная фраза «через админ-панель», не «через панель», критерии)
+    cases = [
+        ("Веб-админка: базовая структура (Jinja2 + Starlette)",
+         "Подключить Jinja2Templates к FastAPI, базовый layout с навигацией",
+         [file_check]),
+        ("Веб-админка: управление товарами, категориями, фото",
+         "Это закрывает требование «владелец самостоятельно добавляет "
+         "товары через админ-панель»",
+         [dom_check]),
+        ("Веб-админка: управление заказами и ручная смена статуса",
+         "Кнопка назначения курьера на заказ", [dom_check]),
+        ("Веб-админка: список отелей зоны доставки",
+         "Импорт из CSV для первоначальной загрузки списка отелей", [dom_check]),
+        ("Интеграция ЮKassa (карты + СБП)",
+         "Тест с моком ЮKassa API: успешная оплата переводит заказ в статус paid",
+         [shell()]),
+        ("Flutter клиент: корзина и оформление заказа",
+         "Кнопка «Оформить заказ» → POST /orders → переход к оплате", [shell()]),
+        ("Flutter клиент: оплата через ЮKassa",
+         "Слушать редирект на success/fail URL", [shell()]),
+        ("Flutter клиент: локализация (ru/en/tr)",
+         "Заполнить lib/l10n всеми строками интерфейса", [shell()]),
+    ]
+    for title, description, acceptance in cases:
+        got = pick_executor(
+            {"title": title, "description": description, "acceptance": acceptance},
+            "claude_code")
+        assert got == "claude_code", f"{title!r} понижена до {got!r} без внешней причины"
+
+
 # ---------- зависимости ----------
 
 async def test_depends_on_blocks(db):

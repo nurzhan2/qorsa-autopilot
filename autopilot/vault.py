@@ -18,7 +18,7 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from .config import cfg
+from .config import _is_placeholder, cfg
 
 log = logging.getLogger("vault")
 
@@ -203,22 +203,23 @@ def install_log_masking(source: Vault | None = None) -> SecretMasker | None:
 
 # ---------- единая точка получения секретов ----------
 
-# Значения-заглушки из .env.example. Без этой проверки `sk-ant-...` считается
-# настоящим ключом, код уходит в API и получает 401 вместо внятного «ключа нет».
-PLACEHOLDERS = ("sk-ant-...", "sk-...", "1abc...", "changeme", "todo", "xxx")
-
 ENV_FILE = "окружение"
 ENV_DOTFILE = ".env"
 SOURCE_VAULT = "vault"
 
 
 def _usable(value: str | None) -> bool:
+    """Заглушка из .env.example (`sk-ant-...` и подобные) — не значение.
+
+    Без этой проверки код уходит в API с заглушкой вместо ключа и получает
+    401 вместо внятного «ключа нет». Список и сама проверка — в config.py:
+    там же заглушки чистятся из os.environ сразу после load_dotenv(), чтобы
+    не утечь в окружение дочерних процессов (Executor, CliBackend).
+    """
     v = (value or "").strip()
     if not v:
         return False
-    if v in PLACEHOLDERS or v.endswith("..."):
-        return False
-    return True
+    return not _is_placeholder(v)
 
 
 def _dotenv_values() -> dict[str, str]:

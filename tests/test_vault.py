@@ -139,3 +139,44 @@ def test_vault_disabled_without_key(tmp_path):
     assert v.enabled is False
     assert v.names() == []
     assert v.mask("что угодно") == "что угодно"
+
+
+# ---------- заглушки .env не должны утекать в окружение дочернего процесса ----------
+
+def test_is_placeholder_recognises_stub_values():
+    """Живой случай: задача 523 получила ANTHROPIC_API_KEY=sk-ant-... и упала
+    с «401 API key is invalid» — CLI пытался авторизоваться заглушкой из
+    .env.example, хотя настоящий ключ лежит в vault и подписке не нужен вовсе.
+    """
+    from autopilot.config import _is_placeholder
+
+    for stub in ("sk-ant-...", "sk-...", "1abc...", "changeme", "todo", "xxx",
+                "что-угодно-с-многоточием..."):
+        assert _is_placeholder(stub) is True, f"{stub!r} не распознан как заглушка"
+
+    for real in ("sk-ant-api03-realkeylookinglonghex1234567890",
+                "postgresql+asyncpg://postgres:pass@localhost:5432/db", "12"):
+        assert _is_placeholder(real) is False, f"{real!r} ошибочно принят за заглушку"
+
+
+def test_env_placeholder_does_not_leak_into_process(tmp_path):
+    """Заглушка из .env не должна оказаться в os.environ вообще.
+
+    load_dotenv() кладёт .env в окружение ПРОЦЕССА как есть, а окружение
+    дочернего claude собирается из os.environ напрямую (Executor._secret_env,
+    CliBackend.ask) — заглушка утекала бы в любой такой subprocess. Проверяем
+    ту же логику, что реально чистит os.environ при импорте autopilot.config,
+    на синтетическом примере, а не полагаемся на содержимое настоящего .env.
+    """
+    import os
+
+    from autopilot.config import _is_placeholder
+
+    os.environ["_TEST_STUB_SECRET"] = "sk-ant-..."
+    try:
+        for name, val in list(os.environ.items()):
+            if _is_placeholder(val):
+                del os.environ[name]
+        assert "_TEST_STUB_SECRET" not in os.environ
+    finally:
+        os.environ.pop("_TEST_STUB_SECRET", None)

@@ -9,6 +9,28 @@ load_dotenv(ROOT / ".env")
 
 log = logging.getLogger("cfg")
 
+# Заглушки из .env.example (sk-ant-... и подобные) не считаются настоящим
+# значением нигде в проекте — используется и здесь, и в vault._usable().
+PLACEHOLDERS = ("sk-ant-...", "sk-...", "1abc...", "changeme", "todo", "xxx")
+
+
+def _is_placeholder(value: str) -> bool:
+    return value in PLACEHOLDERS or value.endswith("...")
+
+
+# load_dotenv() кладёт .env В ОКРУЖЕНИЕ ПРОЦЕССА как есть, заглушки включая.
+# Окружение дочерних процессов (Executor, CliBackend) строится из os.environ
+# напрямую — и заглушка утекала туда же. Живой случай: задача 523 получила
+# ANTHROPIC_API_KEY=sk-ant-... и упала с «401 API key is invalid», хотя
+# настоящий ключ лежит в vault и подписке он вообще не нужен — до добавления
+# первого секрета в access_items это было не видно, потому что окружение
+# дочернего процесса строилось как env=None (то же самое os.environ, только
+# без явного прохода через фильтр). Чистим сразу, а не там, где нашли:
+# resolve_secret() и так игнорировал заглушку, но чужой subprocess — нет.
+for _name, _val in list(os.environ.items()):
+    if _is_placeholder(_val):
+        del os.environ[_name]
+
 
 def _num(key, default, cast):
     """Пустая или кривая переменная в .env не должна ронять импорт всего процесса."""
