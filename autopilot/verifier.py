@@ -7,6 +7,7 @@ import dataclasses as dc
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
@@ -587,11 +588,20 @@ class Verifier:
     async def _check_dom(self, check, cwd, task, project):
         """Селектор на живой странице. Через headless-браузер, а не разбор HTML:
         половина верстки сегодня дорисовывается скриптами, и по сырому
-        HTML такой проверки не сделать."""
+        HTML такой проверки не сделать.
+
+        Опциональный `login` — та же дыра, что была у 519 («модели
+        импортируются» проходит на заглушках): без сессии dom-проверка
+        админ-панели видит форму логина, а не защищённую страницу, и
+        засчитывает это за успех. `login: {url, method, body}` логинится
+        ДО навигации через httpx и переносит cookie в контекст браузера —
+        критерий держит содержимое страницы, а не факт её существования.
+        """
         url = str(check.get("url") or "")
         selector = str(check.get("selector") or "")
         need = int(check.get("min_count", 1) or 1)
         timeout = float(check.get("timeout", DEFAULT_TIMEOUT_SEC) or DEFAULT_TIMEOUT_SEC)
+        login = check.get("login") if isinstance(check.get("login"), dict) else None
 
         try:
             from playwright.async_api import async_playwright
@@ -600,10 +610,29 @@ class Verifier:
                            "(pip install playwright && playwright install chromium)")
 
         try:
+            cookies = []
+            if login:
+                login_url = str(login.get("url") or "")
+                if login_url.startswith("/"):
+                    base = re.match(r"(https?://[^/]+)", url)
+                    login_url = (base.group(1) if base else "") + login_url
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as c:
+                    resp = await c.request(str(login.get("method") or "POST").upper(),
+                                           login_url, json=login.get("body") or {})
+                for name, value in resp.cookies.items():
+                    cookies.append({"name": name, "value": value, "url": url})
+                if not cookies:
+                    return False, (f"dom: логин {login_url} не установил тестовую сессию "
+                                   f"(код {resp.status_code}, cookie нет) — dom-проверку "
+                                   f"запускать не на чем")
+
             async with async_playwright() as pw:
                 browser = await pw.chromium.launch()
                 try:
-                    page = await browser.new_page()
+                    context = await browser.new_context()
+                    if cookies:
+                        await context.add_cookies(cookies)
+                    page = await context.new_page()
                     page.set_default_timeout(timeout * 1000)
                     await page.goto(url, wait_until="networkidle",
                                     timeout=timeout * 1000)

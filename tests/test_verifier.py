@@ -145,6 +145,101 @@ async def test_dom_check_js_rendered(db):
     assert "Тест" in msg, "в сообщении должно быть видно, что мы реально открыли"
 
 
+@pytest.fixture
+def login_gated_server():
+    """Живой сервер: /dashboard отдаёт форму логина без cookie, дашборд — с ней.
+
+    Живой случай — тот же класс ошибки, что у 519 («модели импортируются»
+    проходит на заглушках): dom-проверка без сессии видела бы форму логина
+    и засчитывала бы её за «админка работает». Нужен настоящий HTTP-сервер,
+    а не data:-страница — cookie ставится ответом на POST, а не статикой.
+    """
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            authed = "session=test-admin" in (self.headers.get("Cookie") or "")
+            body = ('<html><body><div class="dashboard">панель администратора</div>'
+                    '</body></html>' if authed else
+                    '<html><body><form>логин</form></body></html>')
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        def do_POST(self):
+            self.send_response(200)
+            self.send_header("Set-Cookie", "session=test-admin; Path=/")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}"
+    server.shutdown()
+
+
+async def test_dom_check_without_login_sees_the_login_form(db, login_gated_server):
+    """Без сессии критерий видит форму логина, а не панель — и честно проваливается."""
+    p = await make_project()
+    v = Verifier()
+    ok, msg = await v._check_dom(
+        {"type": "dom", "url": f"{login_gated_server}/dashboard",
+         "selector": ".dashboard"}, ".", None, p)
+    assert ok is False, "критерий без сессии не должен видеть защищённую страницу"
+    assert "найден 0 раз" in msg
+
+
+async def test_dom_check_with_login_reaches_the_real_dashboard(db, login_gated_server):
+    """С логином критерий видит настоящую панель, а не форму входа."""
+    p = await make_project()
+    v = Verifier()
+    ok, msg = await v._check_dom(
+        {"type": "dom", "url": f"{login_gated_server}/dashboard",
+         "selector": ".dashboard",
+         "login": {"url": "/login", "method": "POST", "body": {"phone": "+70000000000"}}},
+        ".", None, p)
+    assert ok is True, f"логин не пробил сессию: {msg}"
+
+
+async def test_dom_check_login_without_cookie_fails_loudly(db, login_gated_server):
+    """Логин не поставил cookie — критерий не притворяется, что сессия есть."""
+    import http.server
+    import threading
+
+    class NoCookieHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), NoCookieHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        p = await make_project()
+        v = Verifier()
+        ok, msg = await v._check_dom(
+            {"type": "dom", "url": f"http://127.0.0.1:{port}/dashboard",
+             "selector": ".dashboard",
+             "login": {"url": "/login", "method": "POST", "body": {}}},
+            ".", None, p)
+        assert ok is False
+        assert "тестовую сессию" in msg
+    finally:
+        server.shutdown()
+
+
 async def test_dom_min_count(db):
     p = await make_project()
     page = ("data:text/html,<html><body><i class='x'>1</i><i class='x'>2</i>"
