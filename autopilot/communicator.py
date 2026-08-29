@@ -161,6 +161,25 @@ def internal_recipient(msg_route: str) -> str:
     return cfg.tg_manager or "MANAGER"
 
 
+def _permanent_failure(exc: Exception) -> bool:
+    """Ошибка, которую повтор не исправит.
+
+    4xx от Telegram означает, что не так с самим запросом: нет такого чата,
+    бот заблокирован, текст не годится. Единственное исключение — 429:
+    это «слишком часто», и вот его повторять как раз нужно.
+
+    Разница не косметическая. Сообщение, которое не может быть доставлено
+    никогда, висело в очереди вечно и роняло трейсбэк на каждом круге —
+    а настоящие ошибки терялись в этом шуме.
+    """
+    import httpx
+
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return False
+    code = exc.response.status_code
+    return 400 <= code < 500 and code != 429
+
+
 class CrossAccountSend(RuntimeError):
     """Попытка ответить по проекту одной компании ботом другой.
 
@@ -242,7 +261,16 @@ class Communicator:
         if transport is None:
             transport = next((t for (_, n), t in self.transports.items()
                               if n == "telegram"), None)
-        chat = cfg.tg_owner or "OWNER"
+        chat = cfg.tg_owner
+        if not chat:
+            # Раньше сюда подставлялся литерал "OWNER", и он честно уезжал
+            # в Telegram как chat_id. На первом живом запуске это дало
+            # 22 ответа «400 Bad Request» с трейсбэком на каждый — вместо
+            # одной внятной строки о том, что адресат просто не настроен.
+            # Уведомление при этом всё равно не доходило: ни одно.
+            self._warn_no_owner()
+            await self.send_fn("OWNER", text)      # хотя бы в лог
+            return
         if transport is None:
             await self.send_fn(chat, text)
             return
@@ -250,6 +278,19 @@ class Communicator:
             await transport.send(chat, text)
         except Exception:
             log.exception("не смог уведомить владельца")
+
+    _no_owner_warned = False
+
+    def _warn_no_owner(self) -> None:
+        """Один раз за процесс, а не на каждое уведомление."""
+        if Communicator._no_owner_warned:
+            return
+        Communicator._no_owner_warned = True
+        log.error(
+            "TG_OWNER_CHAT_ID не задан — уведомления владельцу НИКУДА "
+            "не уходят: ни эскалации, ни упор в квоту, ни задачи, ждущие "
+            "решения. Пропиши в .env свой chat_id (узнать: напиши боту "
+            "и открой https://api.telegram.org/bot<ТОКЕН>/getUpdates)")
 
     # ---------- создание ----------
 
@@ -448,7 +489,19 @@ class Communicator:
                     continue
                 try:
                     delivered = await self._deliver(m, p)
-                except Exception:
+                except Exception as e:
+                    if _permanent_failure(e):
+                        # 400 от Telegram — это «такого чата нет» или «текст
+                        # не годится», и повтор ничего не изменит. Раньше
+                        # такое сообщение висело в очереди вечно и каждые
+                        # 17 секунд роняло трейсбэк в лог, пряча настоящие
+                        # ошибки. Поймано на демо-данных: чат `demo-2-ерлан`
+                        # Telegram отвергает навсегда
+                        m.status = "cancelled"
+                        log.error("сообщение %s (проект %s) отменено — адресат "
+                                  "отвергнут навсегда: %s", m.id, p.id,
+                                  str(e)[:200])
+                        continue
                     log.exception("не смог отправить сообщение %s", m.id)
                     continue      # не помечаем отправленным, попробуем на следующем круге
                 if delivered is None:
@@ -492,6 +545,14 @@ class Communicator:
         else:
             # владелец и менеджер — всегда обычным ботом в Telegram
             name, chat = "telegram", internal_recipient(m.route)
+            if chat in ("OWNER", "MANAGER"):
+                # Адресат не настроен. Литерал «OWNER» уезжал в Telegram как
+                # chat_id и возвращался 400-м с трейсбэком на каждое сообщение
+                # очереди. Отправить всё равно некуда — говорим об этом один
+                # раз и кладём в лог, а не долбимся в API
+                self._warn_no_owner()
+                await self.send_fn(chat, text)
+                return chat
 
         transport = self.transport_for(account, name)
         if transport is None:
