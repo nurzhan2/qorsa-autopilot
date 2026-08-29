@@ -13,6 +13,7 @@ from sqlalchemy import select
 from .config import cfg
 from . import guard
 from . import llm
+from . import projectdir
 from .db import (AccessItem, Project, Session, Task, close_run, open_run,
                  utcnow)
 from .textenc import decode_console
@@ -90,9 +91,11 @@ def _why_failed(data: dict) -> str:
 
 class Executor:
     async def run(self, task: Task, project: Project) -> dict:
-        workspace = Path(project.workspace or cfg.workspaces / f"p{project.id}")
-        # без каталога create_subprocess_exec падает с невнятным WinError 267
-        workspace.mkdir(parents=True, exist_ok=True)
+        # Каталог проекта, а не общий workspaces/: код заказа, его логи и его
+        # ТЗ лежат вместе. Явно заданная колонкой «Папка» директория сильнее —
+        # projectdir.workspace() это учитывает.
+        # Без каталога create_subprocess_exec падает с невнятным WinError 267
+        workspace = projectdir.workspace(project)
         raw = _raw_prompt(task, project)
         prompt = to_env_names(raw)
         env = await self._secret_env(raw, project)
@@ -175,7 +178,9 @@ class Executor:
             guard.forget_child(proc)
 
         elapsed = time.monotonic() - t0
-        log_path = cfg.logs / f"task{task.id}_{int(time.time())}.json"
+        # Лог сессии — в каталоге проекта: в общем logs/ вывод сессий по
+        # сорока задачам четырёх заказов лежал вперемешку и разбирался поиском
+        log_path = projectdir.logs(project) / f"task{task.id}_{int(time.time())}.json"
         # агент вполне может вывести пароль в отчёте — на диск он попасть не должен
         log_path.write_bytes(vault.mask_bytes(out or err or b""))
 

@@ -39,6 +39,7 @@ from difflib import SequenceMatcher
 from sqlalchemy import select
 
 from . import guard
+from . import projectdir
 from .config import cfg
 from .db import (AccessItem, ChatMessage, Project, Session, Task, close_run,
                  open_run, service_task, utcnow)
@@ -1077,6 +1078,11 @@ class Brief:
             await s.commit()
         project.brief = payload
         project.brief_ready = ready
+
+        # Копия в каталог заказа. Не источник правды — правда в базе, — но
+        # открыв папку проекта через месяц, надо видеть, по какому ТЗ его
+        # делали, не поднимая SQL
+        projectdir.save_snapshot(project, "brief.json", payload)
 
         await self.sync_access_items(project, data, full=full, messages=messages)
         log.info("проект %s: бриф обновлён, confidence=%.2f, вопросов=%d "

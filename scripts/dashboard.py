@@ -1,4 +1,4 @@
-"""Локальный дашборд: что происходит и что от меня ждут.
+"""Локальный дашборд: что происходит, что от меня ждут и куда вставить ТЗ.
 
     python scripts/dashboard.py
     открыть http://127.0.0.1:8787
@@ -7,8 +7,11 @@
 HTML и JSON, страница раз в три секунды спрашивает состояние обычным fetch.
 
 **Слушает только localhost.** Здесь видны имена клиентов, суммы и то, чего мы
-ждём от людей; в локальной сети этому делать нечего. Значения секретов сюда
-не попадают никогда — в базе их и нет, там только ссылки `{{SECRET:NAME}}`.
+ждём от людей; в локальной сети этому делать нечего.
+
+**Значения секретов отсюда не отдаются никогда.** Окно секретов умеет их
+класть в хранилище и показывать ИМЕНА — но не значения: страница, которая
+печатает пароль, тем самым кладёт его в скроллбек браузера и в его историю.
 
 Порядок блоков не косметика: **сначала то, что ждёт человека**. Задача
 в `needs_human` или `escalated` стоит на месте до решения владельца, и если
@@ -17,6 +20,10 @@ HTML и JSON, страница раз в три секунды спрашива�
 from __future__ import annotations
 
 import argparse
+import asyncio
+import datetime as dt
+import logging
+import re
 import sys
 from pathlib import Path
 
@@ -27,14 +34,18 @@ try:
 except (AttributeError, ValueError):
     pass
 
-from sqlalchemy import select                                          # noqa: E402
+from sqlalchemy import func, select                                    # noqa: E402
 
-from autopilot import manual, toolchain                               # noqa: E402
+from autopilot import accounts as accounts_cfg                        # noqa: E402
+from autopilot import intake, manual, projectdir, roles, toolchain    # noqa: E402
 from autopilot.config import cfg                                      # noqa: E402
-from autopilot.db import (Account, Project, Run, Session, Task,       # noqa: E402
-                          AccessItem, cli_spent_today, consumed_today,
-                          init_db, spent_today, utcnow)
+from autopilot.db import (Account, ChatMessage, Project, Run, Session,  # noqa: E402
+                          Task, AccessItem, consumed_today, init_db,
+                          sync_accounts, utcnow)
+from autopilot.vault import resolve_secret, vault                     # noqa: E402
 from autopilot.verifier import Verifier                               # noqa: E402
+
+log = logging.getLogger("dashboard")
 
 # Пауза — файл, а не поле в базе: её должен уметь снять человек, даже если
 # процесс автопилота лежит. Планировщик читает тот же файл.
@@ -50,6 +61,138 @@ TASK_RU = {
     "done": "готово", "escalated": "эскалация", "needs_human": "нужен человек",
 }
 
+SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+# ---------- фоновые прогоны ----------
+#
+# Сбор ТЗ и планирование идут минутами, а то и десятками минут. Держать на
+# них HTTP-запрос нельзя: браузер отвалится по таймауту, а прогон продолжится
+# — и человек не будет знать, чем он кончился. Поэтому запуск возвращается
+# сразу, а состояние видно в общем снимке.
+JOBS: dict[str, dict] = {}
+
+
+def _job_key(kind: str, project_id: int) -> str:
+    return f"{kind}:{project_id}"
+
+
+async def _run_job(kind: str, project_id: int, coro_factory) -> None:
+    key = _job_key(kind, project_id)
+    JOBS[key] = {"kind": kind, "project_id": project_id, "state": "running",
+                 "started": utcnow().isoformat()[:19], "message": ""}
+    try:
+        message = await coro_factory()
+        JOBS[key].update(state="ok", message=message or "готово")
+    except Exception as e:                      # noqa: BLE001 — показать человеку
+        log.exception("прогон %s по проекту %s упал", kind, project_id)
+        JOBS[key].update(state="failed", message=f"{type(e).__name__}: {e}"[:300])
+    finally:
+        JOBS[key]["finished"] = utcnow().isoformat()[:19]
+
+
+def _start_job(kind: str, project_id: int, coro_factory) -> dict:
+    key = _job_key(kind, project_id)
+    running = JOBS.get(key)
+    if running and running.get("state") == "running":
+        return {"ok": False, "message": "этот прогон уже идёт"}
+    asyncio.create_task(_run_job(kind, project_id, coro_factory))
+    return {"ok": True, "message": "запущено, следи за состоянием на карточке"}
+
+
+async def _collect_brief(project_id: int) -> str:
+    from autopilot.brief import Brief, pending_questions
+
+    async with Session() as s:
+        project = await s.get(Project, project_id)
+    if project is None:
+        raise ValueError("проекта нет")
+    data = await Brief(communicator=None).build(project)
+    if data is None:
+        return "новых сообщений нет — модель не дёргалась"
+    questions = await pending_questions(project)
+    return (f"ТЗ обновлено: пунктов {len(data.get('deliverables') or [])}, "
+            f"уверенность {float(data.get('confidence') or 0):.2f}, "
+            f"вопросов к клиенту {len(questions)}")
+
+
+async def _collect_plan(project_id: int) -> str:
+    from autopilot.planner import Planner
+
+    async with Session() as s:
+        project = await s.get(Project, project_id)
+    if project is None:
+        raise ValueError("проекта нет")
+    result = await Planner(communicator=None).plan(project)
+    if result is None:
+        return "план не собран — смотри лог, проект мог уйти в blocked"
+    stats = result["stats"]
+    return (f"план собран: задач {stats['tasks']}, автономность "
+            f"{stats['auto_ratio'] * 100:.0f}% по числу и "
+            f"{stats['auto_ratio_time'] * 100:.0f}% по времени")
+
+
+# ---------- секреты ----------
+
+async def secret_state() -> dict:
+    """Что в хранилище есть и чего не хватает. ТОЛЬКО ИМЕНА.
+
+    «Не хватает» собирается из трёх мест, и все три — реальные причины
+    остановки: без токена компания не поднимает бота, без доступа клиента
+    задача не выполнится, без ключа не судить скриншоты.
+    """
+    known: list[str] = []
+    if vault.enabled:
+        try:
+            known = vault.names()
+        except RuntimeError as e:
+            return {"enabled": True, "broken": str(e), "known": [], "missing": []}
+
+    missing: list[dict] = []
+    seen: set[str] = set()
+
+    def want(name: str, why: str) -> None:
+        name = (name or "").strip()
+        if not name or name in seen:
+            return
+        seen.add(name)
+        value, _where = resolve_secret(name)
+        if not value:
+            missing.append({"name": name, "why": why})
+
+    for acc in accounts_cfg.load():
+        if not acc.active:
+            continue
+        if acc.bot_token_ref:
+            want(acc.bot_token_ref,
+                 f"без него бот компании «{acc.title}» не поднимается")
+        if getattr(acc, "max_token_ref", ""):
+            want(acc.max_token_ref, f"мессенджер MAX для «{acc.title}»")
+
+    want("ANTHROPIC_API_KEY",
+         "нужен только на LLM_BACKEND=api и для судьи по скриншотам; "
+         "на подписке работа идёт без него")
+
+    async with Session() as s:
+        items = (await s.execute(
+            select(AccessItem, Project.title)
+            .join(Project, Project.id == AccessItem.project_id)
+            .where(AccessItem.secret_ref.isnot(None),
+                   AccessItem.stale.is_(False)))).all()
+    for item, project_title in items:
+        for name in _refs(item.secret_ref):
+            want(name, f"доступ «{item.name}» проекта «{project_title}»")
+
+    return {"enabled": vault.enabled, "broken": "",
+            "known": known, "missing": missing}
+
+
+def _refs(text: str | None) -> list[str]:
+    from autopilot.vault import refs_in
+    return refs_in(text or "")
+
+
+# ---------- снимок состояния ----------
 
 async def collect() -> dict:
     """Всё состояние одним снимком: страница ходит сюда раз в три секунды."""
@@ -64,6 +207,13 @@ async def collect() -> dict:
             select(Run).order_by(Run.id.desc()).limit(25))).scalars().all()
         access = (await s.execute(
             select(AccessItem).where(AccessItem.status != "verified"))).scalars().all()
+        # одним запросом, а не по проекту: страница обновляется каждые
+        # три секунды, и N+1 здесь превращается в постоянную нагрузку на базу,
+        # в которую в это же время пишет планировщик
+        msg_counts = dict((await s.execute(
+            select(ChatMessage.project_id, func.count())
+            .where(ChatMessage.project_id.isnot(None))
+            .group_by(ChatMessage.project_id))).all())
 
     by_project: dict[int, list[Task]] = {}
     for t in tasks:
@@ -75,10 +225,6 @@ async def collect() -> dict:
     def task_row(t: Task) -> dict:
         # «Ждёт окружение» ли задача — считаем только для того, что реально
         # стоит и ждёт человека: на остальных это просто лишняя работа.
-        # Дефект «flutter build apk exit=1» и сама задача ждут одного и того
-        # же инструмента, поэтому смотрим и в дефекты, и в критерии — критерий
-        # называет `flutter build apk`, а слово `adb` в дефекте может и не
-        # встретиться вовсе.
         env_hints = []
         if t.status in ("needs_human", "escalated"):
             criteria_text = " ".join(
@@ -102,6 +248,8 @@ async def collect() -> dict:
         mine = by_project.get(p.id, [])
         live = [t for t in mine if not t.orphaned]
         done = [t for t in live if t.status == "done"]
+        brief = (p.brief or {}).get("brief") if isinstance(p.brief, dict) else None
+        folder = projectdir.find(p.id)
         rows.append({
             "id": p.id,
             "company": (accounts.get(p.account_id).title
@@ -115,20 +263,25 @@ async def collect() -> dict:
             "brief_ready": bool(p.brief_ready),
             "ready_for_work": bool(p.ready_for_work),
             "autonomy": round((p.autonomy_ratio or 0) * 100),
+            "autonomy_time": round((p.autonomy_ratio_time or 0) * 100),
+            "deliverables": len((brief or {}).get("deliverables") or []),
+            "questions": [q.get("text", "") for q in
+                          ((brief or {}).get("open_questions") or [])[:5]],
+            "messages": int(msg_counts.get(p.id, 0)),
+            "folder": str(folder) if folder else "",
+            "planned": bool(p.planned_at),
             "last_action": p.last_action or "",
+            "jobs": {kind: JOBS.get(_job_key(kind, p.id))
+                     for kind in ("brief", "plan")
+                     if JOBS.get(_job_key(kind, p.id))},
             "tasks": [task_row(t) for t in live],
         })
 
     stuck = [task_row(t) for t in tasks
              if not t.orphaned and t.status in ("needs_human", "escalated")]
-    # «ждёт окружение» — хотя бы один дефект/критерий упирается в инструмент,
-    # которого сейчас нет на машине: чинить код бессмысленно, пока его нет,
-    # проверка всё равно не пройдёт. Остальное — на глаза владельцу.
     attention_env = [t for t in stuck if t["env_hints"]]
     attention_review = [t for t in stuck if not t["env_hints"]]
 
-    # Тот же список инструментов, но одним сводным перечнем — что поставить,
-    # чтобы разблокировать разом, как раньше делалось для PostgreSQL/Flutter.
     tools_needed: dict[str, dict] = {}
     for t in attention_env:
         for h in t["env_hints"]:
@@ -141,6 +294,9 @@ async def collect() -> dict:
         "projects": rows,
         "attention": {"environment": attention_env, "review": attention_review},
         "install_list": install_list,
+        "companies": [{"code": a.code, "title": a.title, "transport": a.transport}
+                      for a in accounts.values() if a.active],
+        "secrets": await secret_state(),
         "runs": [{
             "id": r.id, "task_id": r.task_id, "kind": r.kind, "ok": bool(r.ok),
             "backend": r.backend, "cost": round(r.cost_usd or 0, 3),
@@ -165,7 +321,7 @@ async def collect() -> dict:
 def build_app():
     import contextlib
 
-    from fastapi import FastAPI
+    from fastapi import Body, FastAPI, HTTPException
     from fastapi.responses import HTMLResponse, JSONResponse
 
     @contextlib.asynccontextmanager
@@ -173,6 +329,13 @@ def build_app():
         # Схему поднимают миграции: дашборд может оказаться первым, кто
         # открыл базу после обновления кода
         await init_db()
+        # Компании из accounts.toml — в таблицу: без строки Account проект
+        # из окна завести нельзя (account_id NOT NULL), а дашборд вполне
+        # может быть запущен раньше главного процесса
+        try:
+            await sync_accounts(accounts_cfg.active())
+        except Exception:
+            log.exception("компании не синхронизированы")
         yield
 
     app = FastAPI(title="Qorsa Autopilot", lifespan=lifespan)
@@ -184,6 +347,8 @@ def build_app():
     @app.get("/api/state")
     async def state():
         return JSONResponse(await collect())
+
+    # ---------- задачи ----------
 
     @app.post("/api/task/{task_id}/done")
     async def mark_done(task_id: int):
@@ -197,6 +362,110 @@ def build_app():
         ok, message = await manual.confirm(task_id)
         return {"ok": ok, "message": message}
 
+    # ---------- приём заказа ----------
+
+    @app.post("/api/intake/preview")
+    async def intake_preview(payload: dict = Body(...)):
+        """Что мы поняли из вставленного — ДО того, как что-то записано.
+
+        Ошибка в ролях портит ТЗ целиком: мои собственные предложения уедут
+        в требования клиента. Поэтому раскладку показываем и просим
+        подтвердить, а не расставляем молча.
+        """
+        parsed = intake.parse(str(payload.get("raw") or ""))
+        account = accounts_cfg.by_code(str(payload.get("company") or "")) or None
+        return {
+            "kind": parsed.kind,
+            "count": len(parsed.lines),
+            "speakers": parsed.speakers,
+            "roles": intake.guess_roles(parsed, account),
+            "notes": parsed.notes,
+            "sample": [{"speaker": ln.speaker, "text": ln.text[:200]}
+                       for ln in parsed.lines[:6]],
+        }
+
+    @app.post("/api/intake/create")
+    async def intake_create(payload: dict = Body(...)):
+        raw = str(payload.get("raw") or "")
+        parsed = intake.parse(raw)
+        if not parsed.ok:
+            raise HTTPException(400, "в тексте не нашлось ни одной реплики")
+        title = str(payload.get("title") or "").strip()
+        if not title:
+            raise HTTPException(400, "у заказа должно быть название")
+        try:
+            project = await intake.create_project(
+                account_code=str(payload.get("company") or ""),
+                client=str(payload.get("client") or ""),
+                title=title,
+                deadline=_parse_deadline(payload.get("deadline")),
+                priority=int(payload.get("priority") or 2),
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        stats = await intake.apply(project.id, parsed,
+                                   _roles_from(payload, parsed),
+                                   source="дашборд: новый заказ")
+        return {"ok": True, "project_id": project.id, "stats": stats}
+
+    @app.post("/api/intake/append")
+    async def intake_append(payload: dict = Body(...)):
+        """Дозагрузка переписки в уже заведённый проект."""
+        raw = str(payload.get("raw") or "")
+        parsed = intake.parse(raw)
+        if not parsed.ok:
+            raise HTTPException(400, "в тексте не нашлось ни одной реплики")
+        project_id = int(payload.get("project_id") or 0)
+        try:
+            stats = await intake.apply(project_id, parsed,
+                                       _roles_from(payload, parsed),
+                                       source="дашборд: дозагрузка")
+        except ValueError as e:
+            raise HTTPException(404, str(e)) from None
+        return {"ok": True, "project_id": project_id, "stats": stats}
+
+    # ---------- прогоны ----------
+
+    @app.post("/api/project/{project_id}/brief")
+    async def run_brief(project_id: int):
+        return _start_job("brief", project_id, lambda: _collect_brief(project_id))
+
+    @app.post("/api/project/{project_id}/plan")
+    async def run_plan(project_id: int):
+        return _start_job("plan", project_id, lambda: _collect_plan(project_id))
+
+    # ---------- секреты ----------
+
+    @app.get("/api/secrets")
+    async def secrets_list():
+        return await secret_state()
+
+    @app.post("/api/secrets")
+    async def secrets_add(payload: dict = Body(...)):
+        """Положить значение в хранилище. Обратно оно не отдаётся никогда."""
+        name = str(payload.get("name") or "").strip()
+        value = str(payload.get("value") or "")
+        if not SECRET_NAME_RE.match(name):
+            raise HTTPException(400, "имя: латиница, цифры, _ . - и не длиннее 64")
+        if not value.strip():
+            raise HTTPException(400, "пустое значение хранить незачем")
+        if not vault.enabled:
+            raise HTTPException(400,
+                                "VAULT_KEY не задан — секреты хранить негде. "
+                                "Заведи ключ: python scripts/vault_cli.py genkey")
+        vault.set(name, value)
+        log.info("секрет %s записан в хранилище через дашборд", name)
+        return {"ok": True, "name": name, "state": await secret_state()}
+
+    @app.post("/api/secrets/{name}/delete")
+    async def secrets_delete(name: str):
+        if not SECRET_NAME_RE.match(name):
+            raise HTTPException(400, "негодное имя")
+        removed = vault.delete(name) if vault.enabled else False
+        return {"ok": removed, "state": await secret_state()}
+
+    # ---------- общее ----------
+
     @app.post("/api/pause")
     async def pause(on: bool = True):
         if on:
@@ -206,6 +475,30 @@ def build_app():
         return {"paused": PAUSE_FILE.exists()}
 
     return app
+
+
+def _roles_from(payload: dict, parsed) -> dict[str, str]:
+    """Роли из окна, с подстраховкой на случай неизвестного говорящего.
+
+    Незнакомый — клиент: ошибка в эту сторону безопаснее, пункт всё равно
+    проверяется по evidence. Обратная ошибка молча выбросила бы требование.
+    """
+    given = payload.get("roles") or {}
+    out = intake.guess_roles(parsed)
+    for who, role in given.items():
+        if role in roles.ROLES:
+            out[str(who)] = role
+    return out
+
+
+def _parse_deadline(value) -> dt.date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return dt.date.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def main() -> int:
@@ -222,6 +515,9 @@ def main() -> int:
         print("нужен uvicorn: pip install fastapi uvicorn", file=sys.stderr)
         return 2
 
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)-7s %(name)-9s %(message)s",
+                        datefmt="%H:%M:%S")
     print(f"дашборд: http://{args.host}:{args.port}")
     uvicorn.run(build_app(), host=args.host, port=args.port, log_level="warning")
     return 0

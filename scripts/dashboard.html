@@ -3,132 +3,406 @@
 <title>Qorsa Autopilot</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  /* Оформление сознательно скучное: воздух, границы вместо заливок, один
-     акцентный цвет. Это приборная панель, а не витрина — на ней смотрят
-     на цифры, а не на градиенты. */
+  /* Оформление по токенам Mercury (DESIGN.md в корне проекта):
+     ониксовая канва, графитовые карточки на шаг светлее, никаких теней —
+     разделение только разницей тона. Кобальт здесь один на всю страницу
+     и означает ровно одно: «это ждёт тебя». Если он расползётся по
+     украшениям, приборная панель перестанет показывать главное. */
   :root {
-    --bg: #ffffff;
-    --fg: #1d1d1f;
-    --dim: #86868b;
-    --line: #d2d2d7;
-    --accent: #0071e3;
-    --warn: #bf4800;
-    --ok: #1d7a44;
-    --radius: 12px;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #000000; --fg: #f5f5f7; --dim: #86868b; --line: #2c2c2e;
-      --accent: #0a84ff; --warn: #ff9f0a; --ok: #30d158;
-    }
+    --onyx: #171721;
+    --graphite: #1e1e2a;
+    --obsidian: #272735;
+    --slate: #70707d;
+    --mist: #e2e3ed;
+    --ash: #c3c3cc;
+    --ivory: #ededf3;
+    --cobalt: #5266eb;
+    --white: #ffffff;
+
+    --font: 'arcadia', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+            "Segoe UI", Roboto, sans-serif;
+    --font-display: 'arcadiaDisplay', ui-sans-serif, system-ui, -apple-system,
+            BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+
+    --r-card: 12px;
+    --r-pill: 32px;
+    --r-nav: 40px;
+    --pad-card: 32px;
+    --gap-section: 72px;
+    --page: 1200px;
   }
   * { box-sizing: border-box; }
+  html { color-scheme: dark; }
   body {
-    margin: 0; background: var(--bg); color: var(--fg);
-    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 0; background: var(--onyx); color: var(--ivory);
+    font: 400 16px/1.5 var(--font);
     -webkit-font-smoothing: antialiased;
   }
-  main { max-width: 1080px; margin: 0 auto; padding: 64px 32px 96px; }
-  h1 { font-size: 40px; font-weight: 600; letter-spacing: -0.02em; margin: 0 0 4px; }
+
+  /* --- шапка: прозрачная поверх канвы, с матовым стеклом --- */
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(23, 23, 33, 0.82);
+    backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--obsidian);
+  }
+  .bar {
+    max-width: var(--page); margin: 0 auto;
+    padding: 16px 32px; display: flex; align-items: center; gap: 24px;
+  }
+  .brand {
+    font-family: var(--font-display); font-weight: 480; font-size: 21px;
+    letter-spacing: 0.02em; white-space: nowrap;
+  }
+  .brand i {
+    display: inline-block; width: 10px; height: 10px; margin-right: 10px;
+    border: 2px solid var(--cobalt); border-radius: 50%; vertical-align: 1px;
+  }
+  nav { display: flex; gap: 4px; flex: 1; flex-wrap: wrap; }
+  nav button {
+    font: inherit; font-size: 16px; color: var(--ash);
+    background: none; border: 0; border-radius: var(--r-nav);
+    padding: 8px 20px; cursor: pointer;
+  }
+  nav button:hover { color: var(--ivory); }
+  nav button[aria-current="true"] { background: var(--obsidian); color: var(--ivory); }
+  nav button .count {
+    display: inline-block; margin-left: 8px; padding: 0 8px;
+    border-radius: var(--r-nav); background: var(--cobalt); color: var(--white);
+    font-size: 12px; letter-spacing: 0.12px;
+  }
+  .clock { color: var(--ash); font-size: 14px; letter-spacing: 0.07px; white-space: nowrap; }
+
+  main { max-width: var(--page); margin: 0 auto; padding: 56px 32px 112px; }
+  section[hidden] { display: none; }
   h2 {
-    font-size: 13px; font-weight: 600; text-transform: uppercase;
-    letter-spacing: 0.06em; color: var(--dim); margin: 56px 0 16px;
+    font-family: var(--font-display); font-weight: 480; font-size: 28px;
+    line-height: 1.2; letter-spacing: 0.42px; margin: var(--gap-section) 0 8px;
   }
-  .sub { color: var(--dim); font-size: 13px; margin: 0 0 40px; }
+  h2:first-child { margin-top: 0; }
+  .lede { color: var(--ash); font-size: 16px; margin: 0 0 24px; max-width: 70ch; }
+
+  /* --- карточки: плоские, разделение только тоном --- */
   .card {
-    border: 1px solid var(--line); border-radius: var(--radius);
-    padding: 20px 24px; margin-bottom: 12px;
+    background: var(--graphite); border-radius: var(--r-card);
+    padding: var(--pad-card); margin-bottom: 12px;
   }
-  .card.attention { border-color: var(--warn); }
-  .row { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; }
-  .title { font-size: 17px; font-weight: 600; }
-  .meta { color: var(--dim); font-size: 13px; }
-  .meta b { font-weight: 600; color: var(--fg); }
+  .card.calls { border-left: 2px solid var(--cobalt); }
+  .head { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; }
+  .title {
+    font-family: var(--font-display); font-weight: 480; font-size: 21px;
+    line-height: 1.35;
+  }
+  .muted { color: var(--ash); font-size: 14px; letter-spacing: 0.07px; }
+  .muted b { color: var(--ivory); font-weight: 480; }
+
+  .tags { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
   .tag {
-    display: inline-block; border: 1px solid var(--line); border-radius: 999px;
-    padding: 1px 10px; font-size: 12px; color: var(--dim); margin-right: 6px;
+    border-radius: var(--r-nav); padding: 3px 12px; font-size: 12px;
+    letter-spacing: 0.12px; background: var(--obsidian); color: var(--ash);
   }
-  .tag.warn { border-color: var(--warn); color: var(--warn); }
-  .tag.ok { border-color: var(--ok); color: var(--ok); }
-  .bar { height: 2px; background: var(--line); border-radius: 2px; margin: 14px 0 4px; }
-  .bar > i { display: block; height: 2px; background: var(--accent); border-radius: 2px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .tag.on { color: var(--ivory); }
+  .tag.call { background: var(--cobalt); color: var(--white); }
+
+  .bar-progress { height: 2px; background: var(--obsidian); border-radius: 2px; margin: 20px 0 0; }
+  .bar-progress > i { display: block; height: 2px; background: var(--ivory); border-radius: 2px; }
+
+  .note { color: var(--ash); font-size: 14px; margin-top: 12px; }
+  .note.defect { color: var(--ivory); }
+  .note.defect::before { content: "✗ "; color: var(--cobalt); }
+  .note.env::before { content: "⛏ "; color: var(--cobalt); }
+  .empty { color: var(--slate); font-size: 16px; padding: 8px 0; }
+
+  /* --- таблицы --- */
+  .scroll { overflow-x: auto; margin-top: 20px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; letter-spacing: 0.07px; }
   th {
-    text-align: left; font-weight: 500; color: var(--dim); padding: 6px 12px 6px 0;
-    border-bottom: 1px solid var(--line); font-size: 12px;
+    text-align: left; font-weight: 400; color: var(--slate); font-size: 12px;
+    letter-spacing: 0.12px; text-transform: uppercase;
+    padding: 0 16px 10px 0; border-bottom: 1px solid var(--obsidian); white-space: nowrap;
   }
-  td { padding: 7px 12px 7px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td { padding: 10px 16px 10px 0; border-bottom: 1px solid var(--obsidian); vertical-align: top; }
   tr:last-child td { border-bottom: 0; }
-  button {
-    font: inherit; font-size: 13px; color: var(--accent); background: none;
-    border: 1px solid var(--line); border-radius: 999px; padding: 3px 14px;
-    cursor: pointer;
+
+  /* --- элементы управления: всё в форме пилюли --- */
+  button.ghost, .actions button {
+    font: inherit; font-size: 16px; color: var(--ivory); background: none;
+    border: 1px solid var(--mist); border-radius: var(--r-nav);
+    padding: 9px 20px; cursor: pointer;
   }
-  button:hover { border-color: var(--accent); }
-  button.quiet { color: var(--dim); }
-  .spend { display: flex; gap: 48px; flex-wrap: wrap; }
-  .spend div { min-width: 180px; }
-  .num { font-size: 28px; font-weight: 600; letter-spacing: -0.01em; }
-  .defect { color: var(--warn); font-size: 13px; margin-top: 6px; }
-  .note { color: var(--dim); font-size: 13px; margin-top: 4px; }
-  .empty { color: var(--dim); font-size: 14px; padding: 8px 0; }
-  .paused { color: var(--warn); }
+  button.ghost:hover, .actions button:hover { background: var(--obsidian); }
+  button.primary {
+    font: inherit; font-size: 16px; color: var(--white); background: var(--cobalt);
+    border: 0; border-radius: var(--r-pill); padding: 13px 24px; cursor: pointer;
+  }
+  button.primary:hover { filter: brightness(1.1); }
+  button.primary:disabled { opacity: 0.4; cursor: default; filter: none; }
+  button.quiet {
+    font: inherit; font-size: 14px; color: var(--ash); background: none;
+    border: 0; border-radius: var(--r-nav); padding: 6px 14px; cursor: pointer;
+  }
+  button.quiet:hover { color: var(--ivory); background: var(--obsidian); }
+  .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 24px; }
+
+  label { display: block; color: var(--ash); font-size: 12px;
+          letter-spacing: 0.12px; text-transform: uppercase; margin-bottom: 8px; }
+  input, select, textarea {
+    font: inherit; font-size: 16px; width: 100%; color: var(--ivory);
+    background: var(--obsidian); border: 1px solid transparent;
+    border-radius: var(--r-pill); padding: 13px 20px;
+  }
+  input:focus, select:focus, textarea:focus { outline: 0; border-color: var(--mist); }
+  input::placeholder, textarea::placeholder { color: var(--slate); }
+  textarea {
+    border-radius: var(--r-card); min-height: 260px; resize: vertical;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 14px; line-height: 1.5;
+  }
+  .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 20px; margin-top: 24px; }
+  .field { min-width: 0; }
+
+  /* --- расход --- */
+  .figures { display: flex; gap: 72px; flex-wrap: wrap; }
+  .num { font-family: var(--font-display); font-weight: 480; font-size: 42px;
+         line-height: 1.15; letter-spacing: 0.42px; margin: 8px 0 4px; }
+
+  .roles { display: grid; gap: 12px; margin-top: 20px; }
+  .role-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .role-row .who { flex: 1; min-width: 160px; }
+  .role-row select { width: auto; min-width: 180px; }
+  .sample { margin-top: 20px; font-size: 14px; color: var(--ash); }
+  .sample div { padding: 6px 0; border-bottom: 1px solid var(--obsidian); }
+  .sample b { color: var(--ivory); font-weight: 480; }
+
+  .flash {
+    margin-top: 20px; padding: 16px 20px; border-radius: var(--r-card);
+    background: var(--obsidian); font-size: 14px;
+  }
+  .flash[hidden] { display: none; }
+  .flash.call { border-left: 2px solid var(--cobalt); }
+
+  @media (max-width: 720px) {
+    .bar, main { padding-left: 20px; padding-right: 20px; }
+    .card { padding: 24px; }
+    :root { --gap-section: 56px; }
+  }
 </style>
 
+<header>
+  <div class="bar">
+    <span class="brand"><i></i>Автопилот</span>
+    <nav id="nav"></nav>
+    <span class="clock" id="clock">загружаю…</span>
+  </div>
+</header>
+
 <main>
-  <h1>Автопилот</h1>
-  <p class="sub" id="head">загружаю…</p>
+  <!-- ---------- работа ---------- -->
+  <section id="view-work">
+    <h2>Ждёт тебя</h2>
+    <p class="lede">Пока это не разобрано, автопилот по этим задачам стоит.
+      Сначала окружение: чинить код бессмысленно, пока инструмента нет на машине.</p>
+    <div id="install"></div>
+    <div id="attention_env"></div>
+    <div id="attention_review"></div>
 
-  <h2>Ждёт окружение</h2>
-  <div class="card" id="install_list" style="display:none"></div>
-  <div id="attention_env"></div>
+    <h2>Заказы</h2>
+    <div id="projects"></div>
+  </section>
 
-  <h2>Нужен разбор</h2>
-  <div id="attention_review"></div>
+  <!-- ---------- новый заказ ---------- -->
+  <section id="view-order" hidden>
+    <h2>Новый заказ из переписки</h2>
+    <p class="lede">Вставь выгрузку чата — <code>result.json</code> из Telegram Desktop,
+      скопированную переписку или просто текст ТЗ. Формат определится сам.
+      Пароли и ключи будут перехвачены до записи в базу: в переписке останутся
+      ссылки, значения уедут в хранилище.</p>
 
-  <h2>Проекты</h2>
-  <div id="projects"></div>
+    <div class="card">
+      <label for="raw">Выгрузка переписки</label>
+      <textarea id="raw" placeholder="Анастасия, [12.08.2026 14:30]
+привет! нужно приложение доставки
 
-  <h2>Расход за сутки</h2>
-  <div class="card spend" id="spend"></div>
+Я, [12.08.2026 14:31]
+понял, какие сроки?"></textarea>
+      <div class="actions">
+        <button class="ghost" onclick="preview()">Разобрать</button>
+        <button class="quiet" onclick="clearIntake()">Очистить</button>
+      </div>
+      <div class="flash" id="preview_flash" hidden></div>
+      <div id="preview_body"></div>
+    </div>
 
-  <h2>Последние вызовы</h2>
-  <div class="card"><table id="runs"></table></div>
+    <div class="card" id="intake_form" hidden>
+      <span class="title">Куда это записать</span>
+      <div class="fields">
+        <div class="field">
+          <label for="company">Компания</label>
+          <select id="company"></select>
+        </div>
+        <div class="field">
+          <label for="client">Клиент</label>
+          <input id="client" placeholder="Анастасия">
+        </div>
+        <div class="field">
+          <label for="title">Название заказа</label>
+          <input id="title" placeholder="TUR TUK">
+        </div>
+        <div class="field">
+          <label for="deadline">Срок</label>
+          <input id="deadline" type="date">
+        </div>
+        <div class="field">
+          <label for="priority">Приоритет</label>
+          <select id="priority">
+            <option value="1">1 — высокий</option>
+            <option value="2" selected>2 — обычный</option>
+            <option value="3">3 — низкий</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="append_to">Или дозагрузить в заказ</label>
+          <select id="append_to"></select>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="primary" id="submit_intake" onclick="submitIntake()">Завести заказ</button>
+      </div>
+      <div class="flash" id="intake_flash" hidden></div>
+    </div>
+  </section>
+
+  <!-- ---------- секреты ---------- -->
+  <section id="view-secrets" hidden>
+    <h2>Доступы и ключи</h2>
+    <p class="lede">Значения лежат зашифрованными в <code>secrets.enc</code> и обратно
+      отсюда не показываются — ни в списке, ни по запросу. В базу и в промпт агента
+      уходит только ссылка <code>{{SECRET:ИМЯ}}</code>, само значение попадает
+      в процесс через окружение.</p>
+
+    <div class="card">
+      <span class="title">Добавить</span>
+      <div class="fields">
+        <div class="field">
+          <label for="secret_name">Имя</label>
+          <input id="secret_name" placeholder="TELEGRAM_API_KEY" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="secret_value">Значение</label>
+          <input id="secret_value" type="password" placeholder="вставь сюда" autocomplete="off">
+        </div>
+      </div>
+      <div class="actions">
+        <button class="primary" onclick="saveSecret()">Положить в хранилище</button>
+      </div>
+      <div class="flash" id="secret_flash" hidden></div>
+    </div>
+
+    <div id="secrets_missing"></div>
+    <div id="secrets_known"></div>
+  </section>
+
+  <!-- ---------- расход ---------- -->
+  <section id="view-spend" hidden>
+    <h2>Расход за сутки</h2>
+    <p class="lede">Два счётчика, и складывать их нельзя: деньги API — это списание,
+      подписка — оценка того, во что вызов обошёлся бы на API. Полоса сборки встаёт
+      от любого из двух.</p>
+    <div class="card figures" id="spend"></div>
+
+    <h2>Последние вызовы</h2>
+    <div class="card"><div class="scroll"><table id="runs"></table></div></div>
+  </section>
 </main>
 
 <script>
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => (
   {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const $ = id => document.getElementById(id);
+
+let STATE = null;
+let VIEW = "work";
+let PREVIEW = null;          // разбор вставленного, ждёт подтверждения ролей
+
+const VIEWS = [
+  {id: "work", label: "Работа"},
+  {id: "order", label: "Новый заказ"},
+  {id: "secrets", label: "Доступы"},
+  {id: "spend", label: "Расход"},
+];
+
+function show(view) {
+  VIEW = view;
+  for (const v of VIEWS) $("view-" + v.id).hidden = (v.id !== view);
+  renderNav();
+}
+
+function renderNav() {
+  const waiting = STATE
+    ? STATE.attention.environment.length + STATE.attention.review.length : 0;
+  const missing = STATE ? (STATE.secrets.missing || []).length : 0;
+  $("nav").innerHTML = VIEWS.map(v => {
+    const n = v.id === "work" ? waiting : (v.id === "secrets" ? missing : 0);
+    return `<button onclick="show('${v.id}')" aria-current="${v.id === VIEW}">
+      ${esc(v.label)}${n ? `<span class="count">${n}</span>` : ""}</button>`;
+  }).join("");
+}
+
+// ---------- общие действия ----------
+
+async function post(url, body) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: body ? {"Content-Type": "application/json"} : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let data = {};
+  try { data = await r.json(); } catch (e) { data = {}; }
+  if (!r.ok) throw new Error(data.detail || `ошибка ${r.status}`);
+  return data;
+}
 
 async function act(url) {
-  const r = await fetch(url, {method: "POST"});
-  const data = await r.json();
-  if (data.message) alert(data.message);
-  else if (data.defects && data.defects.length) alert(data.defects.join("\n"));
+  try {
+    const data = await post(url);
+    if (data.message) alert(data.message);
+    else if (data.defects && data.defects.length) alert(data.defects.join("\n"));
+  } catch (e) { alert(e.message); }
   load();
 }
 
+function flash(id, text, call) {
+  const box = $(id);
+  box.hidden = false;
+  box.className = "flash" + (call ? " call" : "");
+  box.innerHTML = text;
+}
+
+// ---------- работа ----------
+
 function attentionCard(t) {
   const why = t.env_hints && t.env_hints.length
-    ? "ждёт окружение — не отдана человеку, чинить код бессмысленно"
+    ? "ждёт окружение — чинить код бессмысленно, инструмента нет на машине"
     : t.waits_confirmation
-    ? "приёмка прошла, но ничего не доказала"
+    ? "приёмка прошла, но ничего не доказала — нужно твоё решение"
     : (t.status === "escalated" ? "исчерпаны попытки" : "нужен разбор");
-  return `<div class="card attention">
-    <div class="row">
+  return `<div class="card calls">
+    <div class="head">
       <span class="title">${esc(t.title)}</span>
-      <span class="meta">#${t.id} · проект ${t.project_id}</span>
+      <span class="muted">#${t.id} · заказ ${t.project_id}</span>
     </div>
-    <div class="meta" style="margin-top:6px">
-      <span class="tag warn">${esc(t.status_ru)}</span>${esc(why)} ·
-      попыток ${t.attempts}
+    <div class="tags">
+      <span class="tag call">${esc(t.status_ru)}</span>
+      <span class="tag">попыток ${t.attempts}</span>
     </div>
+    <div class="note">${esc(why)}</div>
     ${(t.env_hints || []).map(h =>
-        `<div class="defect">⛏ нужен ${esc(h.name)} — ${esc(h.how)}</div>`).join("")}
-    ${(t.defects || []).map(d => `<div class="defect">✗ ${esc(d)}</div>`).join("")}
+        `<div class="note env">нужен ${esc(h.name)} — ${esc(h.how)}</div>`).join("")}
+    ${(t.defects || []).map(d => `<div class="note defect">${esc(d)}</div>`).join("")}
     ${(t.observations || []).map(o =>
-        `<div class="note">· вне критерия: ${esc(o)}</div>`).join("")}
-    <div style="margin-top:14px">
+        `<div class="note">вне критерия: ${esc(o)}</div>`).join("")}
+    <div class="actions">
       ${t.waits_confirmation
         ? `<button onclick="act('/api/task/${t.id}/confirm')">Подтвердить</button>`
         : `<button onclick="act('/api/task/${t.id}/done')">Я сделал, проверь</button>`}
@@ -136,91 +410,101 @@ function attentionCard(t) {
   </div>`;
 }
 
-function installListCard(items) {
+function installCard(items) {
   if (!items.length) return "";
-  return `<div class="row"><span class="title">Поставить, чтобы разблокировать</span></div>
-    <table style="margin-top:12px">
-      <tr><th>инструмент</th><th>как поставить</th><th>ждут</th></tr>
+  return `<div class="card calls">
+    <span class="title">Поставить, чтобы разблокировать</span>
+    <div class="scroll"><table>
+      <tr><th>инструмент</th><th>как поставить</th><th>что ждёт</th></tr>
       ${items.map(i => `<tr>
         <td>${esc(i.name)}</td>
         <td>${esc(i.how)}</td>
-        <td class="meta">${i.tasks.map(esc).join(", ")}</td></tr>`).join("")}
-    </table>`;
+        <td class="muted">${i.tasks.map(esc).join(", ")}</td></tr>`).join("")}
+    </table></div></div>`;
+}
+
+function jobLine(job) {
+  if (!job) return "";
+  const word = {running: "идёт", ok: "готово", failed: "не вышло"}[job.state] || job.state;
+  return `<div class="note">${esc(job.kind === "brief" ? "сбор ТЗ" : "планирование")}:
+    ${esc(word)}${job.message ? " — " + esc(job.message) : ""}</div>`;
 }
 
 function projectCard(p) {
-  const tasks = p.tasks.filter(t => t.status !== "done");
+  const open = p.tasks.filter(t => t.status !== "done");
+  const busy = Object.values(p.jobs || {}).some(j => j && j.state === "running");
   return `<div class="card">
-    <div class="row">
+    <div class="head">
       <span class="title">${esc(p.title)}</span>
-      <span class="meta">${esc(p.company)} · ${esc(p.client)}</span>
+      <span class="muted">${esc(p.company)} · ${esc(p.client)} · #${p.id}</span>
     </div>
-    <div class="meta" style="margin-top:8px">
-      <span class="tag">${esc(p.status_ru)}</span>
-      <span class="tag">${esc(p.progress)}</span>
-      ${p.brief_ready ? '<span class="tag ok">ТЗ собрано</span>'
-                      : '<span class="tag warn">ТЗ не собрано</span>'}
-      ${p.ready_for_work ? '<span class="tag ok">готов к работе</span>'
-                         : '<span class="tag">галочки нет</span>'}
-      <b>$${p.cost.toFixed(2)}</b> · автономность ${p.autonomy}%
+    <div class="tags">
+      <span class="tag on">${esc(p.status_ru)}</span>
+      <span class="tag">задач ${esc(p.progress)}</span>
+      <span class="tag">сообщений ${p.messages}</span>
+      <span class="tag ${p.brief_ready ? "on" : "call"}">
+        ${p.brief_ready ? "ТЗ собрано" : "ТЗ не собрано"}</span>
+      <span class="tag">пунктов ТЗ ${p.deliverables}</span>
+      ${p.planned ? `<span class="tag">автономность ${p.autonomy}% задач /
+        ${p.autonomy_time}% времени</span>` : `<span class="tag call">не спланирован</span>`}
+      <span class="tag">$${p.cost.toFixed(2)}</span>
     </div>
-    <div class="bar"><i style="width:${p.percent}%"></i></div>
+    <div class="bar-progress"><i style="width:${p.percent}%"></i></div>
     ${p.waiting.length
-      ? `<div class="note">ждём от клиента: ${p.waiting.map(esc).join(", ")}</div>`
-      : ""}
+      ? `<div class="note">ждём от клиента: ${p.waiting.map(esc).join(", ")}</div>` : ""}
+    ${(p.questions || []).length
+      ? `<div class="note">открытые вопросы: ${p.questions.map(esc).join(" · ")}</div>` : ""}
     ${p.last_action ? `<div class="note">${esc(p.last_action)}</div>` : ""}
-    ${tasks.length ? `<table style="margin-top:16px">
-      <tr><th>задача</th><th>статус</th><th>класс</th><th>кто</th><th>попыток</th></tr>
-      ${tasks.map(t => `<tr>
+    ${p.folder ? `<div class="note">папка: ${esc(p.folder)}</div>` : ""}
+    ${Object.values(p.jobs || {}).map(jobLine).join("")}
+    <div class="actions">
+      <button ${busy ? "disabled" : ""} onclick="act('/api/project/${p.id}/brief')">
+        Собрать ТЗ</button>
+      <button ${busy ? "disabled" : ""} onclick="act('/api/project/${p.id}/plan')">
+        Составить план</button>
+    </div>
+    ${open.length ? `<div class="scroll"><table>
+      <tr><th>задача</th><th>статус</th><th>класс</th><th>кто делает</th><th>попыток</th></tr>
+      ${open.map(t => `<tr>
         <td>${esc(t.title)}</td>
         <td>${esc(t.status_ru)}</td>
         <td>${esc(t.verify_class)}</td>
         <td>${esc(t.executor)}</td>
         <td>${t.attempts}</td></tr>`).join("")}
-    </table>` : '<div class="empty">открытых задач нет</div>'}
+    </table></div>` : '<div class="empty">открытых задач нет</div>'}
   </div>`;
 }
 
-function render(s) {
-  document.getElementById("head").innerHTML =
-    `${s.now} UTC · ` +
-    (s.paused
-      ? `<span class="paused">работа на паузе</span> ·
-         <button class="quiet" onclick="act('/api/pause?on=false')">снять паузу</button>`
-      : `<button class="quiet" onclick="act('/api/pause?on=true')">поставить на паузу</button>`);
-
-  const envList = document.getElementById("install_list");
-  if (s.install_list && s.install_list.length) {
-    envList.style.display = "";
-    envList.innerHTML = installListCard(s.install_list);
-  } else {
-    envList.style.display = "none";
+function renderWork(s) {
+  $("install").innerHTML = installCard(s.install_list || []);
+  $("attention_env").innerHTML = s.attention.environment.map(attentionCard).join("");
+  $("attention_review").innerHTML = s.attention.review.map(attentionCard).join("");
+  if (!s.attention.environment.length && !s.attention.review.length &&
+      !(s.install_list || []).length) {
+    $("attention_review").innerHTML =
+      '<div class="card"><div class="empty">ничего не ждёт — всё либо идёт, либо сделано</div></div>';
   }
+  $("projects").innerHTML = s.projects.length
+    ? s.projects.map(projectCard).join("")
+    : '<div class="card"><div class="empty">заказов пока нет — заведи первый на вкладке «Новый заказ»</div></div>';
+}
 
-  document.getElementById("attention_env").innerHTML =
-    s.attention.environment.length ? s.attention.environment.map(attentionCard).join("")
-                       : '<div class="empty">окружения хватает всему, что ждёт</div>';
+// ---------- расход ----------
 
-  document.getElementById("attention_review").innerHTML =
-    s.attention.review.length ? s.attention.review.map(attentionCard).join("")
-                       : '<div class="empty">ничего не ждёт — всё либо идёт, либо сделано</div>';
-
-  document.getElementById("projects").innerHTML = s.projects.map(projectCard).join("");
-
+function renderSpend(s) {
   const sp = s.spend;
-  document.getElementById("spend").innerHTML = `
+  $("spend").innerHTML = `
     <div>
-      <div class="meta">деньги, API</div>
+      <div class="muted">деньги, API</div>
       <div class="num">$${sp.api.toFixed(2)}</div>
-      <div class="meta">из $${sp.api_limit} · вызовов ${sp.api_calls}</div>
+      <div class="muted">из $${sp.api_limit} · вызовов ${sp.api_calls}</div>
     </div>
     <div>
-      <div class="meta">подписка, оценка</div>
+      <div class="muted">подписка, оценка</div>
       <div class="num">~$${sp.cli.toFixed(2)}</div>
-      <div class="meta">из $${sp.cli_limit} · вызовов ${sp.cli_calls} · ${sp.cli_minutes} мин</div>
+      <div class="muted">из $${sp.cli_limit} · вызовов ${sp.cli_calls} · ${sp.cli_minutes} мин</div>
     </div>`;
-
-  document.getElementById("runs").innerHTML =
+  $("runs").innerHTML =
     `<tr><th>что</th><th>задача</th><th>итог</th><th>чем платили</th>
          <th>минут</th><th>начат</th></tr>` +
     s.runs.map(r => `<tr>
@@ -231,16 +515,211 @@ function render(s) {
           ${r.cost ? `$${r.cost.toFixed(2)}` : ""}
           ${r.estimated ? '<span class="tag">оценка</span>' : ""}</td>
       <td>${r.minutes}</td>
-      <td class="meta">${esc(r.started)}</td></tr>`).join("");
+      <td class="muted">${esc(r.started)}</td></tr>`).join("");
+}
+
+// ---------- секреты ----------
+
+function renderSecrets(s) {
+  const sec = s.secrets || {};
+  if (sec.broken) {
+    $("secrets_missing").innerHTML =
+      `<div class="card calls"><span class="title">Хранилище не читается</span>
+        <div class="note">${esc(sec.broken)}</div></div>`;
+    $("secrets_known").innerHTML = "";
+    return;
+  }
+  $("secrets_missing").innerHTML = (sec.missing || []).length
+    ? `<div class="card calls">
+        <span class="title">Не хватает</span>
+        <div class="scroll"><table>
+          <tr><th>имя</th><th>зачем нужен</th><th></th></tr>
+          ${sec.missing.map(m => `<tr>
+            <td><b>${esc(m.name)}</b></td>
+            <td class="muted">${esc(m.why)}</td>
+            <td><button class="quiet" onclick="fillSecret('${esc(m.name)}')">заполнить</button></td>
+          </tr>`).join("")}
+        </table></div></div>`
+    : `<div class="card"><div class="empty">всё, что нужно для работы, на месте</div></div>`;
+
+  $("secrets_known").innerHTML = `<div class="card">
+    <span class="title">В хранилище</span>
+    <div class="note">${sec.enabled ? "" :
+      "VAULT_KEY не задан — класть секреты некуда. Заведи ключ: " +
+      "<code>python scripts/vault_cli.py genkey</code>"}</div>
+    ${(sec.known || []).length ? `<div class="scroll"><table>
+      <tr><th>имя</th><th></th></tr>
+      ${sec.known.map(n => `<tr><td>${esc(n)}</td>
+        <td><button class="quiet" onclick="dropSecret('${esc(n)}')">удалить</button></td>
+      </tr>`).join("")}</table></div>` : '<div class="empty">пока пусто</div>'}
+  </div>`;
+}
+
+function fillSecret(name) {
+  $("secret_name").value = name;
+  $("secret_value").focus();
+}
+
+async function saveSecret() {
+  const name = $("secret_name").value.trim();
+  const value = $("secret_value").value;
+  try {
+    await post("/api/secrets", {name, value});
+    $("secret_name").value = "";
+    $("secret_value").value = "";
+    flash("secret_flash", `<b>${esc(name)}</b> записан. Значение отсюда больше
+      не показывается — это сознательно.`);
+    load();
+  } catch (e) { flash("secret_flash", esc(e.message), true); }
+}
+
+async function dropSecret(name) {
+  if (!confirm(`Удалить ${name} из хранилища? Значение восстановить будет нечем.`)) return;
+  try {
+    await post(`/api/secrets/${encodeURIComponent(name)}/delete`);
+    load();
+  } catch (e) { flash("secret_flash", esc(e.message), true); }
+}
+
+// ---------- приём заказа ----------
+
+function syncCompanies(s) {
+  const sel = $("company");
+  if (document.activeElement === sel) return;      // не дёргаем открытый список
+  const want = (s.companies || []).map(c => `${c.code}|${c.title}`).join(",");
+  if (sel.dataset.filled === want) return;
+  sel.dataset.filled = want;
+  sel.innerHTML = (s.companies || []).map(c =>
+    `<option value="${esc(c.code)}">${esc(c.title)} · ${esc(c.transport)}</option>`).join("");
+
+  const add = $("append_to");
+  if (document.activeElement === add) return;
+  const keep = add.value;
+  add.innerHTML = '<option value="">— завести новый —</option>' +
+    s.projects.map(p =>
+      `<option value="${p.id}">#${p.id} ${esc(p.title)} (${esc(p.client)})</option>`).join("");
+  add.value = keep;
+}
+
+async function preview() {
+  const raw = $("raw").value;
+  if (!raw.trim()) { flash("preview_flash", "вставлять нечего", true); return; }
+  try {
+    PREVIEW = await post("/api/intake/preview", {raw, company: $("company").value});
+  } catch (e) { flash("preview_flash", esc(e.message), true); return; }
+
+  const kindRu = {telegram_json: "выгрузка Telegram (JSON)",
+                  dialog: "переписка текстом",
+                  plain: "просто текст ТЗ"}[PREVIEW.kind] || PREVIEW.kind;
+  if (!PREVIEW.count) {
+    flash("preview_flash", "ни одной реплики не нашлось", true);
+    $("preview_body").innerHTML = "";
+    $("intake_form").hidden = true;
+    return;
+  }
+  flash("preview_flash",
+    `Понято как <b>${esc(kindRu)}</b>: реплик ${PREVIEW.count}.` +
+    (PREVIEW.notes || []).map(n => `<br>${esc(n)}`).join(""));
+
+  const speakers = Object.keys(PREVIEW.speakers || {});
+  const rolesBlock = speakers.length && speakers.some(x => x) ? `
+    <div class="note">Проверь роли глазами. ТЗ строится по словам <b>клиента</b>;
+      моя реплика становится требованием, только если клиент с ней согласился.
+      Ошибка здесь портит ТЗ целиком.</div>
+    <div class="roles">
+      ${speakers.map(who => `<div class="role-row">
+        <span class="who">${esc(who || "без имени")}
+          <span class="muted">· реплик ${PREVIEW.speakers[who]}</span></span>
+        <select data-speaker="${esc(who)}">
+          <option value="client" ${PREVIEW.roles[who] === "client" ? "selected" : ""}>клиент</option>
+          <option value="owner" ${PREVIEW.roles[who] === "owner" ? "selected" : ""}>я, владелец</option>
+          <option value="bot" ${PREVIEW.roles[who] === "bot" ? "selected" : ""}>бот</option>
+        </select></div>`).join("")}
+    </div>` : "";
+
+  $("preview_body").innerHTML = rolesBlock + `
+    <div class="sample">
+      ${(PREVIEW.sample || []).map(l =>
+        `<div><b>${esc(l.speaker || "—")}</b> ${esc(l.text)}</div>`).join("")}
+    </div>`;
+  $("intake_form").hidden = false;
+}
+
+function chosenRoles() {
+  const out = {};
+  document.querySelectorAll("[data-speaker]").forEach(sel => {
+    out[sel.dataset.speaker] = sel.value;
+  });
+  return out;
+}
+
+async function submitIntake() {
+  if (!PREVIEW) { flash("intake_flash", "сначала нажми «Разобрать»", true); return; }
+  const raw = $("raw").value;
+  const roles = chosenRoles();
+  const appendTo = $("append_to").value;
+  const btn = $("submit_intake");
+  btn.disabled = true;
+  try {
+    let data;
+    if (appendTo) {
+      data = await post("/api/intake/append",
+                        {raw, roles, project_id: Number(appendTo)});
+    } else {
+      data = await post("/api/intake/create", {
+        raw, roles,
+        company: $("company").value,
+        client: $("client").value,
+        title: $("title").value,
+        deadline: $("deadline").value,
+        priority: $("priority").value,
+      });
+    }
+    const st = data.stats || {};
+    flash("intake_flash",
+      `Заказ <b>#${data.project_id}</b>: записано реплик ${st.added},
+       пропущено повторов ${st.skipped}, перехвачено секретов ${st.secrets}.
+       Дальше — «Собрать ТЗ» на карточке заказа во вкладке «Работа».`);
+    clearIntake();
+    load();
+  } catch (e) {
+    flash("intake_flash", esc(e.message), true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function clearIntake() {
+  $("raw").value = "";
+  PREVIEW = null;
+  $("preview_body").innerHTML = "";
+  $("preview_flash").hidden = true;
+  $("intake_form").hidden = true;
+}
+
+// ---------- цикл ----------
+
+function render(s) {
+  STATE = s;
+  $("clock").innerHTML = `${esc(s.now)} UTC · ` + (s.paused
+    ? `<button class="quiet" onclick="act('/api/pause?on=false')">на паузе — снять</button>`
+    : `<button class="quiet" onclick="act('/api/pause?on=true')">пауза</button>`);
+  renderNav();
+  renderWork(s);
+  renderSpend(s);
+  renderSecrets(s);
+  syncCompanies(s);
 }
 
 async function load() {
   try {
     render(await (await fetch("/api/state")).json());
   } catch (e) {
-    document.getElementById("head").textContent = "нет связи с автопилотом";
+    $("clock").textContent = "нет связи с автопилотом";
   }
 }
+
+show("work");
 load();
 setInterval(load, 3000);
 </script>

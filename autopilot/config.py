@@ -54,6 +54,10 @@ class Config:
     db_url = os.getenv("DB_URL", f"sqlite+aiosqlite:///{ROOT}/autopilot.db")
     workspaces = Path(os.getenv("WORKSPACES") or ROOT / "workspaces")
     logs = Path(os.getenv("LOGS") or ROOT / "logs")
+    # Каталог, внутри которого у каждого проекта своя папка (см. projectdir.py).
+    # Раньше данные заказа лежали в трёх разных местах — код в workspaces/pN,
+    # логи в общем logs/, исходное ТЗ нигде, — и «отдать заказ» было нечем.
+    projects_dir = Path(os.getenv("PROJECTS_DIR") or ROOT / "projects")
 
     claude_bin = os.getenv("CLAUDE_BIN", "claude")
     cc_model = os.getenv("CC_MODEL", "sonnet")
@@ -252,3 +256,4 @@ class Config:
 cfg = Config()
 cfg.workspaces.mkdir(parents=True, exist_ok=True)
 cfg.logs.mkdir(parents=True, exist_ok=True)
+cfg.projects_dir.mkdir(parents=True, exist_ok=True)

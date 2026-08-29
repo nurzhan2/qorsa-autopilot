@@ -22,6 +22,9 @@ _TMP = Path(tempfile.mkdtemp(prefix="qorsa-tests-"))
 os.environ["DB_URL"] = f"sqlite+aiosqlite:///{(_TMP / 'test.db').as_posix()}"
 os.environ["WORKSPACES"] = str(_TMP / "workspaces")
 os.environ["LOGS"] = str(_TMP / "logs")
+# Каталоги проектов — тоже во временное место: без этого тесты заводили бы
+# папки заказов рядом с настоящими и мусорили в рабочем projects/
+os.environ["PROJECTS_DIR"] = str(_TMP / "projects")
 os.environ["ANTHROPIC_API_KEY"] = ""       # судья в тестах не поднимается
 # В тестах модель подменяется заглушкой через client=, а это путь API.
 # Боевое умолчание — cli, и без этой строки тесты пошли бы искать

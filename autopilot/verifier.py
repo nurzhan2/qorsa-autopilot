@@ -19,6 +19,7 @@ from .checks import (DEFAULT_TIMEOUT_SEC, HUMAN_ONLY, REGISTRY, VIEWPORTS,
 from .checks import suspicious as suspicious_reason
 from .config import cfg
 from . import llm
+from . import projectdir
 from .llm import LLMError
 from .textenc import decode_console
 from .db import AccessItem, Project, Session, Task, close_run, open_run
@@ -460,7 +461,10 @@ class Verifier:
         }
 
     async def run(self, task: Task, project: Project) -> Verdict:
-        cwd = project.workspace or str(cfg.workspaces / f"p{project.id}")
+        # ТОТ ЖЕ каталог, в котором работал агент. Разъедутся — приёмка будет
+        # искать файлы там, где их никто не создавал: ровно та ошибка, из-за
+        # которой задача про корзину провалилась при выполненной работе
+        cwd = str(projectdir.workspace(project))
         defects: list[str] = []
         observations: list[str] = []
         executed = 0
