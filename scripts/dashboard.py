@@ -395,6 +395,7 @@ async def collect() -> dict:
             "cli_minutes": round(both["cli_seconds"] / 60, 1),
         },
         "paused": PAUSE_FILE.exists(),
+        "max_attempts": cfg.max_attempts,
         "now": str(utcnow())[:19],
     }
 

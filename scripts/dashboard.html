@@ -460,11 +460,20 @@ function pulseCard(s) {
 }
 
 function attentionCard(t) {
+  // «Исчерпаны попытки» при `попыток 0` — неправда, и она сбивает с толку
+  // сильнее, чем отсутствие пояснения. Ноль записанных попыток при живой
+  // истории прогонов значит, что задачу гоняли мимо планировщика
+  // (scripts/live_run.py), и счётчик он не трогает
+  const max = (STATE && STATE.max_attempts) || 0;
+  const escalatedWhy = t.attempts
+    ? `исчерпаны попытки — ${t.attempts} из ${max}`
+    : "снята с работы, но записанных попыток нет — похоже, задачу гоняли " +
+      "вручную мимо планировщика";
   const why = t.env_hints && t.env_hints.length
     ? "ждёт окружение — чинить код бессмысленно, инструмента нет на машине"
     : t.waits_confirmation
     ? "приёмка прошла, но ничего не доказала — нужно твоё решение"
-    : (t.status === "escalated" ? "исчерпаны попытки" : "нужен разбор");
+    : (t.status === "escalated" ? escalatedWhy : "нужен разбор");
   return `<div class="card calls">
     <div class="head">
       <span class="title">${esc(t.title)}</span>
