@@ -552,6 +552,21 @@ def build_app():
         except ValueError as e:
             raise HTTPException(400, str(e)) from None
 
+    @app.post("/api/project/{project_id}/question")
+    async def answer_question(project_id: int, payload: dict = Body(...)):
+        """Владелец ответил на блокирующий вопрос ТЗ сам.
+
+        Ответ уходит и в переписку (иначе следующий пересбор спросит то же
+        самое), и в ТЗ ручным пунктом с `origin="owner"`. Выдавать решение
+        владельца за слова клиента нельзя — на этом держится evidence.
+        """
+        try:
+            return {"ok": True, **await curate.answer_question(
+                project_id, str(payload.get("question") or ""),
+                str(payload.get("answer") or ""))}
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+
     @app.post("/api/project/{project_id}/refresh")
     async def refresh(project_id: int):
         """Пересобрать ТЗ и следом перепланировать — одной кнопкой.

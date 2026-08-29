@@ -164,6 +164,92 @@ async def restore(project_id: int, text: str, *, field: str = "deliverables") ->
     return {"action": "возвращено", "text": text}
 
 
+async def answer_question(project_id: int, question: str, answer: str,
+                          *, as_requirement: bool = True) -> dict:
+    """Владелец ответил на блокирующий вопрос ТЗ сам.
+
+    Такой вопрос держит весь заказ: `brief_ready` не станет истиной, пока он
+    открыт, а полоса build не выдаст ни одного слота. Ответить на него было
+    нечем — вопросы приходят от модели и заменяются целиком на следующем
+    прогоне, то есть закрыть его можно было только новой репликой в чате.
+
+    Делаем три вещи, и все три нужны:
+
+    1. **пишем ответ в переписку** как реплику владельца. Без этого следующий
+       полный пересбор задаст тот же вопрос снова: модель читает сообщения,
+       а не наши структуры;
+    2. **убираем вопрос из `open_questions`** — здесь и сейчас, не дожидаясь
+       прогона модели. Иначе заказ стоит до следующего вызова, а вызов может
+       и не пройти;
+    3. **пересчитываем `brief_ready` тут же** по тем же правилам, что
+       и `Brief._persist`: цель есть, блокирующих вопросов нет, уверенности
+       хватает. Так снятие последнего вопроса разблокирует заказ сразу.
+
+    Ответ — это РЕШЕНИЕ ВЛАДЕЛЬЦА, а не слова клиента, и записывается он
+    именно так: `curated`-пунктом с `origin="owner"`. Выдавать его за
+    требование клиента нельзя — на этом держится всё правило evidence.
+    """
+    from .brief import blocking_questions
+    from .config import cfg
+    from .db import ChatMessage
+    from .intake import TRANSPORT, chat_id_for
+    from .roles import OWNER
+    from .secrets_scan import scrub
+
+    question = (question or "").strip()
+    answer = (answer or "").strip()
+    if not question or not answer:
+        raise ValueError("нужны и вопрос, и ответ")
+
+    async with Session() as s:
+        project = await s.get(Project, int(project_id))
+        if project is None:
+            raise ValueError(f"проекта {project_id} нет")
+        brief = _brief_of(project)
+        questions = [q for q in (brief.get("open_questions") or [])
+                     if isinstance(q, dict)]
+        keep = [q for q in questions
+                if str(q.get("text") or "").strip() != question]
+        if len(keep) == len(questions):
+            raise ValueError("такого вопроса в ТЗ нет")
+        brief["open_questions"] = keep
+
+        if as_requirement:
+            rows = [dict(i) for i in (brief.get("constraints") or [])
+                    if isinstance(i, dict)]
+            item = make_item(f"{question} — {answer}")
+            if not any(same_item(r, item) for r in rows):
+                rows.append(item)
+            brief["constraints"] = rows
+
+        # Ответ — в переписку, иначе следующий пересбор спросит то же самое
+        text, _names = scrub(f"РЕШЕНИЕ ВЛАДЕЛЬЦА. {question}\nОтвет: {answer}",
+                             project_id=project_id, chat_id=chat_id_for(project_id))
+        s.add(ChatMessage(
+            transport=TRANSPORT, chat_id=chat_id_for(project_id),
+            tg_message_id=f"owner-{utcnow().strftime('%Y%m%d%H%M%S%f')}",
+            project_id=project_id, direction="out", sender_role=OWNER,
+            sender_id="owner", text=text,
+            raw_json={"owner_decision": True, "question": question},
+            created_at=utcnow()))
+
+        # Те же правила, что у Brief._persist — второго мнения тут быть не должно
+        ready = (bool(brief.get("goal"))
+                 and not blocking_questions(brief)
+                 and float(brief.get("confidence") or 0) >= cfg.brief_min_confidence)
+        project.brief = _save(project, brief)
+        project.brief_ready = ready
+        project.updated_at = utcnow()
+        await s.commit()
+
+    log.warning("проект %s: владелец ответил на вопрос ТЗ сам — %r; "
+                "осталось блокирующих: %s, ТЗ собрано: %s",
+                project_id, question[:70],
+                len([q for q in keep if q.get("blocking")]), ready)
+    return {"action": "вопрос закрыт", "brief_ready": ready,
+            "left": len([q for q in keep if q.get("blocking")])}
+
+
 def listing(project: Project) -> dict:
     """Что показывать в окне правок ТЗ."""
     brief = _brief_of(project)
@@ -183,9 +269,16 @@ def listing(project: Project) -> dict:
             })
         return out
 
+    questions = [{
+        "text": str(q.get("text") or "").strip(),
+        "blocking": bool(q.get("blocking")),
+    } for q in (brief.get("open_questions") or []) if isinstance(q, dict)]
+
     return {
         "deliverables": rows("deliverables"),
         "stack": rows("stack"),
         "constraints": rows("constraints"),
         "out_of_scope": rows("out_of_scope"),
+        # блокирующие впереди: именно они держат заказ
+        "questions": sorted(questions, key=lambda q: not q["blocking"]),
     }

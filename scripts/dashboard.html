@@ -563,6 +563,34 @@ function accessBlock(p) {
   </div>`;
 }
 
+function questionsBlock(p) {
+  const qs = ((p.requirements || {}).questions) || [];
+  if (!qs.length) return "";
+  const blocking = qs.filter(q => q.blocking).length;
+  return `<div class="access">
+    <div class="head">
+      <span class="title">Вопросы по ТЗ — ${qs.length}</span>
+      <span class="muted">${blocking
+        ? `${blocking} из них держат заказ: пока открыты, сборка не начнётся`
+        : "работу не держат"}</span>
+    </div>
+    ${qs.map((q, i) => `<div class="key-row">
+      <div class="key-what">
+        <div>${q.blocking ? '<span class="tag call">держит</span> ' : ""}${esc(q.text)}</div>
+      </div>
+      <input placeholder="ответить за клиента" id="q-${p.id}-${i}"
+             onkeydown="if(event.key==='Enter')answerQ(${p.id},${i},this)"
+             data-q="${esc(q.text)}">
+      <button class="ghost" onclick="answerQ(${p.id},${i},this.previousElementSibling)">
+        Ответить</button>
+    </div>`).join("")}
+    <div class="note">Ответ записывается как <b>решение владельца</b>, а не как
+      слова клиента, и уходит в переписку — иначе следующий пересбор спросит
+      то же самое.</div>
+    <div class="flash" id="q-flash-${p.id}" hidden></div>
+  </div>`;
+}
+
 function requirementsBlock(p) {
   const req = p.requirements || {};
   const live = req.deliverables || [];
@@ -638,6 +666,7 @@ function projectCard(p) {
     ${p.folder ? `<div class="note">папка: ${esc(p.folder)}</div>` : ""}
     ${Object.values(p.jobs || {}).map(jobLine).join("")}
     ${accessBlock(p)}
+    ${questionsBlock(p)}
     ${requirementsBlock(p)}
     ${p.orphans ? `<div class="note">осиротевших задач: ${p.orphans} —
       их требование исчезло из ТЗ, в работу они не идут
@@ -686,6 +715,21 @@ async function putKey(projectId, itemId) {
     if (box) box.value = "";
     setTimeout(load, 1200);      // дать прочитать сообщение до перерисовки
   } catch (e) { flash(`access-flash-${projectId}`, esc(e.message), true); }
+}
+
+async function answerQ(projectId, idx, box) {
+  const answer = box ? box.value.trim() : "";
+  const question = box ? box.dataset.q : "";
+  if (!answer) { flash(`q-flash-${projectId}`, "пустой ответ", true); return; }
+  try {
+    const data = await post(`/api/project/${projectId}/question`,
+                            {question, answer});
+    flash(`q-flash-${projectId}`,
+      `Вопрос закрыт. Блокирующих осталось: ${data.left}. ` +
+      (data.brief_ready ? "<b>ТЗ теперь собрано</b> — можно составлять план."
+                        : "ТЗ ещё не собрано."));
+    setTimeout(load, 1800);
+  } catch (e) { flash(`q-flash-${projectId}`, esc(e.message), true); }
 }
 
 async function addReq(projectId) {
