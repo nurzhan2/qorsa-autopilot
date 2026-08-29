@@ -12,7 +12,6 @@ from .db import init_db, recover_orphan_tasks, sync_accounts
 from .executor import Executor
 from .ingest import Ingest
 from .scheduler import Scheduler
-from .sheets import SheetSync
 from .transports.max import MaxTransport
 from .transports.telegram import TelegramTransport
 from .vault import anthropic_key, install_log_masking
@@ -133,6 +132,14 @@ async def main() -> None:
                         "или файла %s", acc.code, cfg.google_creds)
             continue
         by_sheet.setdefault(acc.sheet_id, []).append(acc)
+
+    if by_sheet:
+        # Импорт ЗДЕСЬ, а не наверху файла. `sheets.py` тянет gspread, и при
+        # импорте на уровне модуля весь автопилот отказывался стартовать без
+        # него — даже когда таблица не настроена и синк всё равно не поднялся
+        # бы. Работа через окно «Новый заказ» к Google-таблице отношения
+        # не имеет, а падало на ней всё.
+        from .sheets import SheetSync
 
     for sheet_id, group in by_sheet.items():
         sync = SheetSync(accounts=group,

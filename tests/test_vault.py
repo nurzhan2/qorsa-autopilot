@@ -1,6 +1,7 @@
 """Секреты: в БД только ссылки, в промпте только имена, в логах только звёздочки."""
 from __future__ import annotations
 
+import io
 import json
 import logging
 
@@ -117,6 +118,45 @@ def test_log_masking(tmp_path, caplog):
     assert SECRET not in text, "секрет утёк в лог"
     assert "***" in text
     assert "агент написал" in text, "маскирование не должно съедать остальное сообщение"
+
+
+def test_log_masking_covers_the_traceback(tmp_path):
+    """Секрет из ТЕКСТА ИСКЛЮЧЕНИЯ тоже не должен попасть в лог.
+
+    Поймано на первом живом запуске автопилота, и это был настоящий утечка,
+    а не гипотеза: httpx поднял HTTPStatusError с полным URL запроса, и токен
+    бота лёг в logs/ открытым. В соседней строке того же лога он был честно
+    замаскирован — дыра была ровно одна: `getMessage()` фильтруется, а
+    исключение форматтер приклеивает потом, из `record.exc_info`, мимо фильтра.
+    """
+    v = make_vault(tmp_path)
+    token = "8617379268:AAFwDBQJtYd2l3YMw7ScScuzim1HH41ASg8"
+    v.set("BOT_TOKEN", token)
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger("test.masking.traceback")
+    logger.handlers = [handler]
+    logger.propagate = False
+    masker = SecretMasker(v)
+    logger.addFilter(masker)
+    handler.addFilter(masker)
+    try:
+        try:
+            raise RuntimeError(
+                f"Client error '400' for url "
+                f"'https://api.telegram.org/bot{token}/sendMessage'")
+        except RuntimeError:
+            logger.exception("не смог уведомить владельца")
+    finally:
+        logger.handlers = []
+        logger.removeFilter(masker)
+
+    text = stream.getvalue()
+    assert token not in text, "токен утёк в лог через трейсбэк"
+    assert "***" in text
+    assert "RuntimeError" in text, "маскирование не должно съедать сам трейсбэк"
 
 
 def test_mask_bytes_covers_subprocess_output(tmp_path):

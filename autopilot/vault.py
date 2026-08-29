@@ -163,6 +163,17 @@ class SecretMasker(logging.Filter):
 
     Ставится на root-логгер, поэтому накрывает и наши сообщения, и чужие,
     и вывод Claude Code, который executor логирует как есть.
+
+    **Трейсбэк маскируется отдельно, и это не педантизм.** `getMessage()`
+    отдаёт только текст записи; исключение форматтер приклеивает потом, из
+    `record.exc_info`, мимо любого фильтра. На первом живом запуске автопилота
+    это дало ровно то, ради чего затевался vault: httpx поднял
+    `HTTPStatusError` с полным URL запроса, и токен бота лёг в `logs/` открытым
+    — в соседней строке того же лога он был честно замаскирован как `bot***`.
+    Дыра была одна: сообщение фильтруется, исключение нет.
+
+    Готовый текст исключения кладём в `record.exc_text` — форматтер берёт
+    именно его, если он уже заполнен, и второй раз не форматирует.
     """
 
     def __init__(self, source: Vault | None = None):
@@ -175,11 +186,22 @@ class SecretMasker(logging.Filter):
         try:
             text = record.getMessage()
         except Exception:
-            return True
-        masked = self.source.mask(text)
-        if masked != text:
-            record.msg = masked
-            record.args = ()
+            text = None
+        if text is not None:
+            masked = self.source.mask(text)
+            if masked != text:
+                record.msg = masked
+                record.args = ()
+
+        if record.exc_info and not record.exc_text:
+            try:
+                record.exc_text = logging.Formatter().formatException(record.exc_info)
+            except Exception:
+                record.exc_text = None
+        if record.exc_text:
+            record.exc_text = self.source.mask(record.exc_text)
+        if getattr(record, "stack_info", None):
+            record.stack_info = self.source.mask(record.stack_info)
         return True
 
 
