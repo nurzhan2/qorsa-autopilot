@@ -175,6 +175,16 @@
   .sample div { padding: 6px 0; border-bottom: 1px solid var(--obsidian); }
   .sample b { color: var(--ivory); font-weight: 480; }
 
+  /* зона перетаскивания файла выгрузки */
+  .drop {
+    border: 1px dashed var(--slate); border-radius: var(--r-card);
+    padding: 24px; margin-bottom: 16px; text-align: center;
+    color: var(--ash); font-size: 14px;
+  }
+  .drop.over { border-color: var(--cobalt); color: var(--ivory); }
+  .drop input[type=file] { display: none; }
+  .drop button { margin-top: 16px; }
+
   .why {
     margin-top: 20px; padding: 16px 20px; border-radius: var(--r-card);
     background: var(--onyx);
@@ -197,6 +207,7 @@
   .key-what { flex: 1 1 260px; min-width: 0; font-size: 14px; }
   .key-what code { color: var(--ash); }
   .key-row input { flex: 1 1 220px; width: auto; background: var(--graphite); }
+  .key-row select { flex: 0 0 auto; width: auto; background: var(--graphite); }
   .key-row button { flex: 0 0 auto; }
 
   .flash {
@@ -248,6 +259,14 @@
 
     <div class="card">
       <label for="raw">Выгрузка переписки</label>
+      <div id="drop" class="drop">
+        Перетащи сюда <code>result.json</code> или любой текстовый файл —
+        или просто вставь текст в поле ниже
+        <input type="file" id="file" accept=".json,.txt,.md,.log,text/*"
+               onchange="loadFile(this.files[0])">
+        <button class="ghost" onclick="document.getElementById('file').click()">
+          Выбрать файл</button>
+      </div>
       <textarea id="raw" placeholder="Анастасия, [12.08.2026 14:30]
 привет! нужно приложение доставки
 
@@ -544,6 +563,44 @@ function accessBlock(p) {
   </div>`;
 }
 
+function requirementsBlock(p) {
+  const req = p.requirements || {};
+  const live = req.deliverables || [];
+  const dropped = req.out_of_scope || [];
+  if (!live.length && !dropped.length && !p.planned) return "";
+  return `<div class="access">
+    <div class="head">
+      <span class="title">Требования — ${live.length}</span>
+      <span class="muted">план правится ЧЕРЕЗ ТЗ: задача, дописанная в план
+        руками, уедет в сироты на следующем прогоне</span>
+    </div>
+    ${live.map(r => `<div class="key-row">
+      <div class="key-what">
+        <div>${esc(r.text)}
+          ${r.curated ? '<span class="tag">руками</span>' : ""}
+          ${r.missing ? '<span class="tag">модель не подтвердила</span>' : ""}</div>
+        <div class="muted">${esc(r.priority || "")}${r.origin
+          ? " · " + esc(r.origin) : ""}</div>
+      </div>
+      <button class="quiet" onclick="dropReq(${p.id}, this)"
+              data-text="${esc(r.text)}">снять</button>
+    </div>`).join("")}
+    ${dropped.length ? `<div class="note">снято: ${dropped.map(r =>
+      `<span class="tag">${esc(r.text)}</span>`).join(" ")}</div>` : ""}
+    <div class="key-row" style="border-top:1px solid var(--obsidian);padding-top:16px">
+      <input id="req-${p.id}" placeholder="дописать требование словами клиента"
+             onkeydown="if(event.key==='Enter')addReq(${p.id})">
+      <select id="reqp-${p.id}">
+        <option value="must">обязательно</option>
+        <option value="should">желательно</option>
+        <option value="nice">по возможности</option>
+      </select>
+      <button class="ghost" onclick="addReq(${p.id})">Добавить</button>
+    </div>
+    <div class="flash" id="req-flash-${p.id}" hidden></div>
+  </div>`;
+}
+
 function projectCard(p) {
   const open = p.tasks.filter(t => t.status !== "done");
   const busy = Object.values(p.jobs || {}).some(j => j && j.state === "running");
@@ -581,11 +638,19 @@ function projectCard(p) {
     ${p.folder ? `<div class="note">папка: ${esc(p.folder)}</div>` : ""}
     ${Object.values(p.jobs || {}).map(jobLine).join("")}
     ${accessBlock(p)}
+    ${requirementsBlock(p)}
+    ${p.orphans ? `<div class="note">осиротевших задач: ${p.orphans} —
+      их требование исчезло из ТЗ, в работу они не идут
+      <button class="quiet" onclick="act('/api/project/${p.id}/prune')">убрать
+        те, по которым ничего не делали</button></div>` : ""}
     <div class="actions">
+      <button class="primary" ${busy ? "disabled" : ""}
+              onclick="act('/api/project/${p.id}/refresh')">
+        Пересобрать ТЗ и план</button>
       <button ${busy ? "disabled" : ""} onclick="act('/api/project/${p.id}/brief')">
-        Собрать ТЗ</button>
+        Только ТЗ</button>
       <button ${busy ? "disabled" : ""} onclick="act('/api/project/${p.id}/plan')">
-        Составить план</button>
+        Только план</button>
       ${p.status === "blocked"
         ? `<button onclick="act('/api/project/${p.id}/unblock')">Вернуть в работу</button>`
         : ""}
@@ -595,8 +660,7 @@ function projectCard(p) {
              Готов к работе</button>`}
       ${p.autonomous
         ? `<button onclick="setAutonomous(${p.id}, false)">Выключить самостоятельность</button>`
-        : `<button class="primary" onclick="setAutonomous(${p.id}, true)">
-             Работать без ключей</button>`}
+        : `<button onclick="setAutonomous(${p.id}, true)">Работать без ключей</button>`}
     </div>
     ${open.length ? `<div class="scroll"><table>
       <tr><th>задача</th><th>статус</th><th>класс</th><th>кто делает</th><th>попыток</th></tr>
@@ -622,6 +686,33 @@ async function putKey(projectId, itemId) {
     if (box) box.value = "";
     setTimeout(load, 1200);      // дать прочитать сообщение до перерисовки
   } catch (e) { flash(`access-flash-${projectId}`, esc(e.message), true); }
+}
+
+async function addReq(projectId) {
+  const box = $(`req-${projectId}`);
+  const text = box ? box.value.trim() : "";
+  if (!text) { flash(`req-flash-${projectId}`, "пустое требование", true); return; }
+  try {
+    const data = await post(`/api/project/${projectId}/requirement`,
+      {text, priority: $(`reqp-${projectId}`).value});
+    if (box) box.value = "";
+    flash(`req-flash-${projectId}`,
+      `${esc(data.action)}. Чтобы оно попало в план — «Пересобрать ТЗ и план».`);
+    setTimeout(load, 1500);
+  } catch (e) { flash(`req-flash-${projectId}`, esc(e.message), true); }
+}
+
+async function dropReq(projectId, btn) {
+  const text = btn.dataset.text;
+  if (!confirm(`Снять требование «${text}»?\n\nОно уедет в «вне объёма» ` +
+               `с пометкой, что снял его ты. Задачи по нему станут сиротами ` +
+               `после пересборки плана.`)) return;
+  try {
+    await post(`/api/project/${projectId}/requirement/drop`, {text});
+    flash(`req-flash-${projectId}`,
+      "снято. Чтобы план это учёл — «Пересобрать ТЗ и план».");
+    setTimeout(load, 1500);
+  } catch (e) { flash(`req-flash-${projectId}`, esc(e.message), true); }
 }
 
 async function setAutonomous(projectId, on) {
@@ -770,6 +861,41 @@ function syncCompanies(s) {
   add.value = keep;
 }
 
+// Выгрузка Telegram — это файл, и обычно немаленький: 132 сообщения проекта 8
+// в textarea вставлять больно. Читаем файл прямо в браузере и кладём в то же
+// поле — дальше всё как при вставке руками, включая перехват секретов на
+// сервере: файл никуда не загружается, уходит только разобранный текст
+async function loadFile(file) {
+  if (!file) return;
+  const MAX = 12 * 1024 * 1024;
+  if (file.size > MAX) {
+    flash("preview_flash", `файл ${(file.size / 1048576).toFixed(1)} МБ —
+      это больше 12 МБ. Выгрузи чат без медиа: они всё равно не нужны`, true);
+    return;
+  }
+  try {
+    $("raw").value = await file.text();
+  } catch (e) {
+    flash("preview_flash", "не смог прочитать файл: " + esc(e.message), true);
+    return;
+  }
+  flash("preview_flash", `файл <b>${esc(file.name)}</b> прочитан
+    (${(file.size / 1024).toFixed(0)} КБ) — жми «Разобрать»`);
+  preview();
+}
+
+function initDrop() {
+  const zone = $("drop");
+  if (!zone) return;
+  ["dragenter", "dragover"].forEach(ev => zone.addEventListener(ev, e => {
+    e.preventDefault(); zone.classList.add("over");
+  }));
+  ["dragleave", "drop"].forEach(ev => zone.addEventListener(ev, e => {
+    e.preventDefault(); zone.classList.remove("over");
+  }));
+  zone.addEventListener("drop", e => loadFile(e.dataTransfer.files[0]));
+}
+
 async function preview() {
   const raw = $("raw").value;
   if (!raw.trim()) { flash("preview_flash", "вставлять нечего", true); return; }
@@ -889,6 +1015,7 @@ async function load() {
 }
 
 show("work");
+initDrop();
 load();
 setInterval(load, 3000);
 </script>

@@ -37,8 +37,8 @@ except (AttributeError, ValueError):
 from sqlalchemy import func, select                                    # noqa: E402
 
 from autopilot import accounts as accounts_cfg                        # noqa: E402
-from autopilot import (autonomy, intake, limits, manual, progress,    # noqa: E402
-                       projectdir, roles, toolchain)
+from autopilot import (autonomy, curate, intake, limits, manual,      # noqa: E402
+                       progress, projectdir, roles, toolchain)
 from autopilot.config import cfg                                      # noqa: E402
 from autopilot.db import (Account, ChatMessage, Project, Run, Session,  # noqa: E402
                           Task, AccessItem, cli_spent_today, consumed_today,
@@ -312,6 +312,8 @@ async def collect() -> dict:
             "messages": int(msg_counts.get(p.id, 0)),
             "folder": str(folder) if folder else "",
             "planned": bool(p.planned_at),
+            "requirements": curate.listing(p),
+            "orphans": sum(1 for t in mine if t.orphaned),
             "why_stuck": why_stuck,
             "running_now": [t.title for t in live if t.status == "running"],
             "last_action": p.last_action or "",
@@ -515,6 +517,68 @@ def build_app():
     @app.post("/api/project/{project_id}/plan")
     async def run_plan(project_id: int):
         return _start_job("plan", project_id, lambda: _collect_plan(project_id))
+
+    # ---------- правки ТЗ ----------
+    #
+    # План правится ЧЕРЕЗ ТЗ, а не мимо него. Задача, дописанная в план руками,
+    # не найдёт своего пункта и на следующем прогоне планировщика уедет
+    # в `orphaned` — правка молча откатится. Поэтому дописываем требование,
+    # а план пересобираем.
+
+    @app.post("/api/project/{project_id}/requirement")
+    async def add_requirement(project_id: int, payload: dict = Body(...)):
+        try:
+            return {"ok": True, **await curate.add(
+                project_id, str(payload.get("text") or ""),
+                field=str(payload.get("field") or "deliverables"),
+                priority=str(payload.get("priority") or "must"))}
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+
+    @app.post("/api/project/{project_id}/requirement/drop")
+    async def drop_requirement(project_id: int, payload: dict = Body(...)):
+        try:
+            return {"ok": True, **await curate.drop(
+                project_id, str(payload.get("text") or ""),
+                field=str(payload.get("field") or "deliverables"))}
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+
+    @app.post("/api/project/{project_id}/requirement/restore")
+    async def restore_requirement(project_id: int, payload: dict = Body(...)):
+        try:
+            return {"ok": True, **await curate.restore(
+                project_id, str(payload.get("text") or ""))}
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+
+    @app.post("/api/project/{project_id}/refresh")
+    async def refresh(project_id: int):
+        """Пересобрать ТЗ и следом перепланировать — одной кнопкой.
+
+        Именно в этом порядке и именно цепочкой: план выводится из ТЗ, и
+        планировать по несобранному значит планировать по старому. Раньше
+        это были две кнопки, и между ними легко было забыть вторую.
+        """
+        async def chain() -> str:
+            first = await _collect_brief(project_id)
+            second = await _collect_plan(project_id)
+            return f"{first}; {second}"
+
+        return _start_job("refresh", project_id, chain)
+
+    @app.post("/api/project/{project_id}/prune")
+    async def prune(project_id: int):
+        """Убрать сирот — задачи, требование которых исчезло из ТЗ.
+
+        Удаляется только то, по чему ничего не происходило: ни попыток,
+        ни расхода, ни сессии агента. Сирота с историей — это работа,
+        за которую платили, и стирать её нельзя.
+        """
+        removed, kept = await manual.prune(project_id, apply=True)
+        return {"ok": True, "removed": removed, "kept": kept,
+                "message": (f"удалено сирот: {removed}"
+                            + (f", оставлено с историей: {kept}" if kept else ""))}
 
     # ---------- доступы конкретного заказа ----------
 
