@@ -185,6 +185,28 @@
   .drop input[type=file] { display: none; }
   .drop button { margin-top: 16px; }
 
+  /* прогон, запущенный кнопкой: видно, что он пошёл и сколько уже идёт */
+  /* вне объёма: не «потерянные» требования, а исключённые клиентом */
+  .oos {
+    margin-top: 20px; padding: 20px; border-radius: var(--r-card);
+    background: var(--graphite);
+  }
+  .oos .title { font-size: 18px; }
+
+  .job {
+    margin-top: 16px; padding: 14px 20px; border-radius: var(--r-card);
+    background: var(--onyx); font-size: 14px;
+  }
+  .job.running { border-left: 2px solid var(--cobalt); }
+  .job.bad { border-left: 2px solid var(--mist); }
+  .job .dot {
+    display: inline-block; width: 8px; height: 8px; margin-right: 10px;
+    border-radius: 50%; background: var(--cobalt);
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: 0.25 } }
+  @media (prefers-reduced-motion: reduce) { .job .dot { animation: none } }
+
   .why {
     margin-top: 20px; padding: 16px 20px; border-radius: var(--r-card);
     background: var(--onyx);
@@ -409,13 +431,36 @@ async function post(url, body) {
   return data;
 }
 
-async function act(url) {
+async function act(url, opts) {
+  opts = opts || {};
   try {
-    const data = await post(url);
-    if (data.message) alert(data.message);
+    const data = await post(url, opts.body);
+    // У запуска прогона всплывашки быть не должно: он и так виден на карточке
+    // строкой «идёт», и лишний клик по ОК только мешает. Ошибку показываем
+    if (data.ok === false && data.message) alert(data.message);
     else if (data.defects && data.defects.length) alert(data.defects.join("\n"));
+    else if (data.message && !opts.quiet) alert(data.message);
   } catch (e) { alert(e.message); }
   load();
+  // Прогон заводится в фоновой задаче, и первый load() может успеть раньше
+  // неё — тогда карточка на три секунды выглядит так, будто кнопка не сработала
+  setTimeout(load, 700);
+}
+
+async function removeProject(projectId) {
+  let info;
+  try {
+    info = await (await fetch(`/api/project/${projectId}/deletion`)).json();
+  } catch (e) { alert("не смог узнать, что пропадёт: " + e.message); return; }
+  const what =
+    `Удалить заказ «${info.title}» (${info.client || "без клиента"})?\n\n` +
+    `Пропадёт безвозвратно:\n` +
+    `  задач: ${info.tasks}\n  сообщений переписки: ${info.messages}\n` +
+    `  записей о прогонах: ${info.runs}\n  учтённый расход: $${info.cost}\n\n` +
+    (info.folder ? `Каталог на диске НЕ удаляется:\n  ${info.folder}\n\n` : "") +
+    `Отменить это будет нечем.`;
+  if (!confirm(what)) return;
+  act(`/api/project/${projectId}/delete`, {body: {confirm: true}});
 }
 
 function flash(id, text, call) {
@@ -455,8 +500,21 @@ function pulseCard(s) {
       <td class="muted">${t.minutes < 60 ? t.minutes + " мин назад"
                                          : esc(t.at)}</td></tr>`).join("");
 
+  // Прогоны, запущенные кнопками, — здесь же. Они идут не в полосах
+  // планировщика, и без этой строки нажатие кнопки не видно нигде, кроме
+  // карточки заказа, до которой ещё надо доскроллить
+  const jobs = [];
+  for (const p of (s.projects || [])) {
+    for (const job of Object.values(p.jobs || {})) {
+      if (job && job.state === "running") jobs.push({...job, project: p.title});
+    }
+  }
+
   return `<div class="card ${beat.alive ? "" : "calls"}">
     <div class="tags">${head}${laneTags}</div>
+    ${jobs.map(j => `<div class="job running"><span class="dot"></span>
+      <b>${esc(j.kind_ru)}</b> по заказу «${esc(j.project)}» —
+      идёт ${howLong(j.seconds)}</div>`).join("")}
     ${gb.length ? `<div style="margin-top:16px">${gb.map(b =>
       `<div class="note defect">${esc(b.what)}${b.fix
         ? ` <span class="muted">→ ${esc(b.fix)}</span>` : ""}</div>`).join("")}</div>` : ""}
@@ -512,7 +570,12 @@ function attentionCard(t) {
       ${t.waits_confirmation
         ? `<button onclick="act('/api/task/${t.id}/confirm')">Подтвердить</button>`
         : `<button onclick="act('/api/task/${t.id}/done')">Я сделал, проверь</button>`}
+      ${t.waits_confirmation ? "" :
+        `<button onclick="act('/api/task/${t.id}/retry')">Пусть агент сделает заново</button>`}
     </div>
+    ${t.waits_confirmation ? "" : `<div class="note">«Я сделал, проверь» — если
+      работу сделал ты сам. Если её никто не делал, нужна вторая кнопка:
+      она вернёт задачу агенту и обнулит счётчик попыток.</div>`}
   </div>`;
 }
 
@@ -529,11 +592,30 @@ function installCard(items) {
     </table></div></div>`;
 }
 
+function howLong(seconds) {
+  const s = Math.round(seconds || 0);
+  if (s < 90) return `${s} с`;
+  return `${Math.floor(s / 60)} мин ${s % 60} с`;
+}
+
+// «Идёт» без времени выглядит одинаково и через секунду, и через двадцать
+// минут — то есть не отвечает на вопрос, ради которого на него смотрят.
+// Пульсирующая точка отвечает на другой: «оно вообще живое или подвисло».
 function jobLine(job) {
   if (!job) return "";
-  const word = {running: "идёт", ok: "готово", failed: "не вышло"}[job.state] || job.state;
-  return `<div class="note">${esc(job.kind === "brief" ? "сбор ТЗ" : "планирование")}:
-    ${esc(word)}${job.message ? " — " + esc(job.message) : ""}</div>`;
+  if (job.state === "running") {
+    return `<div class="job running">
+      <span class="dot"></span>
+      <b>${esc(job.kind_ru)}</b> идёт уже ${howLong(job.seconds)} —
+      модель отвечает минутами, это нормально. Страница обновится сама.
+    </div>`;
+  }
+  const word = job.state === "ok" ? "готово" : "НЕ ВЫШЛО";
+  return `<div class="job ${job.state === "ok" ? "" : "bad"}">
+    <b>${esc(job.kind_ru)}: ${word}</b>
+    ${job.seconds ? `<span class="muted">за ${howLong(job.seconds)}</span>` : ""}
+    ${job.message ? `<div class="note">${esc(job.message)}</div>` : ""}
+  </div>`;
 }
 
 function accessBlock(p) {
@@ -613,8 +695,26 @@ function requirementsBlock(p) {
       <button class="quiet" onclick="dropReq(${p.id}, this)"
               data-text="${esc(r.text)}">снять</button>
     </div>`).join("")}
-    ${dropped.length ? `<div class="note">снято: ${dropped.map(r =>
-      `<span class="tag">${esc(r.text)}</span>`).join(" ")}</div>` : ""}
+    ${dropped.length ? `<div class="oos">
+      <div class="head">
+        <span class="title">Вне объёма работ — ${dropped.length}</span>
+        <span class="muted">это НЕ потерянные требования</span>
+      </div>
+      <div class="note">Сюда пункт попадает, когда клиент сам сказал «не нужно»
+        или «позже». Вернуть можно, но тогда в объём войдёт работа, которую
+        клиент исключил — а «слово клиента закон» здесь работает как раз
+        в обратную сторону.</div>
+      ${dropped.map(r => `<div class="key-row">
+        <div class="key-what">
+          <div>${esc(r.text)}</div>
+          <div class="muted">${r.by_client
+            ? "по словам клиента"
+            : "снял владелец"}${r.reason ? " · " + esc(r.reason) : ""}</div>
+        </div>
+        <button class="quiet" onclick="restoreReq(${p.id}, this)"
+                data-text="${esc(r.text)}">вернуть в объём</button>
+      </div>`).join("")}
+    </div>` : ""}
     <div class="key-row" style="border-top:1px solid var(--obsidian);padding-top:16px">
       <input id="req-${p.id}" placeholder="дописать требование словами клиента"
              onkeydown="if(event.key==='Enter')addReq(${p.id})">
@@ -674,11 +774,13 @@ function projectCard(p) {
         те, по которым ничего не делали</button></div>` : ""}
     <div class="actions">
       <button class="primary" ${busy ? "disabled" : ""}
-              onclick="act('/api/project/${p.id}/refresh')">
-        Пересобрать ТЗ и план</button>
-      <button ${busy ? "disabled" : ""} onclick="act('/api/project/${p.id}/brief')">
+              onclick="act('/api/project/${p.id}/refresh', {quiet: true})">
+        ${busy ? "идёт…" : "Пересобрать ТЗ и план"}</button>
+      <button ${busy ? "disabled" : ""}
+              onclick="act('/api/project/${p.id}/brief', {quiet: true})">
         Только ТЗ</button>
-      <button ${busy ? "disabled" : ""} onclick="act('/api/project/${p.id}/plan')">
+      <button ${busy ? "disabled" : ""}
+              onclick="act('/api/project/${p.id}/plan', {quiet: true})">
         Только план</button>
       ${p.status === "blocked"
         ? `<button onclick="act('/api/project/${p.id}/unblock')">Вернуть в работу</button>`
@@ -690,6 +792,7 @@ function projectCard(p) {
       ${p.autonomous
         ? `<button onclick="setAutonomous(${p.id}, false)">Выключить самостоятельность</button>`
         : `<button onclick="setAutonomous(${p.id}, true)">Работать без ключей</button>`}
+      <button class="quiet" onclick="removeProject(${p.id})">Удалить заказ</button>
     </div>
     ${open.length ? `<div class="scroll"><table>
       <tr><th>задача</th><th>статус</th><th>класс</th><th>кто делает</th><th>попыток</th></tr>
@@ -742,6 +845,21 @@ async function addReq(projectId) {
     if (box) box.value = "";
     flash(`req-flash-${projectId}`,
       `${esc(data.action)}. Чтобы оно попало в план — «Пересобрать ТЗ и план».`);
+    setTimeout(load, 1500);
+  } catch (e) { flash(`req-flash-${projectId}`, esc(e.message), true); }
+}
+
+async function restoreReq(projectId, btn) {
+  const text = btn.dataset.text;
+  if (!confirm(
+      `Вернуть «${text}» в объём работ?\n\n` +
+      `Клиент это исключил или отложил своими словами. Возврат добавит ` +
+      `работу, за которую он не просил платить.\n\n` +
+      `Делай это, только если клиент передумал.`)) return;
+  try {
+    await post(`/api/project/${projectId}/requirement/restore`, {text});
+    flash(`req-flash-${projectId}`,
+      "возвращено в объём. Чтобы попало в план — «Пересобрать ТЗ и план».");
     setTimeout(load, 1500);
   } catch (e) { flash(`req-flash-${projectId}`, esc(e.message), true); }
 }

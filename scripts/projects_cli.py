@@ -171,9 +171,95 @@ async def cmd_migrate(args) -> int:
     return 0
 
 
+DEMO_MARK = "демо-задача"
+
+
+async def cmd_demo(args) -> int:
+    """Убрать демо-данные из seed_demo.py.
+
+    Они мешают не тем, что занимают место, а тем, что **выглядят как работа,
+    ждущая человека**. У демо-задачи нет ни одного критерия приёмки, и
+    верификатор честно говорит «принять задачу нечем» — то же самое, что он
+    сказал бы про настоящую задачу с забытыми критериями. В списке «ждёт тебя»
+    двенадцать таких строк неотличимы от реальной проблемы.
+    """
+    from sqlalchemy import delete, func
+
+    from autopilot.db import (AccessItem, ChatMessage, Message, ProjectChat,
+                              Run, Task)
+
+    await init_db()
+    async with Session() as s:
+        projects = list((await s.execute(select(Project).order_by(Project.id)))
+                        .scalars().all())
+        whole: list[Project] = []
+        partial: list[tuple[Project, int]] = []
+        for p in projects:
+            demo = (await s.execute(
+                select(func.count()).select_from(Task)
+                .where(Task.project_id == p.id,
+                       Task.prompt.like(f"%{DEMO_MARK}%")))).scalar() or 0
+            real = (await s.execute(
+                select(func.count()).select_from(Task)
+                .where(Task.project_id == p.id,
+                       Task.lane.in_(("build", "verify")),
+                       Task.prompt.notlike(f"%{DEMO_MARK}%")))).scalar() or 0
+            msgs = (await s.execute(
+                select(func.count()).select_from(ChatMessage)
+                .where(ChatMessage.project_id == p.id))).scalar() or 0
+            if not demo:
+                continue
+            # Заказ целиком демонстрационный только если в нём НЕТ ни настоящих
+            # задач, ни переписки. Иначе трогаем только сами демо-задачи:
+            # у проекта 2 их двенадцать при двадцати девяти настоящих
+            if real == 0 and msgs == 0:
+                whole.append(p)
+            else:
+                partial.append((p, demo))
+
+    if not whole and not partial:
+        print("демо-данных нет")
+        return 0
+
+    for p in whole:
+        print(f"#{p.id} {p.title!r} — заказ целиком демонстрационный, удалить")
+    for p, demo in partial:
+        print(f"#{p.id} {p.title!r} — удалить {demo} демо-задач, "
+              f"сам заказ настоящий и остаётся")
+    if not args.apply:
+        print("\nпримерка. Удалить — повтори с --apply")
+        return 0
+
+    async with Session() as s:
+        for p, _ in partial:
+            ids = list((await s.execute(
+                select(Task.id).where(Task.project_id == p.id,
+                                      Task.prompt.like(f"%{DEMO_MARK}%"))))
+                       .scalars().all())
+            if ids:
+                await s.execute(delete(Run).where(Run.task_id.in_(ids)))
+                await s.execute(delete(Task).where(Task.id.in_(ids)))
+        for p in whole:
+            ids = list((await s.execute(
+                select(Task.id).where(Task.project_id == p.id))).scalars().all())
+            if ids:
+                await s.execute(delete(Run).where(Run.task_id.in_(ids)))
+            for model in (Task, Message, AccessItem, ProjectChat, ChatMessage):
+                await s.execute(delete(model).where(model.project_id == p.id))
+            await s.execute(delete(Project).where(Project.id == p.id))
+        await s.commit()
+    print(f"\nудалено заказов: {len(whole)}, почищено заказов: {len(partial)}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="каталоги проектов автопилота")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_demo = sub.add_parser("demo", help="убрать демо-данные из seed_demo")
+    p_demo.add_argument("--apply", action="store_true",
+                        help="без него — только примерка")
+    p_demo.set_defaults(fn=cmd_demo)
 
     p_list = sub.add_parser("list", help="что где лежит")
     p_list.add_argument("--project", type=int, default=None)

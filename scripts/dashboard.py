@@ -40,9 +40,10 @@ from autopilot import accounts as accounts_cfg                        # noqa: E4
 from autopilot import (autonomy, curate, intake, limits, manual,      # noqa: E402
                        progress, projectdir, roles, toolchain)
 from autopilot.config import cfg                                      # noqa: E402
-from autopilot.db import (Account, ChatMessage, Project, Run, Session,  # noqa: E402
-                          Task, AccessItem, cli_spent_today, consumed_today,
-                          init_db, spent_today, sync_accounts, utcnow)
+from autopilot.db import (Account, AccessItem, ChatMessage, Message,  # noqa: E402
+                          Project, ProjectChat, Run, Session, Task,
+                          cli_spent_today, consumed_today, init_db,
+                          spent_today, sync_accounts, utcnow)
 from autopilot.vault import resolve_secret, vault                     # noqa: E402
 from autopilot.verifier import Verifier                               # noqa: E402
 
@@ -79,6 +80,14 @@ SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 # сразу, а состояние видно в общем снимке.
 JOBS: dict[str, dict] = {}
 
+# Виды прогонов. Список нужен, чтобы снимок состояния не забыл ни один:
+# `refresh` однажды уже не попал в карточку, и нажатие кнопки выглядело как
+# «ничего не произошло», хотя цепочка шла
+JOB_KINDS = ("brief", "plan", "refresh")
+
+JOB_RU = {"brief": "сбор ТЗ", "plan": "планирование",
+          "refresh": "пересборка ТЗ и плана"}
+
 
 def _job_key(kind: str, project_id: int) -> str:
     return f"{kind}:{project_id}"
@@ -86,8 +95,11 @@ def _job_key(kind: str, project_id: int) -> str:
 
 async def _run_job(kind: str, project_id: int, coro_factory) -> None:
     key = _job_key(kind, project_id)
-    JOBS[key] = {"kind": kind, "project_id": project_id, "state": "running",
-                 "started": utcnow().isoformat()[:19], "message": ""}
+    started = utcnow()
+    JOBS[key] = {"kind": kind, "kind_ru": JOB_RU.get(kind, kind),
+                 "project_id": project_id, "state": "running",
+                 "started": started.isoformat()[:19], "message": "",
+                 "seconds": 0.0}
     try:
         message = await coro_factory()
         JOBS[key].update(state="ok", message=message or "готово")
@@ -96,6 +108,23 @@ async def _run_job(kind: str, project_id: int, coro_factory) -> None:
         JOBS[key].update(state="failed", message=f"{type(e).__name__}: {e}"[:300])
     finally:
         JOBS[key]["finished"] = utcnow().isoformat()[:19]
+        JOBS[key]["seconds"] = round((utcnow() - started).total_seconds(), 1)
+
+
+def _job_view(row: dict | None) -> dict | None:
+    """Прогон для страницы: у идущего считаем, сколько он уже идёт.
+
+    Без этого «идёт» выглядит одинаково и через секунду, и через двадцать
+    минут — то есть не отвечает на вопрос, ради которого его смотрят.
+    """
+    if not row:
+        return None
+    out = dict(row)
+    if out.get("state") == "running":
+        started = dt.datetime.fromisoformat(out["started"]).replace(
+            tzinfo=dt.timezone.utc)
+        out["seconds"] = round((utcnow() - started).total_seconds(), 1)
+    return out
 
 
 def _start_job(kind: str, project_id: int, coro_factory) -> dict:
@@ -317,8 +346,11 @@ async def collect() -> dict:
             "why_stuck": why_stuck,
             "running_now": [t.title for t in live if t.status == "running"],
             "last_action": p.last_action or "",
-            "jobs": {kind: JOBS.get(_job_key(kind, p.id))
-                     for kind in ("brief", "plan")
+            # Все виды прогонов, включая цепочку `refresh`: раньше её тут
+            # не было, и нажатие «Пересобрать ТЗ и план» не оставляло на
+            # карточке никакого следа — человек не понимал, пошло или нет
+            "jobs": {kind: _job_view(JOBS.get(_job_key(kind, p.id)))
+                     for kind in JOB_KINDS
                      if JOBS.get(_job_key(kind, p.id))},
             "tasks": [task_row(t) for t in live],
         })
@@ -439,6 +471,42 @@ def build_app():
         """«Сделал, проверь» — те же критерии, что и для агента."""
         ok, defects = await manual.submit(task_id, Verifier())
         return {"ok": ok, "defects": defects}
+
+    @app.post("/api/task/{task_id}/retry")
+    async def retry_task(task_id: int):
+        """Вернуть задачу агенту: «сделай ещё раз».
+
+        Нужно там, где работа НЕ сделана, а задача уже снята с работы:
+        исчерпаны попытки или приёмке нечем было её принять. Кнопка
+        «Я сделал, проверь» тут не подходит — она проверяет то, чего нет,
+        и снова проваливается.
+
+        Счётчик попыток обнуляется намеренно: владелец решил дать задаче
+        новый заход, и старый лимит его решение отменять не должен. Но
+        решение записывается в `last_error` — по базе должно быть видно,
+        что счётчик сбросила рука, а не сама система.
+        """
+        async with Session() as s:
+            t = await s.get(Task, task_id)
+            if t is None:
+                raise HTTPException(404, "задачи нет")
+            if t.status not in ("escalated", "needs_human", autonomy.AWAITING_KEYS):
+                return {"ok": False,
+                        "message": f"задача в статусе «{TASK_RU.get(t.status, t.status)}» "
+                                   f"— возвращать в очередь нечего"}
+            was, attempts = t.status, t.attempts
+            t.status = "ready"
+            t.lane = "build"
+            t.defects = []
+            t.attempts = 0
+            t.last_error = (f"возвращена в работу владельцем из «{was}»; "
+                            f"счётчик попыток сброшен (было {attempts})")
+            t.updated_at = utcnow()
+            await s.commit()
+        log.warning("задача %s возвращена в очередь вручную (была %s, попыток %s)",
+                    task_id, was, attempts)
+        return {"ok": True, "message": "Задача снова в очереди — агент возьмёт её "
+                                       "на ближайшем тике."}
 
     @app.post("/api/task/{task_id}/confirm")
     async def confirm(task_id: int):
@@ -612,6 +680,69 @@ def build_app():
                                              str(payload.get("value") or ""))}
         except ValueError as e:
             raise HTTPException(400, str(e)) from None
+
+    @app.get("/api/project/{project_id}/deletion")
+    async def deletion_preview(project_id: int):
+        """Что именно пропадёт. Показываем ДО удаления, а не после.
+
+        Кнопка «удалить заказ» — единственное необратимое действие в этой
+        панели, и нажимают её обычно не глядя. Пусть в подтверждении будут
+        настоящие цифры, а не «вы уверены?».
+        """
+        from sqlalchemy import func
+
+        async with Session() as s:
+            p = await s.get(Project, project_id)
+            if p is None:
+                raise HTTPException(404, "проекта нет")
+            tasks = (await s.execute(
+                select(func.count()).select_from(Task)
+                .where(Task.project_id == project_id))).scalar() or 0
+            msgs = (await s.execute(
+                select(func.count()).select_from(ChatMessage)
+                .where(ChatMessage.project_id == project_id))).scalar() or 0
+            runs = (await s.execute(
+                select(func.count()).select_from(Run).join(Task, Task.id == Run.task_id)
+                .where(Task.project_id == project_id))).scalar() or 0
+        folder = projectdir.find(project_id)
+        return {"id": project_id, "title": p.title, "client": p.client,
+                "tasks": tasks, "messages": msgs, "runs": runs,
+                "cost": round(p.cost_usd or 0, 2),
+                "folder": str(folder) if folder else ""}
+
+    @app.post("/api/project/{project_id}/delete")
+    async def delete_project(project_id: int, payload: dict = Body(None)):
+        """Удалить заказ из базы.
+
+        **Каталог проекта на диске НЕ трогаем.** Там код, который писал агент,
+        и весит он гигабайты; стереть его нажатием кнопки — не то, что можно
+        сделать по одному клику. Путь возвращается, чтобы удалить руками,
+        если он и правда не нужен.
+        """
+        from sqlalchemy import delete as sql_delete
+
+        if not (payload or {}).get("confirm"):
+            raise HTTPException(400, "удаление требует подтверждения")
+        async with Session() as s:
+            p = await s.get(Project, project_id)
+            if p is None:
+                raise HTTPException(404, "проекта нет")
+            title = p.title
+            ids = list((await s.execute(
+                select(Task.id).where(Task.project_id == project_id))).scalars().all())
+            if ids:
+                await s.execute(sql_delete(Run).where(Run.task_id.in_(ids)))
+            for model in (Task, Message, AccessItem, ProjectChat, ChatMessage):
+                await s.execute(sql_delete(model).where(model.project_id == project_id))
+            await s.execute(sql_delete(Project).where(Project.id == project_id))
+            await s.commit()
+        folder = projectdir.find(project_id)
+        log.warning("проект %s (%s) удалён из базы через дашборд; каталог %s "
+                    "оставлен на диске", project_id, title, folder or "—")
+        return {"ok": True, "message":
+                f"Заказ «{title}» удалён." + (f" Каталог остался на диске: {folder} "
+                                              f"— удали руками, если не нужен."
+                                              if folder else "")}
 
     @app.post("/api/project/{project_id}/unblock")
     async def unblock(project_id: int):

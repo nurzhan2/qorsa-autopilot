@@ -259,6 +259,7 @@ def listing(project: Project) -> dict:
         for i in (brief.get(field) or []):
             if not isinstance(i, dict):
                 continue
+            refs = i.get("evidence") or []
             out.append({
                 "text": item_text(i),
                 "curated": bool(i.get("curated")),
@@ -266,6 +267,14 @@ def listing(project: Project) -> dict:
                 "priority": i.get("priority") or "",
                 "origin": i.get("origin") or "",
                 "reason": i.get("reason") or "",
+                # Кто вывел пункт из объёма. Считаем ПО ССЫЛКАМ, а не по
+                # `origin`: на живом проекте 8 четыре пункта помечены
+                # origin="owner", хотя это отказы КЛИЕНТА, записанные руками
+                # (в тексте прямо стоит «клиент отложил: …»). Подпись
+                # «снял владелец» на них — неправда, и она уже один раз
+                # заставила решить, что требования потеряны по ошибке
+                "by_client": bool(refs),
+                "evidence": len(refs),
             })
         return out
 
