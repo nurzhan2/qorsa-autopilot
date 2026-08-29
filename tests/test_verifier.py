@@ -161,23 +161,40 @@ def login_gated_server():
         def log_message(self, *a):
             pass
 
+        # Два обязательных условия, и без них тест плавал: падал примерно
+        # раз из трёх с `ReadError('')`, и краснел при этом не тестовый
+        # сервер, а dom-проверка — то есть код, с которым всё в порядке.
+        #
+        # 1. ТЕЛО ЗАПРОСА НАДО ВЫЧИТАТЬ. Обработчик отвечал, не прочитав
+        #    присланный JSON, и на закрытии соединения непрочитанные байты
+        #    в приёмном буфере заставляли Windows слать RST вместо FIN.
+        #    Клиент видел обрыв. Замерено отдельно: 5 провалов из 60 без
+        #    чтения тела, 0 из 80 — с чтением.
+        # 2. Content-Length в ответе: иначе клиент читает тело до закрытия
+        #    соединения, а закрытие — ровно то место, где происходит сброс.
+        def _reply(self, body: bytes, **headers) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.send_response(200)
+            for name, value in headers.items():
+                self.send_header(name.replace("_", "-"), value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
             authed = "session=test-admin" in (self.headers.get("Cookie") or "")
             body = ('<html><body><div class="dashboard">панель администратора</div>'
                     '</body></html>' if authed else
                     '<html><body><form>логин</form></body></html>')
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(body.encode())
+            self._reply(body.encode(), Content_Type="text/html")
 
         def do_POST(self):
-            self.send_response(200)
-            self.send_header("Set-Cookie", "session=test-admin; Path=/")
-            self.end_headers()
-            self.wfile.write(b"{}")
+            self._reply(b"{}", Set_Cookie="session=test-admin; Path=/")
 
-    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    # ThreadingHTTPServer, а не HTTPServer: обычный обслуживает по одному
+    # запросу за раз, а Playwright открывает страницу не одним запросом
+    # и держит соединение
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -218,11 +235,15 @@ async def test_dom_check_login_without_cookie_fails_loudly(db, login_gated_serve
             pass
 
         def do_POST(self):
+            # тело вычитываем и здесь — см. соседний сервер: иначе закрытие
+            # соединения приходит клиенту сбросом, и тест плавает
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
             self.send_response(200)
+            self.send_header("Content-Length", "2")
             self.end_headers()
             self.wfile.write(b"{}")
 
-    server = http.server.HTTPServer(("127.0.0.1", 0), NoCookieHandler)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), NoCookieHandler)
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

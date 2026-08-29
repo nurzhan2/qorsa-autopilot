@@ -175,6 +175,13 @@
   .sample div { padding: 6px 0; border-bottom: 1px solid var(--obsidian); }
   .sample b { color: var(--ivory); font-weight: 480; }
 
+  .why {
+    margin-top: 20px; padding: 16px 20px; border-radius: var(--r-card);
+    background: var(--onyx);
+  }
+  .why .note { margin-top: 8px; }
+  .why .note:first-of-type { margin-top: 12px; }
+
   /* блок «ждём от клиента» внутри карточки заказа: своё окно на каждый ключ */
   .access {
     margin-top: 24px; padding: 24px; border-radius: var(--r-card);
@@ -217,6 +224,9 @@
 <main>
   <!-- ---------- работа ---------- -->
   <section id="view-work">
+    <h2>Что сейчас происходит</h2>
+    <div id="pulse"></div>
+
     <h2>Ждёт тебя</h2>
     <p class="lede">Пока это не разобрано, автопилот по этим задачам стоит.
       Сначала окружение: чинить код бессмысленно, пока инструмента нет на машине.</p>
@@ -398,6 +408,57 @@ function flash(id, text, call) {
 
 // ---------- работа ----------
 
+function pulseCard(s) {
+  const beat = s.beat || {};
+  const gb = s.global_blockers || [];
+  const lanes = beat.lanes || {};
+  const laneNames = {build: "сборка", verify: "приёмка", chat: "переписка"};
+
+  const head = beat.alive
+    ? `<span class="tag on">автопилот работает</span>
+       <span class="muted">пульс ${beat.age} с назад</span>`
+    : `<span class="tag call">автопилот не запущен</span>
+       <span class="muted">${esc(beat.why || "")}</span>`;
+
+  const laneTags = Object.entries(lanes).map(([k, v]) =>
+    `<span class="tag">${esc(laneNames[k] || k)} ${v.running}/${v.limit}</span>`).join("");
+
+  const nowRows = (s.running || []).map(t => `<tr>
+      <td>${esc(t.title)}</td>
+      <td class="muted">заказ ${t.project_id}</td>
+      <td>${esc(laneNames[t.lane] || t.lane)}</td>
+      <td>${t.minutes} мин</td></tr>`).join("");
+
+  const feedRows = (s.feed || []).map(t => `<tr>
+      <td>${esc(t.title)}</td>
+      <td class="muted">заказ ${t.project_id}</td>
+      <td>${esc(t.status_ru)}</td>
+      <td class="muted">${t.minutes < 60 ? t.minutes + " мин назад"
+                                         : esc(t.at)}</td></tr>`).join("");
+
+  return `<div class="card ${beat.alive ? "" : "calls"}">
+    <div class="tags">${head}${laneTags}</div>
+    ${gb.length ? `<div style="margin-top:16px">${gb.map(b =>
+      `<div class="note defect">${esc(b.what)}${b.fix
+        ? ` <span class="muted">→ ${esc(b.fix)}</span>` : ""}</div>`).join("")}</div>` : ""}
+
+    ${nowRows ? `<div class="scroll"><table>
+      <tr><th>сейчас выполняется</th><th></th><th>полоса</th><th>идёт</th></tr>
+      ${nowRows}</table></div>`
+      : `<div class="note">${beat.alive
+          ? "прямо сейчас ничего не выполняется"
+          : "выполняться нечему — процесс не запущен"}</div>`}
+
+    ${(s.open_runs || []).length ? `<div class="note">вызовов модели в полёте:
+      ${s.open_runs.map(r => `${esc(r.kind)} по задаче ${r.task_id} — ${r.minutes} мин`)
+        .join(" · ")}</div>` : ""}
+
+    ${feedRows ? `<div class="scroll"><table style="margin-top:24px">
+      <tr><th>последние движения</th><th></th><th>стало</th><th>когда</th></tr>
+      ${feedRows}</table></div>` : ""}
+  </div>`;
+}
+
 function attentionCard(t) {
   const why = t.env_hints && t.env_hints.length
     ? "ждёт окружение — чинить код бессмысленно, инструмента нет на машине"
@@ -496,6 +557,15 @@ function projectCard(p) {
       <span class="tag">$${p.cost.toFixed(2)}</span>
     </div>
     <div class="bar-progress"><i style="width:${p.percent}%"></i></div>
+    ${(p.running_now || []).length
+      ? `<div class="note">сейчас в работе: ${p.running_now.map(esc).join(", ")}</div>`
+      : ""}
+    ${(p.why_stuck || []).length ? `<div class="why">
+      <div class="muted">почему стоит — снимать надо всё, а не первое:</div>
+      ${p.why_stuck.map((b, i) => `<div class="note defect">
+        ${i + 1}. ${esc(b.what)}${b.fix
+          ? `<div class="muted" style="margin-left:18px">${esc(b.fix)}</div>` : ""}
+      </div>`).join("")}</div>` : ""}
     ${(p.questions || []).length
       ? `<div class="note">открытые вопросы: ${p.questions.map(esc).join(" · ")}</div>` : ""}
     ${p.last_action ? `<div class="note">${esc(p.last_action)}</div>` : ""}
@@ -507,6 +577,13 @@ function projectCard(p) {
         Собрать ТЗ</button>
       <button ${busy ? "disabled" : ""} onclick="act('/api/project/${p.id}/plan')">
         Составить план</button>
+      ${p.status === "blocked"
+        ? `<button onclick="act('/api/project/${p.id}/unblock')">Вернуть в работу</button>`
+        : ""}
+      ${p.ready_for_work
+        ? ""
+        : `<button onclick="post('/api/project/${p.id}/ready',{on:true}).then(load)">
+             Готов к работе</button>`}
       ${p.autonomous
         ? `<button onclick="setAutonomous(${p.id}, false)">Выключить самостоятельность</button>`
         : `<button class="primary" onclick="setAutonomous(${p.id}, true)">
@@ -552,6 +629,7 @@ async function setAutonomous(projectId, on) {
 }
 
 function renderWork(s) {
+  $("pulse").innerHTML = pulseCard(s);
   $("install").innerHTML = installCard(s.install_list || []);
   $("attention_env").innerHTML = s.attention.environment.map(attentionCard).join("");
   $("attention_review").innerHTML = s.attention.review.map(attentionCard).join("");

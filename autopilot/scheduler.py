@@ -16,6 +16,7 @@ from .db import (AccessItem, Project, Session, Task, cli_spent_today,
                  decayed_units, spent_today, utcnow)
 from . import autonomy
 from . import limits
+from . import progress
 from .llm import LimitReached
 from .manual import NEEDS_HUMAN, needs_human, unproven_note
 
@@ -151,6 +152,18 @@ class Scheduler:
             if lane == "build" and not self.build_allowed():
                 continue
             await self._dispatch(lane)
+
+        # Пульс — в самом конце тика, когда занятость полос уже настоящая.
+        # Без него дашборд не отличает работающий автопилот от незапущенного:
+        # заказы на месте, задачи «в очереди», кнопки нажимаются — и ничего
+        # не происходит, потому что процесса просто нет
+        progress.write_heartbeat({
+            "lanes": {lane: {"running": self.running[lane],
+                             "limit": cfg.lane_limits[lane]} for lane in LANES},
+            "paused": self.budget_paused,
+            "limited_sec": round(limits.state.seconds_left()),
+            "build_allowed": self.build_allowed(),
+        })
 
     async def drain(self, timeout: float = 30.0) -> None:
         """Дождаться завершения всех запущенных задач (тесты и мягкая остановка)."""

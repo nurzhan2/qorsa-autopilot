@@ -37,12 +37,12 @@ except (AttributeError, ValueError):
 from sqlalchemy import func, select                                    # noqa: E402
 
 from autopilot import accounts as accounts_cfg                        # noqa: E402
-from autopilot import (autonomy, intake, manual, projectdir, roles,   # noqa: E402
-                       toolchain)
+from autopilot import (autonomy, intake, limits, manual, progress,    # noqa: E402
+                       projectdir, roles, toolchain)
 from autopilot.config import cfg                                      # noqa: E402
 from autopilot.db import (Account, ChatMessage, Project, Run, Session,  # noqa: E402
-                          Task, AccessItem, consumed_today, init_db,
-                          sync_accounts, utcnow)
+                          Task, AccessItem, cli_spent_today, consumed_today,
+                          init_db, spent_today, sync_accounts, utcnow)
 from autopilot.vault import resolve_secret, vault                     # noqa: E402
 from autopilot.verifier import Verifier                               # noqa: E402
 
@@ -212,6 +212,12 @@ async def collect() -> dict:
             .order_by(Task.project_id, Task.order_idx, Task.id))).scalars().all()
         runs = (await s.execute(
             select(Run).order_by(Run.id.desc()).limit(25))).scalars().all()
+        # что шевелилось последним — лента «как идёт процесс».
+        # По updated_at, а не по id: id говорит, когда задачу ЗАВЕЛИ
+        recent = (await s.execute(
+            select(Task).where(Task.lane.in_(("build", "verify")),
+                               Task.orphaned.is_(False))
+            .order_by(Task.updated_at.desc()).limit(12))).scalars().all()
         # `stale` берём тоже: работу они не держат (см. Scheduler), но
         # показать их надо — пункт мог выпасть из ТЗ переформулировкой,
         # а доступ по нему всё равно нужен, и вставить его должно быть куда
@@ -271,6 +277,18 @@ async def collect() -> dict:
         done = [t for t in live if t.status == "done"]
         brief = (p.brief or {}).get("brief") if isinstance(p.brief, dict) else None
         folder = projectdir.find(p.id)
+        # Почему заказ стоит. Гейтов четыре, и закрытых обычно не один —
+        # сняв первый, человек справедливо ждал бы, что поедет
+        open_tasks = [t for t in live if t.status not in ("done", "escalated")]
+        agent_tasks = [t for t in open_tasks
+                       if t.executor == "claude_code" and t.verify_class != "human"]
+        waiting_now = [a for a in waiting_access.get(p.id, [])
+                       if not a["stale"] and not a["placeholder"]]
+        why_stuck = progress.blockers(
+            p, access_waiting=len(waiting_now),
+            blocking_questions=sum(1 for q in ((brief or {}).get("open_questions") or [])
+                                   if q.get("blocking")),
+            open_tasks=len(open_tasks), agent_tasks=len(agent_tasks))
         rows.append({
             "id": p.id,
             "company": (accounts.get(p.account_id).title
@@ -294,6 +312,8 @@ async def collect() -> dict:
             "messages": int(msg_counts.get(p.id, 0)),
             "folder": str(folder) if folder else "",
             "planned": bool(p.planned_at),
+            "why_stuck": why_stuck,
+            "running_now": [t.title for t in live if t.status == "running"],
             "last_action": p.last_action or "",
             "jobs": {kind: JOBS.get(_job_key(kind, p.id))
                      for kind in ("brief", "plan")
@@ -314,8 +334,45 @@ async def collect() -> dict:
     install_list = sorted(tools_needed.values(), key=lambda r: r["name"])
 
     both = await consumed_today()
+    beat = progress.read_heartbeat()
+    money, subscription = await spent_today(), await cli_spent_today()
+
+    # Задачи, которые ПРЯМО СЕЙЧАС в работе, и сколько уже идут.
+    # `updated_at` для running — это момент захвата задачи планировщиком
+    now = utcnow()
+    running = [{
+        "id": t.id, "title": t.title, "project_id": t.project_id, "lane": t.lane,
+        "minutes": round((now - t.updated_at).total_seconds() / 60, 1),
+    } for t in tasks if t.status == "running"]
+
+    # Незакрытые строки расхода — вызов модели, который идёт прямо сейчас
+    # (или процесс убили на середине, см. db.open_run)
+    open_runs = [{
+        "id": r.id, "task_id": r.task_id, "kind": r.kind,
+        "minutes": round((now - r.started_at).total_seconds() / 60, 1),
+    } for r in runs if r.finished_at is None]
+
     return {
         "projects": rows,
+        "beat": beat,
+        "running": running,
+        "open_runs": open_runs,
+        "feed": [{
+            "id": t.id, "title": t.title, "project_id": t.project_id,
+            "status": t.status, "status_ru": TASK_RU.get(t.status, t.status),
+            "lane": t.lane, "at": str(t.updated_at)[:19],
+            "minutes": round((now - t.updated_at).total_seconds() / 60, 1),
+        } for t in recent],
+        "global_blockers": progress.global_blockers(
+            paused=PAUSE_FILE.exists(), alive=bool(beat.get("alive")),
+            over_money=money >= cfg.daily_budget_usd,
+            over_cli=subscription >= cfg.daily_cli_budget_usd,
+            limited_until=limits.state.seconds_left(),
+            # Тихие часы считает планировщик, а не мы: второе мнение о том же
+            # самом однажды разойдётся с первым. Автопилот не запущен — про
+            # тихие часы говорить нечего, о нём и так сказано отдельно
+            build_allowed=bool(beat.get("build_allowed", True))
+            if beat.get("alive") else True),
         "attention": {"environment": attention_env, "review": attention_review},
         "install_list": install_list,
         "companies": [{"code": a.code, "title": a.title, "transport": a.transport}
@@ -475,6 +532,42 @@ def build_app():
                                              str(payload.get("value") or ""))}
         except ValueError as e:
             raise HTTPException(400, str(e)) from None
+
+    @app.post("/api/project/{project_id}/unblock")
+    async def unblock(project_id: int):
+        """Вернуть заказ из `blocked` в работу.
+
+        Возвращаем в `briefing`, а не сразу в `active`: остальные гейты
+        никуда не делись, и пусть их проверит обычный ход, а не эта кнопка.
+        Из `blocked` заказ выводит ЧЕЛОВЕК — так было и в CLI, кнопка лишь
+        избавляет от похода в консоль.
+        """
+        async with Session() as s:
+            p = await s.get(Project, project_id)
+            if p is None:
+                raise HTTPException(404, "проекта нет")
+            if p.status != "blocked":
+                return {"ok": False, "message": f"заказ не заблокирован "
+                                                f"(статус {p.status})"}
+            p.status = "briefing"
+            p.last_action = "возвращён в работу владельцем"
+            p.updated_at = utcnow()
+            await s.commit()
+        log.warning("проект %s: blocked -> briefing вручную из дашборда", project_id)
+        return {"ok": True, "message": "заказ возвращён в работу"}
+
+    @app.post("/api/project/{project_id}/ready")
+    async def set_ready(project_id: int, payload: dict = Body(None)):
+        """Галочка «готов к работе» — подтверждение владельца, гейт 1 из трёх."""
+        on = bool((payload or {}).get("on", True))
+        async with Session() as s:
+            p = await s.get(Project, project_id)
+            if p is None:
+                raise HTTPException(404, "проекта нет")
+            p.ready_for_work = on
+            p.updated_at = utcnow()
+            await s.commit()
+        return {"ok": True, "ready": on}
 
     @app.post("/api/project/{project_id}/autonomous")
     async def toggle_autonomous(project_id: int, payload: dict = Body(None)):
