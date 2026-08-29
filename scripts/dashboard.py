@@ -37,7 +37,8 @@ except (AttributeError, ValueError):
 from sqlalchemy import func, select                                    # noqa: E402
 
 from autopilot import accounts as accounts_cfg                        # noqa: E402
-from autopilot import intake, manual, projectdir, roles, toolchain    # noqa: E402
+from autopilot import (autonomy, intake, manual, projectdir, roles,   # noqa: E402
+                       toolchain)
 from autopilot.config import cfg                                      # noqa: E402
 from autopilot.db import (Account, ChatMessage, Project, Run, Session,  # noqa: E402
                           Task, AccessItem, consumed_today, init_db,
@@ -59,6 +60,12 @@ STATUS_RU = {
 TASK_RU = {
     "pending": "ждёт", "ready": "в очереди", "running": "выполняется",
     "done": "готово", "escalated": "эскалация", "needs_human": "нужен человек",
+    autonomy.AWAITING_KEYS: "ждёт ключа",
+}
+ACCESS_RU = {
+    "needed": "нужен", "requested": "запрошен", "received": "получен",
+    "verified": "есть", "failed": "не подошёл",
+    autonomy.PLACEHOLDER: "заглушка",
 }
 
 SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -205,8 +212,12 @@ async def collect() -> dict:
             .order_by(Task.project_id, Task.order_idx, Task.id))).scalars().all()
         runs = (await s.execute(
             select(Run).order_by(Run.id.desc()).limit(25))).scalars().all()
+        # `stale` берём тоже: работу они не держат (см. Scheduler), но
+        # показать их надо — пункт мог выпасть из ТЗ переформулировкой,
+        # а доступ по нему всё равно нужен, и вставить его должно быть куда
         access = (await s.execute(
-            select(AccessItem).where(AccessItem.status != "verified"))).scalars().all()
+            select(AccessItem).where(AccessItem.status != "verified")
+            .order_by(AccessItem.stale, AccessItem.id))).scalars().all()
         # одним запросом, а не по проекту: страница обновляется каждые
         # три секунды, и N+1 здесь превращается в постоянную нагрузку на базу,
         # в которую в это же время пишет планировщик
@@ -218,9 +229,19 @@ async def collect() -> dict:
     by_project: dict[int, list[Task]] = {}
     for t in tasks:
         by_project.setdefault(t.project_id, []).append(t)
-    waiting_access: dict[int, list[str]] = {}
+    # Чеглист доступов — структурой, а не строкой: у каждого пункта своё окно
+    # для значения на карточке заказа. Раньше это была строка «ждём от клиента»,
+    # по которой человек шёл в CLI и вставлял ключ руками
+    waiting_access: dict[int, list[dict]] = {}
     for a in access:
-        waiting_access.setdefault(a.project_id, []).append(f"{a.kind}: {a.name}")
+        waiting_access.setdefault(a.project_id, []).append({
+            "id": a.id, "name": a.name, "kind": a.kind, "status": a.status,
+            "status_ru": ACCESS_RU.get(a.status, a.status),
+            "secret": autonomy.suggest_secret_name(a.project_id, a),
+            "placeholder": a.status == autonomy.PLACEHOLDER,
+            "stale": bool(a.stale),
+            "note": a.note or "",
+        })
 
     def task_row(t: Task) -> dict:
         # «Ждёт окружение» ли задача — считаем только для того, что реально
@@ -259,7 +280,10 @@ async def collect() -> dict:
             "progress": f"{len(done)}/{len(live)}" if live else "—",
             "percent": round(len(done) / len(live) * 100) if live else 0,
             "cost": round(p.cost_usd or 0, 2),
-            "waiting": waiting_access.get(p.id, []),
+            "access": waiting_access.get(p.id, []),
+            "autonomous": bool(p.autonomous_mode),
+            "awaiting_keys": sum(1 for t in live
+                                 if t.status == autonomy.AWAITING_KEYS),
             "brief_ready": bool(p.brief_ready),
             "ready_for_work": bool(p.ready_for_work),
             "autonomy": round((p.autonomy_ratio or 0) * 100),
@@ -433,6 +457,35 @@ def build_app():
     @app.post("/api/project/{project_id}/plan")
     async def run_plan(project_id: int):
         return _start_job("plan", project_id, lambda: _collect_plan(project_id))
+
+    # ---------- доступы конкретного заказа ----------
+
+    @app.post("/api/project/{project_id}/access/{item_id}")
+    async def put_access_key(project_id: int, item_id: int,
+                             payload: dict = Body(...)):
+        """Владелец вставил настоящее значение доступа прямо на карточке.
+
+        Пункт становится `verified` — автопроверки доступа у нас по-прежнему
+        нет, `verified` ставит человек. Задачи, ждавшие ИМЕННО этот ключ,
+        возвращаются на приёмку.
+        """
+        try:
+            return {"ok": True,
+                    **await autonomy.put_key(project_id, item_id,
+                                             str(payload.get("value") or ""))}
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+
+    @app.post("/api/project/{project_id}/autonomous")
+    async def toggle_autonomous(project_id: int, payload: dict = Body(None)):
+        """Режим самостоятельности: работать с заглушками вместо ключей."""
+        on = bool((payload or {}).get("on", True))
+        try:
+            if on:
+                return {"ok": True, "on": True, **await autonomy.enable(project_id)}
+            return {"ok": True, "on": False, **await autonomy.disable(project_id)}
+        except ValueError as e:
+            raise HTTPException(404, str(e)) from None
 
     # ---------- секреты ----------
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from sqlalchemy import select
 
 from .config import cfg
+from . import autonomy
 from . import guard
 from . import llm
 from . import projectdir
@@ -50,6 +51,11 @@ SYSTEM_RULES = """Ты работаешь автономно, человека �
 
 def _raw_prompt(task: Task, project: Project) -> str:
     parts = [SYSTEM_RULES, f"# Проект\n{project.title} (клиент: {project.client})"]
+    if getattr(project, "autonomous_mode", False):
+        # Без этого блока агент получает заглушку, видит отказ внешнего
+        # сервиса и начинает её обходить: хардкодить «временный» ключ или
+        # отключать проверку подписи. Обход дороже недоделки
+        parts.append(autonomy.PROMPT_NOTE)
     if project.brief:
         parts.append("# ТЗ\n" + json.dumps(project.brief, ensure_ascii=False, indent=2))
     parts.append(f"# Задача\n{task.title}\n\n{task.prompt}")

@@ -136,6 +136,11 @@ class Project(Base):
     deadline: Mapped[dt.date | None] = mapped_column(default=None)
     price: Mapped[float | None] = mapped_column(default=None)
 
+    # Режим самостоятельности: работать с ЗАГЛУШКАМИ вместо ключей клиента.
+    # Снимает гейт доступов, но не приёмку — проверка, которой нужен настоящий
+    # ключ, не выполняется вовсе и ждёт его (см. autopilot/autonomy.py).
+    autonomous_mode: Mapped[bool] = mapped_column(default=False,
+                                                  server_default=text("0"))
     workspace: Mapped[str | None] = mapped_column(default=None)
     preview_url: Mapped[str | None] = mapped_column(default=None)
     brief: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)

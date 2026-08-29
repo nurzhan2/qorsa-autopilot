@@ -14,6 +14,7 @@ from sqlalchemy import select, update
 from .config import cfg
 from .db import (AccessItem, Project, Session, Task, cli_spent_today,
                  decayed_units, spent_today, utcnow)
+from . import autonomy
 from . import limits
 from .llm import LimitReached
 from .manual import NEEDS_HUMAN, needs_human, unproven_note
@@ -322,6 +323,11 @@ class Scheduler:
                     await self._set_status(task.id, "done")
                     await self.communicator.on_task_done(task, project)
                     await self._maybe_finish(project.id)
+                elif verdict.awaiting_keys:
+                    # Часть проверок не выполнялась: нужен настоящий ключ,
+                    # а стоит заглушка. Ни провал, ни приёмка — задача ждёт
+                    # значения от клиента, попытка не засчитывается
+                    await self._awaiting_keys(task, project, verdict)
                 elif verdict.unproven:
                     # Прошло, но доказательства нет: судила модель либо
                     # критерии оказались пустышками. Закрыть такую задачу —
@@ -376,6 +382,31 @@ class Scheduler:
             notify = getattr(self.communicator, "notify_owner", None)
             if notify is not None:
                 await notify(limits.state.message())
+
+    async def _awaiting_keys(self, task: Task, project: Project, verdict) -> None:
+        """Работа сделана, часть проверок не выполнялась: нет настоящего ключа.
+
+        Попытка НЕ засчитывается — по той же причине, что при упоре в квоту:
+        пересобирать нечего, агент ничего не чинил бы, а четыре таких прохода
+        увели бы выполненную задачу в эскалацию.
+
+        Имена недостающих ключей пишутся в `last_error`: по ним `autonomy`
+        вернёт задачу на приёмку, когда владелец вставит именно этот ключ,
+        а не какой-нибудь.
+        """
+        keys = ", ".join("{{SECRET:%s}}" % n for n in verdict.deferred_keys)
+        async with Session() as s:
+            t = await s.get(Task, task.id)
+            if t is None:
+                return
+            t.status = autonomy.AWAITING_KEYS
+            t.defects = list(verdict.deferred)
+            t.last_error = (f"ждёт настоящих ключей: {keys}" if keys else
+                            "ждёт настоящий ключ клиента")
+            t.updated_at = utcnow()
+            await s.commit()
+        log.warning("задача %s ждёт ключа: %s (%s проверок не выполнялось, "
+                    "попытка НЕ засчитана)", task.id, task.title, len(verdict.deferred))
 
     async def _needs_confirmation(self, task: Task, project: Project, verdict) -> None:
         """Задача сделана и проверки прошли — но ничего не доказали.
@@ -454,11 +485,28 @@ class Scheduler:
     # ---------- доступы ----------
 
     async def _projects_without_access(self) -> set[int]:
-        """Проекты, у которых хоть один пункт чеклиста не verified."""
+        """Проекты, у которых хоть один пункт чеклиста реально ждёт клиента.
+
+        Не блокируют два вида пунктов.
+
+        `placeholder` — владелец включил режим самостоятельности и осознанно
+        разрешил работать с заглушкой вместо ключа. Гейт при этом не отменён,
+        а перенесён: проверку, которой нужен настоящий ключ, приёмка
+        не выполняет и задачу не закрывает (см. autopilot/autonomy.py).
+
+        `stale` — требование ПРОПАЛО ИЗ ТЗ. Раньше такие пункты держали
+        полосу наравне с живыми, и на проекте 8 это остановило работу
+        целиком: шесть пунктов из восьми оказались переформулировками,
+        которые не склеились при пересборе брифа, а гейт продолжал их ждать.
+        Хуже того, `_sync_access` по ним ещё и напоминал клиенту — то есть
+        просил доступ к тому, чего в ТЗ уже нет. Доступ, который никому
+        не нужен, не может блокировать работу.
+        """
         async with Session() as s:
             rows = (await s.execute(
                 select(AccessItem.project_id)
-                .where(AccessItem.status != "verified")
+                .where(AccessItem.status.notin_(("verified", autonomy.PLACEHOLDER)),
+                       AccessItem.stale.is_(False))
                 .distinct())).scalars().all()
         return set(rows)
 
@@ -474,7 +522,11 @@ class Scheduler:
             if blocked:
                 items = (await s.execute(
                     select(AccessItem)
-                    .where(AccessItem.project_id.in_(blocked), AccessItem.status != "verified")
+                    .where(AccessItem.project_id.in_(blocked),
+                           AccessItem.status != "verified",
+                           # то же правило, что у гейта: не просим клиента
+                           # о доступе к тому, чего в ТЗ больше нет
+                           AccessItem.stale.is_(False))
                     .order_by(AccessItem.id))).scalars().all()
                 for it in items:
                     missing.setdefault(it.project_id, []).append(it)

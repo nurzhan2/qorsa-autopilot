@@ -18,6 +18,7 @@ from .checks import (DEFAULT_TIMEOUT_SEC, HUMAN_ONLY, REGISTRY, VIEWPORTS,
                      is_runnable, spec)
 from .checks import suspicious as suspicious_reason
 from .config import cfg
+from . import autonomy
 from . import llm
 from . import projectdir
 from .llm import LLMError
@@ -106,13 +107,33 @@ class Verdict:
     # Судья видит диф целиком и замечает настоящие вещи — отсутствие тестов,
     # необработанные ошибки. Приёмка это не решает, а следующая задача может
     observations: tuple[str, ...] = ()
+    # Проверки, которые НЕ ВЫПОЛНЯЛИСЬ: в режиме самостоятельности им нужен
+    # настоящий ключ клиента, а сейчас за ним стоит заглушка. Это не дефект
+    # работы и не пройденная проверка — это отсутствие проверки с известной
+    # временной причиной, ровно как упор в квоту в limits.py
+    deferred: tuple[str, ...] = ()
+    # каких именно ключей не хватило — по ним задача вернётся на приёмку
+    deferred_keys: tuple[str, ...] = ()
 
     @property
     def confirmed(self) -> bool:
         """Прошла так, что машине можно верить: есть хоть одна проверка,
         вердикт которой вынес код, а не модель, и которая при этом что-то
-        доказывает. Только это закрывает задачу автоматически."""
-        return self.ok and self.deterministic > 0
+        доказывает. Только это закрывает задачу автоматически.
+
+        Отложенная проверка закрывает эту дорогу целиком: задача, часть
+        которой не проверяли вовсе, принятой считаться не может.
+        """
+        return self.ok and self.deterministic > 0 and not self.deferred
+
+    @property
+    def awaiting_keys(self) -> bool:
+        """Работа сделана, но часть проверок не выполнялась: нет ключа.
+
+        Не провал (агент ничего не чинил бы) и не приёмка (никто ничего не
+        проверил). Задача ждёт настоящего ключа, попытка не засчитывается.
+        """
+        return self.ok and bool(self.deferred)
 
     @property
     def unproven(self) -> bool:
@@ -124,8 +145,11 @@ class Verdict:
           на невыполненной задаче, то есть не проверяют ничего.
 
         Не провал и не приёмка: задача уходит владельцу на подтверждение.
+
+        Отложенные проверки сюда не относятся: там ждут ЗНАЧЕНИЯ от клиента,
+        а не решения владельца, и подтверждать ему нечего.
         """
-        return self.ok and self.deterministic == 0
+        return self.ok and self.deterministic == 0 and not self.deferred
 
     def why_unproven(self) -> str:
         """Чем именно приёмка оказалась пустой — владельцу это решать."""
@@ -467,11 +491,19 @@ class Verifier:
         cwd = str(projectdir.workspace(project))
         defects: list[str] = []
         observations: list[str] = []
+        deferred: list[str] = []
+        deferred_keys: list[str] = []
         executed = 0
         # считаем раздельно: кто вынес вердикт — код или модель
         deterministic = 0
         assisted = 0
         suspicious = 0
+
+        # Режим самостоятельности: за какими секретами сейчас стоит заглушка.
+        # Считаем один раз на задачу, а не на критерий: чтение хранилища
+        # расшифровывает файл целиком
+        blocked_secrets = (autonomy.placeholder_names()
+                           if getattr(project, "autonomous_mode", False) else set())
 
         for check in task.acceptance or []:
             if not isinstance(check, dict):
@@ -495,6 +527,17 @@ class Verifier:
                                    f"проверка не запустится")
                 continue
 
+            # Критерию нужен настоящий ключ, а стоит заглушка — НЕ ВЫПОЛНЯЕМ.
+            # Не «выполняем и как-то трактуем»: живой запрос к платёжному шлюзу
+            # с фальшивым ключом ничего не проверяет, а его ответ пришлось бы
+            # разбирать гаданием. Отсутствие проверки честнее выдуманной
+            why = autonomy.deferred_reason(check, blocked_secrets)
+            if why:
+                deferred.append(f"{kind}: {why}")
+                deferred_keys.extend(
+                    n for n in autonomy.secrets_in_check(check) if n in blocked_secrets)
+                continue
+
             try:
                 # проверка вправе вернуть третьим элементом замечания вне
                 # критерия: на вердикт они не влияют, но показываются владельцу
@@ -502,6 +545,16 @@ class Verifier:
                 observations.extend(notes)
             except Exception as e:
                 ok, msg = False, f"{kind}: {e}"
+
+            # Второй признак, и он ловит неявный случай: критерий про ключ
+            # ничего не говорит (`pytest tests/test_payments.py`), а код внутри
+            # читает переменную окружения и валится, напечатав её значение.
+            # Считать это дефектом работы было бы неправдой
+            if not ok and autonomy.output_hit_placeholder(msg):
+                deferred.append(f"{kind}: упёрлось в заглушку вместо ключа — {msg}")
+                deferred_keys.extend(autonomy.placeholders_in_output(msg))
+                continue
+
             executed += 1
             # проверка исполнена — записываем, чьим вердиктом она закрыта.
             # Считаем даже упавшую: счётчик отвечает на вопрос «чем эту задачу
@@ -521,9 +574,11 @@ class Verifier:
             if not ok:
                 defects.append(msg)
 
-        if executed == 0:
+        if executed == 0 and not deferred:
             # Ни одной исполнимой проверки. Это не «нечего проверять»,
-            # это «проверить нечем» — и оно не может считаться приёмкой
+            # это «проверить нечем» — и оно не может считаться приёмкой.
+            # Отложенные сюда не идут: у них причина известна и временна,
+            # и владельцу нечего решать, пока клиент не прислал ключ
             defects.append("нет ни одной исполнимой проверки — принять задачу нечем")
 
         notes = tuple(dict.fromkeys(observations))
@@ -534,7 +589,9 @@ class Verifier:
             await self._save_observations(task, notes)
         return Verdict(ok=not defects, defects=defects,
                        deterministic=deterministic, assisted=assisted,
-                       suspicious=suspicious, observations=notes)
+                       suspicious=suspicious, observations=notes,
+                       deferred=tuple(dict.fromkeys(deferred)),
+                       deferred_keys=tuple(dict.fromkeys(deferred_keys)))
 
     async def _save_observations(self, task: Task, notes: tuple[str, ...]) -> None:
         """Замечания вне критерия — владельцу, а не в никуда.

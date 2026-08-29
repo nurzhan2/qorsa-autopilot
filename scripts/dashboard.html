@@ -175,6 +175,23 @@
   .sample div { padding: 6px 0; border-bottom: 1px solid var(--obsidian); }
   .sample b { color: var(--ivory); font-weight: 480; }
 
+  /* блок «ждём от клиента» внутри карточки заказа: своё окно на каждый ключ */
+  .access {
+    margin-top: 24px; padding: 24px; border-radius: var(--r-card);
+    background: var(--onyx);
+  }
+  .access .head { margin-bottom: 8px; }
+  .access .title { font-size: 18px; }
+  .key-row {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 14px 0; border-bottom: 1px solid var(--obsidian);
+  }
+  .key-row:last-of-type { border-bottom: 0; }
+  .key-what { flex: 1 1 260px; min-width: 0; font-size: 14px; }
+  .key-what code { color: var(--ash); }
+  .key-row input { flex: 1 1 220px; width: auto; background: var(--graphite); }
+  .key-row button { flex: 0 0 auto; }
+
   .flash {
     margin-top: 20px; padding: 16px 20px; border-radius: var(--r-card);
     background: var(--obsidian); font-size: 14px;
@@ -430,6 +447,33 @@ function jobLine(job) {
     ${esc(word)}${job.message ? " — " + esc(job.message) : ""}</div>`;
 }
 
+function accessBlock(p) {
+  if (!(p.access || []).length) return "";
+  const live = p.access.filter(a => !a.stale);
+  return `<div class="access">
+    <div class="head">
+      <span class="title">Ждём от клиента — ${live.length}</span>
+      <span class="muted">${p.autonomous
+        ? "режим самостоятельности: работа идёт на заглушках"
+        : (live.length ? "пока не заполнено, сборка по заказу стоит"
+                       : "работу ничего не держит")}</span>
+    </div>
+    ${p.access.map(a => `<div class="key-row">
+      <div class="key-what">
+        <div>${esc(a.name)}${a.stale
+          ? ' <span class="tag">выпал из ТЗ — работу не держит</span>' : ""}</div>
+        <div class="muted">${esc(a.kind)} · ${esc(a.status_ru)} ·
+          <code>${esc(a.secret)}</code></div>
+      </div>
+      <input type="password" autocomplete="off" placeholder="вставь значение"
+             id="key-${p.id}-${a.id}"
+             onkeydown="if(event.key==='Enter')putKey(${p.id},${a.id})">
+      <button class="ghost" onclick="putKey(${p.id},${a.id})">Сохранить</button>
+    </div>`).join("")}
+    <div class="flash" id="access-flash-${p.id}" hidden></div>
+  </div>`;
+}
+
 function projectCard(p) {
   const open = p.tasks.filter(t => t.status !== "done");
   const busy = Object.values(p.jobs || {}).some(j => j && j.state === "running");
@@ -447,21 +491,26 @@ function projectCard(p) {
       <span class="tag">пунктов ТЗ ${p.deliverables}</span>
       ${p.planned ? `<span class="tag">автономность ${p.autonomy}% задач /
         ${p.autonomy_time}% времени</span>` : `<span class="tag call">не спланирован</span>`}
+      ${p.autonomous ? '<span class="tag on">самостоятельность</span>' : ""}
+      ${p.awaiting_keys ? `<span class="tag call">ждут ключа ${p.awaiting_keys}</span>` : ""}
       <span class="tag">$${p.cost.toFixed(2)}</span>
     </div>
     <div class="bar-progress"><i style="width:${p.percent}%"></i></div>
-    ${p.waiting.length
-      ? `<div class="note">ждём от клиента: ${p.waiting.map(esc).join(", ")}</div>` : ""}
     ${(p.questions || []).length
       ? `<div class="note">открытые вопросы: ${p.questions.map(esc).join(" · ")}</div>` : ""}
     ${p.last_action ? `<div class="note">${esc(p.last_action)}</div>` : ""}
     ${p.folder ? `<div class="note">папка: ${esc(p.folder)}</div>` : ""}
     ${Object.values(p.jobs || {}).map(jobLine).join("")}
+    ${accessBlock(p)}
     <div class="actions">
       <button ${busy ? "disabled" : ""} onclick="act('/api/project/${p.id}/brief')">
         Собрать ТЗ</button>
       <button ${busy ? "disabled" : ""} onclick="act('/api/project/${p.id}/plan')">
         Составить план</button>
+      ${p.autonomous
+        ? `<button onclick="setAutonomous(${p.id}, false)">Выключить самостоятельность</button>`
+        : `<button class="primary" onclick="setAutonomous(${p.id}, true)">
+             Работать без ключей</button>`}
     </div>
     ${open.length ? `<div class="scroll"><table>
       <tr><th>задача</th><th>статус</th><th>класс</th><th>кто делает</th><th>попыток</th></tr>
@@ -475,6 +524,33 @@ function projectCard(p) {
   </div>`;
 }
 
+async function putKey(projectId, itemId) {
+  const box = $(`key-${projectId}-${itemId}`);
+  const value = box ? box.value : "";
+  if (!value.trim()) { flash(`access-flash-${projectId}`, "пустое поле", true); return; }
+  try {
+    const data = await post(`/api/project/${projectId}/access/${itemId}`, {value});
+    flash(`access-flash-${projectId}`,
+      `Записано в <b>${esc(data.secret)}</b>.` +
+      (data.resumed ? ` Задач вернулось на приёмку: ${data.resumed}.` : ""));
+    if (box) box.value = "";
+    setTimeout(load, 1200);      // дать прочитать сообщение до перерисовки
+  } catch (e) { flash(`access-flash-${projectId}`, esc(e.message), true); }
+}
+
+async function setAutonomous(projectId, on) {
+  if (on && !confirm(
+      "Режим самостоятельности: вместо ключей клиента подставятся заглушки, " +
+      "и сборка пойдёт, не дожидаясь их.\n\n" +
+      "Проверки, которым нужен настоящий ключ, выполняться НЕ будут — такие " +
+      "задачи не закроются, а встанут в «ждёт ключа» и переприёмятся, когда " +
+      "ты вставишь значение.\n\nВключить?")) return;
+  try {
+    await post(`/api/project/${projectId}/autonomous`, {on});
+  } catch (e) { alert(e.message); }
+  load();
+}
+
 function renderWork(s) {
   $("install").innerHTML = installCard(s.install_list || []);
   $("attention_env").innerHTML = s.attention.environment.map(attentionCard).join("");
@@ -484,7 +560,13 @@ function renderWork(s) {
     $("attention_review").innerHTML =
       '<div class="card"><div class="empty">ничего не ждёт — всё либо идёт, либо сделано</div></div>';
   }
-  $("projects").innerHTML = s.projects.length
+  // Страница перерисовывается раз в три секунды, а в карточках заказов теперь
+  // живут поля для ключей. Перерисовать их посреди набора значит стереть
+  // наполовину вставленный пароль — и человек не поймёт, куда он делся
+  const projects = $("projects");
+  if (projects.contains(document.activeElement) &&
+      document.activeElement !== document.body) return;
+  projects.innerHTML = s.projects.length
     ? s.projects.map(projectCard).join("")
     : '<div class="card"><div class="empty">заказов пока нет — заведи первый на вкладке «Новый заказ»</div></div>';
 }

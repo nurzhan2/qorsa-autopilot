@@ -335,6 +335,23 @@ async def m011_cost_estimated(conn) -> None:
         "UPDATE runs SET cost_estimated = 0 WHERE cost_estimated IS NULL"))
 
 
+async def m012_autonomous_mode(conn) -> None:
+    """Режим самостоятельности: работа идёт с заглушками вместо ключей.
+
+    Флаг на проекте, а не глобальный: у одного заказа ключи уже есть и ждать
+    нечего, у другого клиент неделю не отвечает, а половина плана к ключам
+    вообще не относится. Глобальная настройка заставила бы выбирать одно
+    поведение на все заказы сразу.
+
+    По умолчанию ВЫКЛЮЧЕН. Гейт доступов существует не зря, и снимать его
+    молча на всех проектах — не то, что должна делать миграция.
+    """
+    await ensure_tables(conn)
+    await _add_column(conn, "projects", "autonomous_mode", "BOOLEAN DEFAULT 0")
+    await conn.execute(text(
+        "UPDATE projects SET autonomous_mode = 0 WHERE autonomous_mode IS NULL"))
+
+
 MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline: схема фазы 1", m001_baseline),
     (2, "ingest: переписка, транспорты, привязка чатов", m002_ingest),
@@ -347,6 +364,7 @@ MIGRATIONS: list[tuple[int, str, object]] = [
     (9, "приёмка: замечания судьи вне критерия", m009_judge_observations),
     (10, "учёт: прогон знает своё начало и свой конец", m010_run_finished_at),
     (11, "учёт: стоимость измерена или оценена по времени", m011_cost_estimated),
+    (12, "режим самостоятельности: работа с заглушками вместо ключей", m012_autonomous_mode),
 ]
 
 
