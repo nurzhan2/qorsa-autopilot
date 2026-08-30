@@ -87,6 +87,25 @@ def build_prompt(task: Task, project: Project, brief: str | None = None) -> str:
     return to_env_names(_raw_prompt(task, project, brief))
 
 
+# Сессия CLI кончилась или её нет. Это состояние УСТАНОВКИ, а не задачи:
+# чинится входом в claude, а не правкой кода. Живой случай: сбор ТЗ из
+# дашборда встал на «OAuth session expired», и каждая следующая задача
+# сожгла бы по попытке на том же самом.
+AUTH_MARKERS = (
+    "oauth session expired",
+    "failed to authenticate",
+    "not logged in",
+    "please run /login",
+    "invalid api key",
+    "authentication_error",
+)
+
+
+def _looks_like_auth(text: str) -> bool:
+    body = str(text or "").lower()
+    return any(m in body for m in AUTH_MARKERS)
+
+
 def _why_failed(data: dict) -> str:
     """Почему сессия агента не удалась — словами, а не «None».
 
@@ -235,7 +254,32 @@ class Executor:
             await close_run(run_id, ok=False, backend=RUN_BACKEND,
                             cost_usd=cost, seconds=elapsed, estimated=not cost,
                             log_path=str(log_path))
-            raise RuntimeError(_why_failed(data)) from None
+
+            # УПОР В КВОТУ И ИСТЁКШАЯ СЕССИЯ — НЕ ПРОВАЛ РАБОТЫ.
+            #
+            # limits.py написан ровно про это, но правку до исполнителя
+            # не донесли: здесь любой `is_error` уходил обычным RuntimeError
+            # и в `_on_fail`, то есть тратил попытку. Четыре упора подряд —
+            # и выполненная задача в эскалации, при том что с работой всё
+            # в порядке. Ту же ошибку проект уже проходил в другом месте.
+            #
+            # Признак ищем ТОЛЬКО при отсутствии генерации: слова «rate
+            # limit» в отчёте самой модели однажды стоили 26 минут работы,
+            # выброшенной как «упор». Про исчерпание сообщает оболочка,
+            # а не содержимое ответа.
+            usage = data.get("usage") or {}
+            produced = bool(cost) or int(usage.get("output_tokens") or 0) > 0
+            reason = _why_failed(data)
+            if not produced and llm.looks_like_limit(reason):
+                raise llm.LimitReached(reason)
+            if not produced and _looks_like_auth(reason):
+                # То же самое, но чинится не ожиданием, а входом в CLI.
+                # Гасим всю работу: у остальных задач будет ровно тот же
+                # отказ, и каждая сожжёт по попытке впустую
+                raise llm.LimitReached(
+                    f"сессия Claude Code недействительна: {reason}. "
+                    f"Войди заново: claude, затем /login")
+            raise RuntimeError(reason) from None
 
         await close_run(run_id, ok=True, backend=RUN_BACKEND, cost_usd=cost,
                         seconds=elapsed, log_path=str(log_path))

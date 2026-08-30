@@ -904,11 +904,32 @@ class Verifier:
         return proc.returncode, out or b""
 
     async def _http(self, url: str, expect: int) -> tuple[bool, str]:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+        """Критерий `expect: 3xx` БЫЛ НЕДОСТИЖИМ ПО ПОСТРОЕНИЮ.
+
+        Клиент открывался с `follow_redirects=True` и сравнивал статус
+        КОНЕЧНОЙ страницы. Сервер, честно отдающий 302 на `/admin/`, доводил
+        клиента до страницы логина, та отвечала 200 — и приёмка писала
+        «-> 200, ожидалось 302». То есть критерий не мог пройти НИКОГДА,
+        как бы правильно агент ни работал.
+
+        Живой случай: задача 531 четыре раза подряд получила ровно этот
+        дефект. Воспроизведено на подставном сервере, который правда отдаёт
+        302: критерий провалился с тем же текстом. Четыре сессии агента,
+        эскалация и заблокированные соседние задачи — из-за одного флага.
+
+        Проверяется это ровно так же строго, просто теперь измеряется то,
+        что критерий и просил: сам ответ по адресу, а не то, куда он ведёт.
+        Для 2xx поведение прежнее — там редирект по дороге нормален.
+        """
+        follow = not (300 <= int(expect) < 400)
+        async with httpx.AsyncClient(timeout=20, follow_redirects=follow) as c:
             r = await c.get(url)
         if r.status_code == expect:
             return True, ""
-        return False, f"GET {url} -> {r.status_code}, ожидалось {expect}"
+        where = ""
+        if 300 <= r.status_code < 400 and r.headers.get("location"):
+            where = f" (ведёт на {r.headers['location']})"
+        return False, f"GET {url} -> {r.status_code}{where}, ожидалось {expect}"
 
     # --- уровень 3: судья ---
 
