@@ -1027,3 +1027,47 @@ async def test_failed_session_is_still_charged_and_explained(db, monkeypatch):
     assert row.ok is False
     assert row.cost_usd == 2.74, "сожжённая квота не записана"
     assert row.cost_estimated is False, "это замер CLI, а не наша оценка"
+
+
+# ---------- критерий, который нечем выполнить ----------
+
+def test_missing_command_is_a_broken_criterion_not_a_defect():
+    """Провал из-за отсутствующей команды — не дефект работы.
+
+    Живой случай, задача 536: планировщик написал `flutter build apk |
+    tail -1 | grep -i built`, а машина — Windows без юникс-утилит. Критерий
+    четырежды упал с `exit=255, "tail" не является внутренней или внешней
+    командой`, задача ушла в эскалацию и заблокировала соседние. Агент тут
+    ни при чём: ни одна правка кода не создаст отсутствующую команду.
+    """
+    from autopilot.checks import unrunnable_reason
+    from autopilot.manual import needs_human
+
+    real = ('`cd client_app && flutter build apk --debug 2>&1 | tail -1 | '
+            'grep -i \'built\'` exit=255\n'
+            '"tail" не является внутренней или внешней\r\n'
+            'командой, исполняемой программой или пакетным файлом.\r\n')
+    why = unrunnable_reason(real)
+    assert why, "не распознан негодный критерий"
+    assert needs_human([f"shell: {why}. Вывод: {real[:100]}"]), \
+        "такая задача должна уходить человеку сразу, а не после четырёх попыток"
+
+
+def test_ordinary_failure_still_goes_back_to_the_agent():
+    """Обычный провал критерия чинит агент, и трогать его правило не должно."""
+    from autopilot.checks import unrunnable_reason
+    from autopilot.manual import needs_human
+
+    ordinary = "GET http://localhost:8000/admin/ -> 200, ожидалось 302"
+    assert unrunnable_reason(ordinary) == ""
+    assert needs_human([ordinary]) is False
+
+
+def test_machine_block_checks_path_not_the_os_name():
+    """Утилиты проверяются реально: на Windows может стоять git-bash,
+    и тогда `grep` есть. Гадать по имени системы нельзя."""
+    from autopilot.planner import machine_block
+
+    text = machine_block()
+    assert "МАШИНА" in text and "Система:" in text
+    assert "Юникс-утилиты в PATH:" in text

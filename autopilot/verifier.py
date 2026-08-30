@@ -15,7 +15,7 @@ import httpx
 from sqlalchemy import select
 
 from .checks import (DEFAULT_TIMEOUT_SEC, HUMAN_ONLY, REGISTRY, VIEWPORTS,
-                     is_runnable, spec)
+                     is_runnable, spec, unrunnable_reason)
 from .checks import suspicious as suspicious_reason
 from .config import cfg
 from . import autonomy
@@ -550,6 +550,15 @@ class Verifier:
             # ничего не говорит (`pytest tests/test_payments.py`), а код внутри
             # читает переменную окружения и валится, напечатав её значение.
             # Считать это дефектом работы было бы неправдой
+            # Провал из-за того, что команды нет на машине, — не дефект работы.
+            # Агент может писать идеальный код: `tail` от этого не появится.
+            # Помечаем так, чтобы задача ушла человеку сразу, а не после
+            # четырёх одинаковых попыток (см. manual.needs_human)
+            if not ok:
+                why_unrunnable = unrunnable_reason(msg)
+                if why_unrunnable:
+                    msg = f"{kind}: {why_unrunnable}. Вывод: {msg[:200]}"
+
             if not ok and autonomy.output_hit_placeholder(msg):
                 deferred.append(f"{kind}: упёрлось в заглушку вместо ключа — {msg}")
                 deferred_keys.extend(autonomy.placeholders_in_output(msg))
