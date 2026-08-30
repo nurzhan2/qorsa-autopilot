@@ -395,8 +395,12 @@ def machine_block() -> str:
 
     system = platform.system()
     shell = "cmd.exe / PowerShell" if system == "Windows" else "sh/bash"
-    unix_tools = [t for t in ("tail", "grep", "head", "sed", "awk", "wc")
-                  if shutil.which(t)]
+    # Учитываем и то, что приёмка подставит сама (git-bash), — иначе запретили
+    # бы конвейеры, которые на самом деле выполнятся
+    from_git = toolchain.unix_tools_dir()
+    unix_tools = [t for t in toolchain.UNIX_TOOLS
+                  if shutil.which(t) or (from_git and
+                                         Path(from_git, f"{t}.exe").exists())]
     have = (", ".join(unix_tools) if unix_tools
             else "НИ ОДНОЙ — юниксовые конвейеры в критериях не писать")
     return (f"# МАШИНА (здесь будут выполняться критерии приёмки)\n"

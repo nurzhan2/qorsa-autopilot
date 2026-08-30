@@ -21,6 +21,7 @@ from .config import cfg
 from . import autonomy
 from . import llm
 from . import projectdir
+from . import toolchain
 from .llm import LLMError
 from .textenc import decode_console
 from .db import AccessItem, Project, Session, Task, close_run, open_run
@@ -334,11 +335,18 @@ def shell_env(cwd: str) -> dict | None:
     критериям, которые окружение не назвали.
     """
     venv = project_venv(cwd)
-    if venv is None:
+    unix = toolchain.unix_tools_dir()
+    if venv is None and unix is None:
         return None
     env = dict(os.environ)
-    env["PATH"] = str(venv) + os.pathsep + env.get("PATH", "")
-    env["VIRTUAL_ENV"] = str(venv.parent)
+    if venv is not None:
+        env["PATH"] = str(venv) + os.pathsep + env.get("PATH", "")
+        env["VIRTUAL_ENV"] = str(venv.parent)
+    if unix is not None:
+        # Юникс-утилиты — В КОНЕЦ PATH, а не в начало. Впереди они подменяли бы
+        # системные одноимённые программы (`sort` в Windows свой), и критерий
+        # начал бы вести себя иначе, чем ожидал тот, кто его писал
+        env["PATH"] = env.get("PATH", "") + os.pathsep + unix
     # PYTHONHOME от родителя увёл бы дочерний python в чужой интерпретатор
     env.pop("PYTHONHOME", None)
     return env

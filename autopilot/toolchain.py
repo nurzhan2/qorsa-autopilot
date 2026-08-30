@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import shutil
+from pathlib import Path
 
 # Команда -> что это и как поставить. Ключ ищется как первое слово команды
 # либо как отдельное слово внутри неё.
@@ -150,6 +151,43 @@ def _server_reachable(host: str, port: int, timeout: float = 0.5) -> bool:
             return True
     except OSError:
         return False
+
+
+# Юникс-утилиты, которые планировщик норовит поставить в конвейер: `... |
+# tail -1 | grep -i built`. На Windows их нет в PATH у процесса, запущенного
+# из PowerShell, — и критерий падает с «не является внутренней или внешней
+# командой». Но САМИ УТИЛИТЫ на машине есть: они идут с git-bash.
+UNIX_TOOLS = ("tail", "grep", "head", "sed", "awk", "wc", "cut", "sort")
+
+# Куда git их кладёт. Проверяется существованием, а не угадывается по версии.
+_GIT_UNIX_SUBDIRS = ("usr/bin", "bin")
+
+
+def unix_tools_dir() -> str | None:
+    """Каталог с юникс-утилитами, если они на машине есть, но не в PATH.
+
+    Это ПОЧИНКА ОКРУЖЕНИЯ, а не критерия, и разница принципиальная. Задача 536
+    четырежды провалилась на `| tail -1 | grep -i built`, и заманчиво было бы
+    переписать критерий. Но критерий — это и есть приёмка: переписать его
+    ради прохождения значит подделать результат. А `tail` при этом лежит
+    в `C:\\Program Files\\Git\\usr\\bin` — просто процесс о нём не знает.
+
+    Чиним то, что действительно сломано: PATH. Критерий выполняется ровно
+    так, как написан, и ничего не ослаблено.
+    """
+    if all(shutil.which(t) for t in UNIX_TOOLS):
+        return None                     # уже доступны — вмешиваться незачем
+    git = shutil.which("git")
+    if not git:
+        return None
+    root = Path(git).resolve().parent.parent
+    for sub in _GIT_UNIX_SUBDIRS:
+        candidate = root / sub
+        # Проверяем не каталог, а сами программы: `bin` у git есть всегда,
+        # а `tail` в нём лежит не всегда
+        if all((candidate / f"{t}.exe").exists() for t in ("tail", "grep")):
+            return str(candidate)
+    return None
 
 
 def installed(tool: str) -> bool:

@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
@@ -219,3 +220,61 @@ def test_planner_prompt_requires_explicit_interpreter():
 
     assert ".venv/Scripts/python -m pytest" in SYSTEM
     assert "САМОДОСТАТОЧНЫМ" in SYSTEM
+
+
+# ---------- юникс-утилиты: чиним ОКРУЖЕНИЕ, а не критерий ----------
+
+def test_unix_tools_dir_found_when_git_is_installed():
+    """`tail` и `grep` на Windows есть — они идут с git-bash, просто не в PATH.
+
+    Разница принципиальная: задача 536 четырежды упала на `| tail -1 | grep`,
+    и заманчиво было бы переписать критерий. Но критерий — это и есть приёмка,
+    переписать его ради прохождения значит подделать результат. Сломан был
+    PATH, его и чиним; критерий выполняется ровно так, как написан.
+    """
+    import shutil
+    from autopilot import toolchain
+
+    found = toolchain.unix_tools_dir()
+    if all(shutil.which(t) for t in toolchain.UNIX_TOOLS):
+        assert found is None, "утилиты и так в PATH — вмешиваться незачем"
+        return
+    if shutil.which("git") is None:
+        pytest.skip("git не установлен — брать утилиты неоткуда")
+    assert found, "git есть, а каталог с утилитами не найден"
+    from pathlib import Path
+    assert (Path(found) / "tail.exe").exists() or (Path(found) / "tail").exists()
+
+
+def test_unix_pipeline_runs_in_the_verifier_environment(tmp_path):
+    """Критерий с конвейером обязан выполняться в том окружении, где его
+    запускает приёмка. Иначе он падает не по вине агента."""
+    import shutil
+    import subprocess
+    from autopilot import toolchain
+    from autopilot.verifier import shell_env
+
+    if toolchain.unix_tools_dir() is None and not shutil.which("tail"):
+        pytest.skip("юникс-утилит на машине нет вовсе")
+
+    env = shell_env(str(tmp_path))
+    result = subprocess.run("echo hi | tail -1 | grep hi", shell=True,
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == 0, (
+        f"конвейер не выполнился в окружении приёмки: "
+        f"{(result.stdout or result.stderr)[:120]}")
+
+
+def test_unix_tools_go_to_the_end_of_path(tmp_path):
+    """В начало PATH их ставить нельзя: они подменили бы одноимённые
+    системные программы (`sort` в Windows свой), и критерий начал бы вести
+    себя иначе, чем ожидал тот, кто его писал."""
+    from autopilot import toolchain
+    from autopilot.verifier import shell_env
+
+    unix = toolchain.unix_tools_dir()
+    if unix is None:
+        pytest.skip("подставлять нечего")
+    env = shell_env(str(tmp_path))
+    parts = env["PATH"].split(os.pathsep)
+    assert parts[-1] == unix, "юникс-утилиты должны быть последними в PATH"
