@@ -115,10 +115,47 @@ async def test_no_double_build(db, monkeypatch):
         # и ловится вторая параллельная сборка одного проекта
         await asyncio.sleep(0.05)
         assert sched.running["build"] <= 1
-        assert set(sched.busy_projects) <= {p.id}
+        assert set(sched.busy_projects["build"]) <= {p.id}
     await sched.drain()
 
     assert peak["value"] == 1, f"проект держал {peak['value']} build-слотов разом"
+
+
+async def test_build_does_not_lock_the_verify_lane_of_the_same_order(db):
+    """Идущая сборка не должна запирать приёмку того же заказа.
+
+    Живой случай: на проекте 8 задача 536 ждала приёмки, три задачи ждали
+    её, а полоса приёмки стояла пустой — потому что счётчик занятости был
+    один на обе полосы, и сборка совсем другой задачи держала обе.
+    """
+    p = await make_project()
+    (building,) = await make_tasks(p.id, 1, lane="build")
+    (verifying,) = await make_tasks(p.id, 1, lane="verify", start_idx=1)
+
+    seen: set[str] = set()
+
+    class SlowBuild:
+        async def run(self, task, project):
+            seen.add("build")
+            await asyncio.sleep(0.2)
+            return {}
+
+    class Judge:
+        async def run(self, task, project):
+            seen.add("verify")
+            # тоже медленная: мгновенная приёмка успевает закончиться раньше,
+            # чем тест посмотрит на счётчики, и «заперта» не отличить от «уже прошла»
+            await asyncio.sleep(0.2)
+            from autopilot.verifier import Verdict
+            return Verdict(ok=True, defects=[], deterministic=1)
+
+    sched = make_sched(executor=SlowBuild(), verifier=Judge())
+    await sched.tick()
+    await asyncio.sleep(0.05)
+    assert sched.running["build"] == 1
+    assert sched.running["verify"] == 1, "приёмка заперта идущей сборкой"
+    await sched.drain()
+    assert seen == {"build", "verify"}
 
 
 async def test_escalated_task_does_not_freeze_the_whole_order(db, monkeypatch):

@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
-import re
 from collections import Counter
 
 from sqlalchemy import select, update
@@ -19,7 +18,9 @@ from .db import (AccessItem, Project, Session, Task, cli_spent_today,
 from . import autonomy
 from . import crew
 from . import limits
+from . import paths
 from . import progress
+from . import regression
 from .llm import LimitReached
 from .manual import NEEDS_HUMAN, needs_human, unproven_note
 
@@ -69,10 +70,16 @@ class Scheduler:
         self.communicator = communicator
         # занятые слоты по полосам — считаем сами, без чтения приватных полей Semaphore
         self.running: dict[str, int] = {ln: 0 for ln in cfg.lane_limits}
-        # Сколько эксклюзивных задач держит каждый проект. Раньше было
-        # множество «занят / не занят», то есть жёстко одна задача на проект.
-        # Счётчик нужен, чтобы разрешить несколько (LANE_BUILD_PER_PROJECT)
-        self.busy_projects: Counter[int] = Counter()
+        # Сколько эксклюзивных задач держит каждый проект — ПО ПОЛОСАМ.
+        #
+        # Сперва тут было множество «занят / не занят», потом один счётчик
+        # на проект. И то и другое считало сборку и приёмку вместе, а значит
+        # идущая сборка запирала приёмку того же заказа. На проекте 8 это
+        # встало поперёк работы: задача 536 ждала приёмки, три задачи ждали
+        # её, а полоса приёмки стояла пустой (0/2), пока в сборке крутилась
+        # совсем другая задача. Полосы независимы — и счётчики тоже.
+        self.busy_projects: dict[str, Counter] = {
+            lane: Counter() for lane in cfg.lane_limits}
         # Пути, которые СЕЙЧАС правит каждая работающая задача. Два агента
         # в одном каталоге затрут работу друг друга молча, и заметить это
         # можно будет только по пропавшему коду
@@ -242,7 +249,7 @@ class Scheduler:
             self.running[lane] += 1
             self.inflight.add(task.id)
             if exclusive:
-                self.busy_projects[project.id] += 1
+                self.busy_projects[lane][project.id] += 1
                 self.busy_paths[task.id] = self._paths_of(task)
             # списываем сразу — следующий _pick в этом же тике увидит новый score
             await self._charge_dispatch(project.id)
@@ -312,36 +319,18 @@ class Scheduler:
         и распараллеливать её незачем — она короткая.
         """
         limit = cfg.lane_build_per_project if lane == "build" else 1
-        return self.busy_projects[project_id] < max(1, limit)
+        return self.busy_projects[lane][project_id] < max(1, limit)
 
     @staticmethod
     def _paths_of(task: Task) -> set[str]:
-        """Файлы и каталоги, которые задача, судя по её критериям, трогает.
+        """Файлы и каталоги задачи — общий код с регрессионной проверкой.
 
-        Берём из acceptance, а не из текста задачи: там пути названы точно
-        (`backend/app/routers/chat.py`, `client_app/lib/...`), а в описании
-        их пришлось бы угадывать. Это не полный список того, что агент правда
-        тронет, — только то, что мы знаем наверняка.
+        Один и тот же ответ нужен в двух местах: здесь — чтобы не пустить
+        параллельно две задачи по одному каталогу, в `regression` — чтобы
+        понять, чью работу эта задача могла сломать. Дублировать разбор
+        путей значило бы однажды их разойтись.
         """
-        out: set[str] = set()
-        for check in (task.acceptance or []):
-            if not isinstance(check, dict):
-                continue
-            for key in ("path", "cmd"):
-                blob = str(check.get(key) or "")
-                for token in re.split(r"[\s&|;'\"`]+", blob):
-                    token = token.strip().lstrip("./")
-                    if "/" not in token:
-                        continue
-                    # до первого разделителя: каталог верхнего уровня и есть
-                    # та единица, за которую дерутся агенты
-                    head = token.split("::")[0]
-                    parts = [p for p in head.split("/") if p and p not in ("..",)]
-                    if len(parts) >= 2:
-                        out.add("/".join(parts[:2]))
-                    elif parts:
-                        out.add(parts[0])
-        return out
+        return paths.of(task)
 
     def _paths_clash(self, task: Task) -> bool:
         """Пересекается ли задача по файлам с той, что уже идёт.
@@ -411,9 +400,20 @@ class Scheduler:
         started = utcnow()
         try:
             if lane == "build":
+                # База сравнения — ДО работы. Без неё первый же неподнятый
+                # сервер объявил бы виновной любую задачу: все http-критерии
+                # проекта красные, а сделала их такими не она
+                before = await regression.snapshot(self.verifier, task, project)
                 await self.executor.run(task, project)
-                # собранное уходит на приёмку той же задачей, но в другой полосе
-                await self._set_status(task.id, "ready", lane="verify")
+                broke = await regression.broken(self.verifier, task, project, before)
+                if broke:
+                    # Сломала уже принятое — это дефект её работы, а не чужой.
+                    # На приёмку не пускаем: там проверяют только её критерии,
+                    # и поломка соседней задачи прошла бы незамеченной
+                    await self._on_fail(lane, task, project, broke)
+                else:
+                    # собранное уходит на приёмку той же задачей, но в другой полосе
+                    await self._set_status(task.id, "ready", lane="verify")
             elif lane == "verify":
                 verdict = await self.verifier.run(task, project)
                 if verdict.confirmed:
@@ -456,9 +456,9 @@ class Scheduler:
                 log.exception("не смог списать время project %s", project.id)
             self.inflight.discard(task.id)
             if exclusive:
-                self.busy_projects[project.id] -= 1
-                if self.busy_projects[project.id] <= 0:
-                    del self.busy_projects[project.id]
+                self.busy_projects[lane][project.id] -= 1
+                if self.busy_projects[lane][project.id] <= 0:
+                    del self.busy_projects[lane][project.id]
                 self.busy_paths.pop(task.id, None)
             self.running[lane] -= 1
 
