@@ -1071,3 +1071,48 @@ def test_machine_block_checks_path_not_the_os_name():
     text = machine_block()
     assert "МАШИНА" in text and "Система:" in text
     assert "Юникс-утилиты в PATH:" in text
+
+
+# ---------- критерий, который cmd.exe не может разобрать ----------
+
+def test_wsl_stub_is_not_mistaken_for_bash():
+    r"""`C:\Windows\System32\bash.exe` — пусковик WSL, а не bash.
+
+    Он есть на Windows всегда, даже без установленного WSL, и тогда отвечает
+    `execvpe(/bin/bash) failed`. Поймано живой проверкой: which("bash")
+    находил именно его и уводил повтор в заведомо мёртвый путь.
+    """
+    from autopilot.verifier import _bash_path
+
+    found = _bash_path()
+    if found is not None:
+        assert "system32" not in found.lower(), "взят пусковик WSL вместо bash"
+
+
+async def test_posix_criterion_is_retried_in_bash(db, tmp_path):
+    r"""Критерий, который оболочка не смогла разобрать, НЕ ПРОВЕРЕН вовсе.
+
+    Живой случай, задача 536: `grep -i 'built\|success'` — cmd.exe видит
+    `|` внутри одинарных кавычек как пайп, пытается запустить `success''`
+    и отвечает «не является внутренней или внешней командой». Это не провал
+    работы и не провал критерия: вердикта просто не было. Повтор в bash даёт
+    настоящий вердикт, а не ищет зелёный результат.
+    """
+    from autopilot.verifier import Verifier, _bash_path
+
+    if _bash_path() is None:
+        pytest.skip("bash на машине нет — повторять не в чем")
+
+    ok, msg = await Verifier()._shell(
+        r"echo built ok | tail -1 | grep -i 'built\|success'", str(tmp_path))
+    assert ok is True, f"критерий так и не выполнился: {msg[:200]}"
+
+
+async def test_genuinely_failing_criterion_still_fails_in_bash(db, tmp_path):
+    """Повтор в bash — не способ получить зелёный результат. Настоящий
+    провал остаётся провалом."""
+    from autopilot.verifier import Verifier
+
+    ok, msg = await Verifier()._shell(
+        "echo nothing | grep -i 'definitely-not-here'", str(tmp_path))
+    assert ok is False

@@ -321,6 +321,39 @@ def project_venv(cwd: str) -> Path | None:
     return None
 
 
+def _bash_path() -> str | None:
+    """bash на этой машине, если он есть и если он настоящий.
+
+    На Windows его приносит git. Нужен он ровно для одного: повторить
+    критерий, который cmd.exe не смог разобрать (POSIX-кавычки, конвейеры
+    внутри них). Под cmd такой критерий не проверен вовсе, а не провален.
+
+    **`C:\\Windows\\System32\\bash.exe` — НЕ bash.** Это пусковик WSL, и он
+    есть на Windows всегда, даже когда WSL не установлен: тогда он отвечает
+    `execvpe(/bin/bash) failed: No such file or directory`. Поймано живой
+    проверкой — `shutil.which("bash")` находил именно его и уводил повтор
+    в заведомо мёртвый путь. Поэтому git-bash ищем первым, а System32
+    не берём вовсе.
+    """
+    import shutil
+
+    unix = toolchain.unix_tools_dir()
+    for candidate in ([Path(unix) / "bash.exe"] if unix else []):
+        if candidate.exists():
+            return str(candidate)
+
+    git = shutil.which("git")
+    if git:
+        candidate = Path(git).resolve().parent.parent / "bin" / "bash.exe"
+        if candidate.exists():
+            return str(candidate)
+
+    found = shutil.which("bash")
+    if found and "system32" not in found.lower():
+        return found
+    return None
+
+
 def shell_env(cwd: str) -> dict | None:
     """Окружение для shell-критерия, с `.venv` проекта в PATH.
 
@@ -810,24 +843,65 @@ class Verifier:
             secrets = await project_secret_env(project.id)
             if secrets:
                 env = {**(env or dict(os.environ)), **secrets}
-        proc = await asyncio.create_subprocess_shell(
-            cmd, cwd=cwd, env=env,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=SHELL_TIMEOUT_SEC)
-        except asyncio.TimeoutError:
-            proc.kill()                      # иначе процесс переживёт автопилот
-            await proc.wait()
-            return False, f"`{cmd}` не уложился в {SHELL_TIMEOUT_SEC}s"
-        if proc.returncode == 0:
+
+        code, out = await self._run_shell(cmd, cwd, env)
+        if code == 0:
             return True, ""
+
+        # КРИТЕРИЙ, КОТОРЫЙ ОБОЛОЧКА НЕ СМОГЛА РАЗОБРАТЬ, НЕ ПРОВЕРЕН ВООБЩЕ.
+        #
+        # Планировщик пишет команды в POSIX-стиле, а на Windows их исполняет
+        # cmd.exe, для которого одинарные кавычки не кавычки. Живой случай,
+        # задача 536: `grep -i 'built\\|success'` — cmd видит `|` ВНУТРИ
+        # кавычек как пайп, пытается запустить `success''` как программу
+        # и отвечает «не является внутренней или внешней командой». Это не
+        # провал работы агента и даже не провал критерия: команда просто
+        # не была разобрана.
+        #
+        # Поэтому один повтор в bash, если он на машине есть (идёт с git).
+        # Это не «поиск зелёного результата»: под cmd вердикта не было
+        # вовсе, а под bash критерий выполняется ровно так, как написан.
+        # Провалится и там — значит провал настоящий.
+        text = decode_console(out)
+        bash = _bash_path()
+        if bash and unrunnable_reason(text):
+            log.info("критерий не разобрался в cmd — повторяю в bash: %s", cmd[:80])
+            code, out = await self._run_shell(cmd, cwd, env, shell=bash)
+            if code == 0:
+                return True, ""
+            text = decode_console(out)
+            return False, (f"`{cmd}` exit={code} (bash)\n{text[-1200:]}")
+
+        if code is None:
+            return False, f"`{cmd}` не уложился в {SHELL_TIMEOUT_SEC}s"
         # decode_console, а не голый UTF-8: на этой консоли cp866, и слепой
         # decode(errors="replace") превращал системные сообщения Windows
         # («Система не может найти путь») и вывод flutter.bat в «������».
         # Живой случай — дефект задачи 536, восстановить его после записи
         # в базу было уже нельзя: байты потеряны на этапе decode()
-        tail = decode_console(out)[-1200:]
-        return False, f"`{cmd}` exit={proc.returncode}\n{tail}"
+        return False, f"`{cmd}` exit={code}\n{text[-1200:]}"
+
+    async def _run_shell(self, cmd: str, cwd: str, env,
+                         shell: str | None = None) -> tuple[int | None, bytes]:
+        """Один запуск команды. Код возврата None — не уложились в таймаут."""
+        if shell:
+            proc = await asyncio.create_subprocess_exec(
+                shell, "-lc", cmd, cwd=cwd, env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT)
+        else:
+            proc = await asyncio.create_subprocess_shell(
+                cmd, cwd=cwd, env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(),
+                                            timeout=SHELL_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            proc.kill()                      # иначе процесс переживёт автопилот
+            await proc.wait()
+            return None, b""
+        return proc.returncode, out or b""
 
     async def _http(self, url: str, expect: int) -> tuple[bool, str]:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
