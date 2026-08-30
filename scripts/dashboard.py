@@ -37,7 +37,7 @@ except (AttributeError, ValueError):
 from sqlalchemy import func, select                                    # noqa: E402
 
 from autopilot import accounts as accounts_cfg                        # noqa: E402
-from autopilot import (autonomy, curate, intake, limits, manual,      # noqa: E402
+from autopilot import (autonomy, crew, curate, intake, limits, manual,  # noqa: E402
                        progress, projectdir, roles, toolchain)
 from autopilot.config import cfg                                      # noqa: E402
 from autopilot.db import (Account, AccessItem, ChatMessage, Message,  # noqa: E402
@@ -299,6 +299,11 @@ async def collect() -> dict:
             "waits_confirmation": manual.waits_for_confirmation(t),
             "project_id": t.project_id,
             "env_hints": env_hints,
+            # Разбор застрявшей задачи: почему цикл не сходится. Без него
+            # человек видит только «попыток 4» и тот же дефект четырежды
+            "diagnosis": (crew.diagnosis_note(t.diagnosis)
+                          if isinstance(t.diagnosis, dict) and t.diagnosis.get("verdict")
+                          else ""),
         }
 
     rows = []

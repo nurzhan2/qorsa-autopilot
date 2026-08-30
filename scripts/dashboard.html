@@ -561,6 +561,7 @@ function attentionCard(t) {
       <span class="tag">попыток ${t.attempts}</span>
     </div>
     <div class="note">${esc(why)}</div>
+    ${t.diagnosis ? `<div class="job"><b>${esc(t.diagnosis)}</b></div>` : ""}
     ${(t.env_hints || []).map(h =>
         `<div class="note env">нужен ${esc(h.name)} — ${esc(h.how)}</div>`).join("")}
     ${(t.defects || []).map(d => `<div class="note defect">${esc(d)}</div>`).join("")}

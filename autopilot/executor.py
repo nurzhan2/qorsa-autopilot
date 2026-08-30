@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from .config import cfg
 from . import autonomy
+from . import crew
 from . import guard
 from . import llm
 from . import projectdir
@@ -49,7 +50,7 @@ SYSTEM_RULES = """Ты работаешь автономно, человека �
 """
 
 
-def _raw_prompt(task: Task, project: Project) -> str:
+def _raw_prompt(task: Task, project: Project, brief: str | None = None) -> str:
     parts = [SYSTEM_RULES, f"# Проект\n{project.title} (клиент: {project.client})"]
     if getattr(project, "autonomous_mode", False):
         # Без этого блока агент получает заглушку, видит отказ внешнего
@@ -64,17 +65,26 @@ def _raw_prompt(task: Task, project: Project) -> str:
                      json.dumps(task.acceptance, ensure_ascii=False, indent=2))
     if task.defects:
         parts.append("# Дефекты предыдущей итерации — ИСПРАВЬ ИХ\n- " + "\n- ".join(task.defects))
+    # Выводы разбора застрявшей задачи. Задача 531 четыре раза подряд упала
+    # с одним и тем же дефектом, получая каждый раз один и тот же промпт:
+    # список дефектов без объяснения, почему предыдущая починка не сработала,
+    # цикл со стены не сдвигает
+    block = crew.instruction_block(task.diagnosis or None)
+    if block:
+        parts.append(block)
+    if brief:
+        parts.append("# Что от тебя хотят и чем это проверят\n" + brief)
     return "\n\n".join(parts)
 
 
-def build_prompt(task: Task, project: Project) -> str:
+def build_prompt(task: Task, project: Project, brief: str | None = None) -> str:
     """Промпт, который реально уходит агенту.
 
     Значений секретов здесь нет и быть не может: ссылки {{SECRET:NAME}}
     превращаются в имена переменных окружения $NAME, а сами значения
     попадают в процесс через env= у subprocess.
     """
-    return to_env_names(_raw_prompt(task, project))
+    return to_env_names(_raw_prompt(task, project, brief))
 
 
 def _why_failed(data: dict) -> str:
@@ -102,7 +112,11 @@ class Executor:
         # projectdir.workspace() это учитывает.
         # Без каталога create_subprocess_exec падает с невнятным WinError 267
         workspace = projectdir.workspace(project)
-        raw = _raw_prompt(task, project)
+        # Задание словами: критерии приёмки агент читает как JSON и регулярно
+        # не понимает, какого поведения от него хотят. Не собралось — работаем
+        # как раньше, без него: это подсказка, а не условие работы
+        brief = await crew.Prompter().brief_for(task, project)
+        raw = _raw_prompt(task, project, brief)
         prompt = to_env_names(raw)
         env = await self._secret_env(raw, project)
 

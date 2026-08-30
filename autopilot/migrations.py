@@ -352,6 +352,20 @@ async def m012_autonomous_mode(conn) -> None:
         "UPDATE projects SET autonomous_mode = 0 WHERE autonomous_mode IS NULL"))
 
 
+async def m013_task_diagnosis(conn) -> None:
+    """Разбор застрявшей задачи: почему цикл не сходится.
+
+    Задача 531 четыре раза подряд провалила приёмку с одним и тем же
+    дефектом, получая каждый раз один и тот же промпт. Вывод разбора нужно
+    где-то держать между попытками — иначе следующий заход начинается
+    с того же места, что и предыдущий.
+    """
+    await ensure_tables(conn)
+    await _add_column(conn, "tasks", "diagnosis", "TEXT DEFAULT '{}'")
+    await conn.execute(text(
+        "UPDATE tasks SET diagnosis = '{}' WHERE diagnosis IS NULL"))
+
+
 MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline: схема фазы 1", m001_baseline),
     (2, "ingest: переписка, транспорты, привязка чатов", m002_ingest),
@@ -365,6 +379,7 @@ MIGRATIONS: list[tuple[int, str, object]] = [
     (10, "учёт: прогон знает своё начало и свой конец", m010_run_finished_at),
     (11, "учёт: стоимость измерена или оценена по времени", m011_cost_estimated),
     (12, "режим самостоятельности: работа с заглушками вместо ключей", m012_autonomous_mode),
+    (13, "разбор застрявшей задачи между попытками", m013_task_diagnosis),
 ]
 
 

@@ -189,6 +189,11 @@ class Task(Base):
     # выполненном критерии — повод завести новую задачу, а не завалить эту
     observations: Mapped[list[str]] = mapped_column(JSON, default=list,
                                                     server_default=text("'[]'"))
+    # Разбор застрявшей задачи (autopilot/crew.py): почему цикл не сходится
+    # и что сделать иначе. Отдельной колонкой, а не строкой в observations:
+    # там список строк для человека, а здесь структура, которую читает код
+    diagnosis: Mapped[dict] = mapped_column(JSON, default=dict,
+                                            server_default=text("'{}'"))
     last_error: Mapped[str] = mapped_column(default="")
     cost_usd: Mapped[float] = mapped_column(default=0.0)
     updated_at: Mapped[dt.datetime] = mapped_column(default=utcnow, server_default=text("CURRENT_TIMESTAMP"))

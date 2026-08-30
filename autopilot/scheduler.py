@@ -17,6 +17,7 @@ from .config import cfg
 from .db import (AccessItem, Project, Session, Task, cli_spent_today,
                  decayed_units, spent_today, utcnow)
 from . import autonomy
+from . import crew
 from . import limits
 from . import progress
 from .llm import LimitReached
@@ -538,6 +539,7 @@ class Scheduler:
                          f"Посмотреть — /show {task.id}, подтвердить — /confirm {task.id}")
 
     async def _on_fail(self, lane: str, task: Task, project: Project, defects: list[str]) -> None:
+        needs_diagnosis = False
         async with Session() as s:
             t = await s.get(Task, task.id)
             if t is None:
@@ -579,10 +581,59 @@ class Scheduler:
                 if lane == "verify":
                     # не прошло приёмку — обратно на починку, тем же cc_session_id
                     t.lane = "build"
+                needs_diagnosis = crew.Diagnostician.should_run(t)
                 # упавшие build/chat остаются в своей полосе: перекидывать
                 # chat-задачу в build — это менять её смысл
             t.updated_at = utcnow()
             await s.commit()
+
+        if needs_diagnosis:
+            await self._diagnose(task, project, defects)
+
+    async def _diagnose(self, task: Task, project: Project,
+                        defects: list[str]) -> None:
+        """Почему задача не сходится — разбором, а не ещё одной слепой попыткой.
+
+        Вызывается со второго провала: первый разбирать нечего, агент ещё
+        не видел дефекта. Разбор НЕ решает, выполнена ли задача, — это право
+        только у детерминированных проверок. Он отвечает на другой вопрос:
+        что делать в следующий заход.
+        """
+        try:
+            async with Session() as s:
+                fresh = await s.get(Task, task.id)
+            if fresh is None:
+                return
+            diag = await crew.Diagnostician().diagnose(fresh, project, defects)
+        except LimitReached:
+            raise
+        except Exception:
+            # Разбор — подсказка, а не условие работы. Не вышло — задача
+            # просто пойдёт на следующую попытку как раньше
+            log.exception("разбор задачи %s не удался", task.id)
+            return
+        if not diag:
+            return
+
+        note = crew.diagnosis_note(diag)
+        async with Session() as s:
+            t = await s.get(Task, task.id)
+            if t is None:
+                return
+            t.diagnosis = diag
+            if diag["verdict"] != "work_wrong":
+                # Чинить должен не агент: критерий правит человек, инструмент
+                # ставит владелец. Гонять агента по кругу тут бессмысленно
+                t.status = NEEDS_HUMAN
+                t.last_error = note
+            t.updated_at = utcnow()
+            await s.commit()
+        log.warning("задача %s: %s", task.id, note)
+
+        if diag["verdict"] != "work_wrong":
+            notify = getattr(self.communicator, "notify_owner", None)
+            if notify is not None:
+                await notify(f"Задача {task.id} «{task.title}» встала.\n{note}")
 
     async def _set_status(self, task_id: int, status: str, lane: str | None = None) -> None:
         async with Session() as s:
