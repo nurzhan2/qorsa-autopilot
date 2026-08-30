@@ -18,6 +18,7 @@ from .checks import (DEFAULT_TIMEOUT_SEC, HUMAN_ONLY, REGISTRY, VIEWPORTS,
                      is_runnable, spec, unrunnable_reason)
 from .checks import suspicious as suspicious_reason
 from .config import cfg
+from . import appserver
 from . import autonomy
 from . import llm
 from . import projectdir
@@ -497,21 +498,32 @@ class Verifier:
         # искать файлы там, где их никто не создавал: ровно та ошибка, из-за
         # которой задача про корзину провалилась при выполненной работе
         cwd = str(projectdir.workspace(project))
-        defects: list[str] = []
-        observations: list[str] = []
-        deferred: list[str] = []
-        deferred_keys: list[str] = []
-        executed = 0
-        # считаем раздельно: кто вынес вердикт — код или модель
-        deterministic = 0
-        assisted = 0
-        suspicious = 0
 
         # Режим самостоятельности: за какими секретами сейчас стоит заглушка.
         # Считаем один раз на задачу, а не на критерий: чтение хранилища
         # расшифровывает файл целиком
         blocked_secrets = (autonomy.placeholder_names()
                            if getattr(project, "autonomous_mode", False) else set())
+
+        # Критерии http/dom бьют в localhost, а поднимать там что-либо никто
+        # не обязан: задача 531 четырежды получила ответ не своего кода,
+        # а того, что случайно оказалось на порту. Поднимаем приложение сами
+        # на время проверок — критерий при этом не меняется ни на символ,
+        # просто теперь по адресу отвечает именно проект
+        async with appserver.running_for(task, projectdir.workspace(project)):
+            return await self._run_checks(
+                task, project, cwd, blocked_secrets)
+
+    async def _run_checks(self, task: Task, project: Project, cwd: str,
+                          blocked_secrets: set) -> Verdict:
+        defects: list[str] = []
+        observations: list[str] = []
+        deferred: list[str] = []
+        deferred_keys: list[str] = []
+        executed = 0
+        deterministic = 0
+        assisted = 0
+        suspicious = 0
 
         for check in task.acceptance or []:
             if not isinstance(check, dict):
