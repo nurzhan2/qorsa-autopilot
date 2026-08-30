@@ -82,8 +82,15 @@ async def test_scheduler_priority(db):
     assert hot_n >= 3 * max(bg_n, 1), f"горящий={hot_n}, фоновый={bg_n}"
 
 
-async def test_no_double_build(db):
-    """Один проект не занимает два build-слота одновременно."""
+async def test_no_double_build(db, monkeypatch):
+    """По умолчанию один проект не занимает два build-слота одновременно.
+
+    LANE_BUILD_PER_PROJECT=1 — прежнее поведение и умолчание: все задачи
+    проекта работают в одном каталоге, и два агента, правящих один файл,
+    затрут работу друг друга молча. Значение пинуем явно: у владельца
+    в .env оно может быть поднято, и тест краснел бы от его настроек.
+    """
+    monkeypatch.setattr(cfg, "lane_build_per_project", 1)
     p = await make_project()
     await make_tasks(p.id, 5)
 
@@ -108,10 +115,199 @@ async def test_no_double_build(db):
         # и ловится вторая параллельная сборка одного проекта
         await asyncio.sleep(0.05)
         assert sched.running["build"] <= 1
-        assert sched.busy_projects <= {p.id}
+        assert set(sched.busy_projects) <= {p.id}
     await sched.drain()
 
     assert peak["value"] == 1, f"проект держал {peak['value']} build-слотов разом"
+
+
+async def test_escalated_task_does_not_freeze_the_whole_order(db, monkeypatch):
+    """Провалившаяся задача останавливает себя, а не весь заказ.
+
+    Живой случай, стоивший ночи работы: задача 531 четырежды упала на том,
+    что критерий ждал 302, а сервер отдавал 200. Проект уходил в `blocked`,
+    а `blocked` входит в DEAD_STATUSES — и вместе с одной задачей встали
+    двадцать четыре готовые, к ней не относящиеся.
+
+    Тем, что от неё зависит, ход закрыт зависимостями и без этого.
+    """
+    monkeypatch.setattr(cfg, "max_attempts", 1)
+    p = await make_project()
+    bad, good = await make_tasks(p.id, 2)
+
+    class Broken:
+        async def run(self, task, project):
+            if task.id == bad:
+                raise RuntimeError("критерий не сошёлся")
+            return {}
+
+    sched = make_sched(executor=Broken())
+    for _ in range(4):
+        await sched.tick()
+        await sched.drain()
+
+    async with Session() as s:
+        proj = await s.get(Project, p.id)
+        failed = await s.get(Task, bad)
+        other = await s.get(Task, good)
+    assert failed.status == "escalated"
+    assert proj.status != "blocked", "одна задача заморозила весь заказ"
+    assert other.status != "ready" or other.lane != "build", \
+        "соседняя задача так и не пошла в работу"
+
+
+async def test_pause_file_actually_stops_the_scheduler(db, monkeypatch, tmp_path):
+    """Кнопка «пауза» обязана останавливать работу, а не только надпись.
+
+    Живой случай: файл PAUSED писал дашборд, а планировщик его не читал
+    ВООБЩЕ. Страница честно показывала «работа на паузе», задачи при этом
+    продолжали уходить в сборку. Кнопка, которая выглядит рабочей и ничего
+    не делает, хуже отсутствующей.
+    """
+    from autopilot import progress
+
+    monkeypatch.setattr(cfg, "root", tmp_path)
+    p = await make_project()
+    await make_tasks(p.id, 3)
+
+    async def left_build() -> int:
+        """Сколько задач ушло из полосы build. Сравнивать со статусом нельзя:
+        собранная задача возвращается в `ready`, но уже в полосе `verify`."""
+        async with Session() as s:
+            rows = (await s.execute(
+                select(Task).where(Task.project_id == p.id))).scalars().all()
+        return sum(1 for t in rows if t.lane != "build" or t.status != "ready")
+
+    sched = make_sched()
+    progress.pause_path().write_text("стоп", encoding="utf-8")
+    await sched.tick()
+    await asyncio.sleep(0.05)
+    await sched.drain()
+    assert await left_build() == 0, "на паузе задачи всё равно ушли в работу"
+
+    progress.pause_path().unlink()
+    await sched.tick()
+    await asyncio.sleep(0.05)
+    await sched.drain()
+    assert await left_build() > 0, "после снятия паузы работа не возобновилась"
+
+
+async def test_pause_stops_brief_collection_too(db, monkeypatch, tmp_path):
+    """Сбор ТЗ тоже ходит к модели и тоже ест окно подписки."""
+    from autopilot import progress
+    from autopilot.brief import BriefRunner
+
+    monkeypatch.setattr(cfg, "root", tmp_path)
+    await make_project()
+    progress.pause_path().write_text("стоп", encoding="utf-8")
+
+    called = []
+
+    class Probe:
+        communicator = None
+
+        async def build(self, project):
+            called.append(project.id)
+            return {}
+
+    assert await BriefRunner(Probe(), None).tick() == 0
+    assert not called, "на паузе бриф всё равно пошёл к модели"
+
+
+async def test_parallel_build_within_one_project(db, monkeypatch):
+    """LANE_BUILD_PER_PROJECT>1 разрешает несколько задач одного проекта разом.
+
+    Замерено, зачем: план проекта 8 из 31 оставшейся задачи укладывается
+    в 7 «волн» по графу зависимостей. При одной задаче за раз это 31 подход
+    по ~6 минут, при параллельной работе внутри волны — семь.
+    """
+    monkeypatch.setattr(cfg, "lane_build_per_project", 3)
+    monkeypatch.setitem(cfg.lane_limits, "build", 3)
+    monkeypatch.setattr(cfg, "cc_max_concurrent", 4)
+
+    p = await make_project()
+    await make_tasks(p.id, 5)
+
+    peak = {"value": 0}
+    live: set[int] = set()
+
+    class Probe:
+        async def run(self, task, project):
+            live.add(task.id)
+            peak["value"] = max(peak["value"], len(live))
+            try:
+                await asyncio.sleep(0.15)
+            finally:
+                live.discard(task.id)
+            return {}
+
+    sched = make_sched(executor=Probe())
+    await sched.tick()
+    await asyncio.sleep(0.05)
+    await sched.drain()
+
+    assert peak["value"] > 1, "параллельность не включилась"
+    assert peak["value"] <= 3, f"взято {peak['value']} слотов при потолке 3"
+
+
+async def test_parallel_build_skips_tasks_that_touch_the_same_files(db, monkeypatch):
+    """Две задачи по одному каталогу параллельно не идут.
+
+    Зависимости их не разводят: «Веб-админка: товары» и «Веб-админка: заказы»
+    друг от друга не зависят, но правят одни и те же файлы. Пути берём
+    из критериев — там они названы точно.
+    """
+    monkeypatch.setattr(cfg, "lane_build_per_project", 3)
+    monkeypatch.setitem(cfg.lane_limits, "build", 3)
+    monkeypatch.setattr(cfg, "cc_max_concurrent", 4)
+
+    p = await make_project()
+    async with Session() as s:
+        for i, path in enumerate(["backend/app/routers/admin_goods.py",
+                                  "backend/app/routers/admin_orders.py"]):
+            s.add(Task(project_id=p.id, order_idx=i, lane="build", status="ready",
+                       title=f"админка {i}", verify_class="auto",
+                       executor="claude_code",
+                       acceptance=[{"type": "file_exists", "path": path}]))
+        await s.commit()
+
+    peak = {"value": 0}
+    live: set[int] = set()
+
+    class Probe:
+        async def run(self, task, project):
+            live.add(task.id)
+            peak["value"] = max(peak["value"], len(live))
+            try:
+                await asyncio.sleep(0.15)
+            finally:
+                live.discard(task.id)
+            return {}
+
+    sched = make_sched(executor=Probe())
+    await sched.tick()
+    await asyncio.sleep(0.05)
+    await sched.drain()
+
+    assert peak["value"] == 1, ("две задачи по backend/app пошли параллельно — "
+                                "они затрут работу друг друга")
+
+
+def test_paths_of_reads_criteria_not_guesses():
+    """Пути берутся из критериев: там они названы, а не угаданы."""
+    task = Task(id=1, title="x", acceptance=[
+        {"type": "file_exists", "path": "client_app/lib/l10n/app_ru.arb"},
+        {"type": "shell", "cmd": "cd backend && pytest tests/test_orders.py -v"},
+    ])
+    paths = Scheduler._paths_of(task)
+    assert "client_app/lib" in paths
+    assert "tests/test_orders.py" in paths
+
+
+def test_paths_of_is_empty_when_criteria_name_nothing():
+    """Нет путей — нет и запрета: гадать по названию задачи мы не будем."""
+    task = Task(id=1, title="x", acceptance=[{"type": "http", "url": "http://x/"}])
+    assert Scheduler._paths_of(task) == set()
 
 
 async def test_dependent_task_waits_for_done(db):

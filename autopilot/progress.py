@@ -31,6 +31,19 @@ log = logging.getLogger("progress")
 STALE_AFTER_SEC = 30
 
 
+def pause_path():
+    """Файл паузы. Один и тот же для дашборда и планировщика.
+
+    Файл, а не поле в базе, намеренно: снять паузу человек должен уметь даже
+    когда процесс автопилота лежит.
+    """
+    return cfg.root / "PAUSED"
+
+
+def paused() -> bool:
+    return pause_path().exists()
+
+
 def heartbeat_path():
     return cfg.logs / "heartbeat.json"
 

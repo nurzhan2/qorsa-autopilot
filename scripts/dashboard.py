@@ -50,8 +50,10 @@ from autopilot.verifier import Verifier                               # noqa: E4
 log = logging.getLogger("dashboard")
 
 # Пауза — файл, а не поле в базе: её должен уметь снять человек, даже если
-# процесс автопилота лежит. Планировщик читает тот же файл.
-PAUSE_FILE = ROOT / "PAUSED"
+# процесс автопилота лежит. Путь один на всех (progress.pause_path): пока
+# он был объявлен здесь отдельно, планировщик его не читал вовсе — кнопка
+# писала файл, страница показывала «на паузе», а работа шла дальше
+PAUSE_FILE = progress.pause_path()
 
 STATUS_RU = {
     "new": "новый", "briefing": "собираем ТЗ", "active": "в работе",

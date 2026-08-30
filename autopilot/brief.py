@@ -39,6 +39,7 @@ from difflib import SequenceMatcher
 from sqlalchemy import select
 
 from . import guard
+from . import progress
 from . import projectdir
 from .config import cfg
 from .db import (AccessItem, ChatMessage, Project, Session, Task, close_run,
@@ -1561,6 +1562,12 @@ class BriefRunner:
 
     async def tick(self) -> int:
         from .db import cli_spent_today, spent_today
+        # Пауза владельца — та же, что у планировщика. Сбор ТЗ тоже ходит
+        # к модели и тоже ест окно подписки: остановить полосы, но оставить
+        # эту петлю работать значит остановить работу только на словах
+        if progress.paused():
+            log.debug("работа на паузе — бриф не пересобираю")
+            return 0
         # Оба потолка: деньги и подписка. Бриф на CLI ест то же окно, что
         # и build, и не считать его значит оставить окно без присмотра
         if await spent_today() >= cfg.daily_budget_usd:

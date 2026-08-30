@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import re
+from collections import Counter
 
 from sqlalchemy import select, update
 
@@ -66,10 +68,18 @@ class Scheduler:
         self.communicator = communicator
         # занятые слоты по полосам — считаем сами, без чтения приватных полей Semaphore
         self.running: dict[str, int] = {ln: 0 for ln in cfg.lane_limits}
-        self.busy_projects: set[int] = set()   # проекты с активной эксклюзивной задачей
+        # Сколько эксклюзивных задач держит каждый проект. Раньше было
+        # множество «занят / не занят», то есть жёстко одна задача на проект.
+        # Счётчик нужен, чтобы разрешить несколько (LANE_BUILD_PER_PROJECT)
+        self.busy_projects: Counter[int] = Counter()
+        # Пути, которые СЕЙЧАС правит каждая работающая задача. Два агента
+        # в одном каталоге затрут работу друг друга молча, и заметить это
+        # можно будет только по пропавшему коду
+        self.busy_paths: dict[int, set[str]] = {}
         self.inflight: set[int] = set()        # id задач в работе
         self._workers: set[asyncio.Task] = set()   # держим ссылки, иначе GC съест задачу на лету
         self.budget_paused = False
+        self._pause_logged = False
         self.tick_sec = 1.0
 
     def free_slots(self, lane: str) -> int:
@@ -146,7 +156,21 @@ class Scheduler:
             log.debug("квота закрыта ещё %.0f мин — платные полосы стоят",
                       limits.state.seconds_left() / 60)
 
+        # ПАУЗА ВЛАДЕЛЬЦА. Раньше файл PAUSED писал дашборд, а планировщик
+        # его не читал ВООБЩЕ: кнопка ставила паузу, страница честно писала
+        # «работа на паузе», и работа при этом шла дальше. Хуже, чем не иметь
+        # кнопки: она выглядела рабочей
+        on_pause = progress.paused()
+        if on_pause and not self._pause_logged:
+            log.warning("работа на паузе (файл PAUSED) — новые задачи "
+                        "не берутся; уже запущенные доработают")
+        elif self._pause_logged and not on_pause:
+            log.info("пауза снята — работа продолжается")
+        self._pause_logged = on_pause
+
         for lane in LANES:
+            if on_pause:
+                continue
             if (self.budget_paused or limited) and lane in PAID_LANES:
                 continue
             if lane == "build" and not self.build_allowed():
@@ -160,7 +184,8 @@ class Scheduler:
         progress.write_heartbeat({
             "lanes": {lane: {"running": self.running[lane],
                              "limit": cfg.lane_limits[lane]} for lane in LANES},
-            "paused": self.budget_paused,
+            "paused": on_pause,
+            "budget_paused": self.budget_paused,
             "limited_sec": round(limits.state.seconds_left()),
             "build_allowed": self.build_allowed(),
         })
@@ -216,7 +241,8 @@ class Scheduler:
             self.running[lane] += 1
             self.inflight.add(task.id)
             if exclusive:
-                self.busy_projects.add(project.id)
+                self.busy_projects[project.id] += 1
+                self.busy_paths[task.id] = self._paths_of(task)
             # списываем сразу — следующий _pick в этом же тике увидит новый score
             await self._charge_dispatch(project.id)
             if lane == "build":
@@ -264,8 +290,10 @@ class Scheduler:
         for task, project in rows:
             if task.id in self.inflight:
                 continue
-            if exclusive and project.id in self.busy_projects:
+            if exclusive and not self._project_has_room(lane, project.id):
                 continue
+            if exclusive and self._paths_clash(task):
+                continue          # эту задачу правит другой агент прямо сейчас
             if project.id in blocked:
                 continue          # чеклист доступов не закрыт
             if lane == GATED_LANE and not self._deps_done(task, done_titles):
@@ -274,6 +302,61 @@ class Scheduler:
             if best_score is None or score < best_score:
                 best, best_score = (task, project), score
         return best
+
+    def _project_has_room(self, lane: str, project_id: int) -> bool:
+        """Может ли проект взять ещё одну задачу этой эксклюзивной полосы.
+
+        У `build` потолок настраиваемый (LANE_BUILD_PER_PROJECT), у `verify`
+        по-прежнему один: приёмка бегает по тому же каталогу, что и сборка,
+        и распараллеливать её незачем — она короткая.
+        """
+        limit = cfg.lane_build_per_project if lane == "build" else 1
+        return self.busy_projects[project_id] < max(1, limit)
+
+    @staticmethod
+    def _paths_of(task: Task) -> set[str]:
+        """Файлы и каталоги, которые задача, судя по её критериям, трогает.
+
+        Берём из acceptance, а не из текста задачи: там пути названы точно
+        (`backend/app/routers/chat.py`, `client_app/lib/...`), а в описании
+        их пришлось бы угадывать. Это не полный список того, что агент правда
+        тронет, — только то, что мы знаем наверняка.
+        """
+        out: set[str] = set()
+        for check in (task.acceptance or []):
+            if not isinstance(check, dict):
+                continue
+            for key in ("path", "cmd"):
+                blob = str(check.get(key) or "")
+                for token in re.split(r"[\s&|;'\"`]+", blob):
+                    token = token.strip().lstrip("./")
+                    if "/" not in token:
+                        continue
+                    # до первого разделителя: каталог верхнего уровня и есть
+                    # та единица, за которую дерутся агенты
+                    head = token.split("::")[0]
+                    parts = [p for p in head.split("/") if p and p not in ("..",)]
+                    if len(parts) >= 2:
+                        out.add("/".join(parts[:2]))
+                    elif parts:
+                        out.add(parts[0])
+        return out
+
+    def _paths_clash(self, task: Task) -> bool:
+        """Пересекается ли задача по файлам с той, что уже идёт.
+
+        Защита неполная и честно такой заявлена: пути известны только те,
+        что назвал планировщик в критериях. Но она отсекает очевидное —
+        две задачи по одному и тому же каталогу админки, — а это ровно тот
+        случай, где параллельная работа затирает результат.
+        """
+        mine = self._paths_of(task)
+        if not mine:
+            return False
+        for other_id, theirs in self.busy_paths.items():
+            if other_id != task.id and mine & theirs:
+                return True
+        return False
 
     @staticmethod
     async def _done_titles(s, lane: str, rows) -> dict[int, set[str]]:
@@ -372,7 +455,10 @@ class Scheduler:
                 log.exception("не смог списать время project %s", project.id)
             self.inflight.discard(task.id)
             if exclusive:
-                self.busy_projects.discard(project.id)
+                self.busy_projects[project.id] -= 1
+                if self.busy_projects[project.id] <= 0:
+                    del self.busy_projects[project.id]
+                self.busy_paths.pop(task.id, None)
             self.running[lane] -= 1
 
     async def _on_limit(self, task: Task, lane: str, exc) -> None:
@@ -467,13 +553,27 @@ class Scheduler:
                 log.warning("задача %s ждёт человека: %s", t.id, "; ".join(defects)[:200])
                 return
             if t.attempts >= cfg.max_attempts:
+                # Эскалация останавливает ЗАДАЧУ, а не весь заказ.
+                #
+                # Раньше здесь стояло `p.status = "blocked"`, и одна задача
+                # замораживала проект целиком: `blocked` входит в
+                # DEAD_STATUSES, то есть из него не выдаётся ни одного слота.
+                # Живой случай: 531 («Веб-админка») четырежды упала на том,
+                # что критерий ждал 302, а сервер отдавал 200 — и вместе с ней
+                # встали ДВАДЦАТЬ ЧЕТЫРЕ готовые задачи, к ней не относящиеся.
+                # Ночь работы ушла впустую.
+                #
+                # Тем, что зависит от провалившейся задачи, ход и так закрыт:
+                # `_deps_done` не пустит их, пока она не `done`. Блокировка
+                # проекта была вторым, тупым запретом поверх точного — и
+                # запрещала заодно всё остальное.
                 t.status = "escalated"
                 p = await s.get(Project, project.id)
                 if p is not None:
-                    p.status = "blocked"
                     p.last_action = f"эскалация: {t.title}"
                     p.updated_at = utcnow()
-                log.warning("ЭСКАЛАЦИЯ -> %s / %s", project.title, t.title)
+                log.warning("ЭСКАЛАЦИЯ -> %s / %s (заказ продолжает работу "
+                            "по остальным задачам)", project.title, t.title)
             else:
                 t.status = "ready"
                 if lane == "verify":
