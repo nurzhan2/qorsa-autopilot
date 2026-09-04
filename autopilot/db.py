@@ -4,8 +4,8 @@ import datetime as dt
 import logging
 from typing import Any
 
-from sqlalchemy import (JSON, DateTime, ForeignKey, Index, String, TypeDecorator, text,
-                        UniqueConstraint, event, select, update)
+from sqlalchemy import (JSON, DateTime, ForeignKey, Index, String, TypeDecorator, func,
+                        text, UniqueConstraint, event, select, update)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -196,7 +196,64 @@ class Task(Base):
                                             server_default=text("'{}'"))
     last_error: Mapped[str] = mapped_column(default="")
     cost_usd: Mapped[float] = mapped_column(default=0.0)
+    # ЧЕМ была принята задача: {deterministic, assisted, suspicious, tainted}.
+    # Раньше состав приёмки жил только в момент вызова — `Verdict` считался,
+    # логировался и умирал. Через месяц по базе нельзя было отличить задачу,
+    # закрытую пройденным тестом, от задачи, закрытой единственной `http 200`
+    # на корне сайта, хотя проект строит на этой разнице всю честность приёмки.
+    verdict: Mapped[dict] = mapped_column(JSON, default=dict,
+                                          server_default=text("'{}'"))
     updated_at: Mapped[dt.datetime] = mapped_column(default=utcnow, server_default=text("CURRENT_TIMESTAMP"))
+
+
+class TaskAttempt(Base):
+    """Один заход на задачу: чем кончился, что изменил, во что обошёлся.
+
+    **`Task.defects` затирается каждой новой попыткой.** До этой таблицы четыре
+    РАЗНЫХ дефекта и четыре ОДИНАКОВЫХ выглядели в базе одинаково: обе цепочки
+    доходили до `MAX_ATTEMPTS` и обе объяснялись одной строкой «исчерпаны
+    попытки». Задача 531 четырежды упала с дословно тем же дефектом — то есть
+    цикл стоял на месте, — и назвать это своим именем было нечем.
+
+    Таблица **дописывается и не переписывается**: это соглашение, а не запрет
+    на уровне схемы. Строку не правит никто, кроме того, кто её завёл.
+
+    Почему таблица, а не JSON-колонка у задачи (второй рассмотренный вариант):
+    по ней считается отчёт цикла одним запросом, а колонку пришлось бы читать,
+    загружая все задачи целиком.
+    """
+    __tablename__ = "task_attempts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), default=0,
+                                            server_default=text("0"))
+    # номер захода с единицы; НЕ равен Task.attempts — исходы, не тратящие
+    # попытку (упор в квоту, ожидание ключа), тоже оставляют здесь строку
+    n: Mapped[int] = mapped_column(default=0, server_default=text("0"))
+    lane: Mapped[str] = mapped_column(String(10), default="build",
+                                      server_default=text("'build'"))
+    # failed | done | unproven | awaiting_keys | needs_human | escalated
+    # | stagnation | limit | policy
+    outcome: Mapped[str] = mapped_column(String(14), default="failed",
+                                         server_default=text("'failed'"))
+    # Засчитана ли попытка. Упор в квоту, ожидание ключа и работа человека
+    # попытку НЕ тратят — и по базе это должно быть видно, а не выводиться
+    # из разницы двух счётчиков
+    counted: Mapped[bool] = mapped_column(default=True, server_default=text("1"))
+    defects: Mapped[list[str]] = mapped_column(JSON, default=list,
+                                               server_default=text("'[]'"))
+    # подпись дефектов (breaker.signature) — по ней и опознаётся застревание
+    sig: Mapped[str] = mapped_column(default="", server_default=text("''"))
+    # что посоветовал разбор перед этим заходом: повтор совета — тоже застревание
+    note: Mapped[str] = mapped_column(default="", server_default=text("''"))
+    # какие файлы тронул агент за эту сессию (autopilot/worktrace.py).
+    # Пусто — значит слепок снять не удалось, а не «ничего не менял»
+    changed: Mapped[list[str]] = mapped_column(JSON, default=list,
+                                               server_default=text("'[]'"))
+    seconds: Mapped[float] = mapped_column(default=0.0, server_default=text("0"))
+    at: Mapped[dt.datetime] = mapped_column(default=utcnow,
+                                            server_default=text("CURRENT_TIMESTAMP"))
 
 
 class ProjectChat(Base):
@@ -589,6 +646,70 @@ async def recover_orphan_tasks() -> int:
             update(Task).where(Task.status == "running").values(status="ready", updated_at=utcnow()))
         await s.commit()
         return res.rowcount
+
+
+async def sessions_today(kinds: tuple[str, ...] = ("execute",)) -> int:
+    """Сколько сессий модели заведено за последние 24 часа.
+
+    **Третий счётчик, и единственный, который не врёт при `cost_usd=0`.**
+    Оба денежных потолка сравнивают СУММЫ СТОИМОСТИ, а у оборванного вызова
+    цена — ноль (осознанно, см. `Run.cost_estimated`: оценка по времени
+    однажды насчитала $33 за прогон, который не сделал ни одного хода,
+    потому что машина уснула на середине). Живой след этой дыры лежит
+    в базе: у задачи 531 двадцать четыре строки `Run(kind="execute")`
+    при `attempts=0` — ни один потолок этого не заметил.
+
+    Число сессий известно всегда: строка заводится ДО вызова.
+    """
+    since = utcnow() - dt.timedelta(hours=24)
+    async with Session() as s:
+        return int((await s.execute(
+            select(func.count()).select_from(Run)
+            .where(Run.started_at >= since, Run.kind.in_(kinds)))).scalar() or 0)
+
+
+async def log_attempt(task_id: int, *, project_id: int = 0, lane: str = "build",
+                      outcome: str = "failed", counted: bool = True,
+                      defects: list[str] | None = None, sig: str = "",
+                      note: str = "", changed: list[str] | None = None,
+                      seconds: float = 0.0) -> int:
+    """Дописать заход в журнал попыток. Номер считается по самому журналу.
+
+    Ошибка записи журнала НЕ должна ронять работу — журнал наблюдает за
+    циклом, а не управляет им. Поэтому исключение здесь ловится и логируется:
+    потерять строку журнала дешевле, чем потерять задачу.
+    """
+    try:
+        async with Session() as s:
+            n = int((await s.execute(
+                select(func.count()).select_from(TaskAttempt)
+                .where(TaskAttempt.task_id == task_id))).scalar() or 0) + 1
+            row = TaskAttempt(
+                task_id=task_id, project_id=project_id, n=n, lane=lane,
+                outcome=outcome, counted=counted,
+                defects=[str(d) for d in (defects or [])], sig=sig, note=note,
+                changed=[str(c) for c in (changed or [])], seconds=seconds)
+            s.add(row)
+            await s.commit()
+            return row.id
+    except Exception:                                   # noqa: BLE001
+        log_db.exception("строка журнала попыток для задачи %s не записана", task_id)
+        return 0
+
+
+async def attempts_of(task_id: int, counted_only: bool = True) -> list[TaskAttempt]:
+    """Журнал попыток задачи, от старых к новым.
+
+    `counted_only` — по умолчанию только те заходы, которые действительно
+    были работой агента. Упор в квоту и ожидание ключа серию НЕ продолжают:
+    агент в них ничего не чинил, и считать их повтором дефекта значило бы
+    объявить застреванием ожидание клиента.
+    """
+    async with Session() as s:
+        q = select(TaskAttempt).where(TaskAttempt.task_id == task_id)
+        if counted_only:
+            q = q.where(TaskAttempt.counted.is_(True))
+        return list((await s.execute(q.order_by(TaskAttempt.n))).scalars().all())
 
 
 def decayed_units(served: float, served_at: dt.datetime | None, now: dt.datetime | None = None) -> float:

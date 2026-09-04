@@ -13,14 +13,20 @@ from collections import Counter
 from sqlalchemy import select, update
 
 from .config import cfg
-from .db import (AccessItem, Project, Session, Task, cli_spent_today,
-                 decayed_units, spent_today, utcnow)
+from .db import (AccessItem, Project, Session, Task, attempts_of,
+                 cli_spent_today, decayed_units, log_attempt, sessions_today,
+                 spent_today, utcnow)
 from . import autonomy
+from . import breaker
+from . import checks
 from . import crew
 from . import limits
 from . import paths
+from . import policy
 from . import progress
+from . import projectdir
 from . import regression
+from . import worktrace
 from .llm import LimitReached
 from .manual import NEEDS_HUMAN, needs_human, unproven_note
 
@@ -142,12 +148,24 @@ class Scheduler:
         money, subscription = await spent_today(), await cli_spent_today()
         over_money = money >= cfg.daily_budget_usd
         over_cli = subscription >= cfg.daily_cli_budget_usd
-        over_budget = over_money or over_cli
+        # ТРЕТИЙ ПОТОЛОК, и единственный, который не врёт при cost_usd=0.
+        #
+        # Оба денежных счётчика сравнивают СУММЫ СТОИМОСТИ, а у оборванного
+        # вызова цена — ноль (осознанно: оценка по времени однажды насчитала
+        # $33 за прогон без единого хода, потому что машина уснула). Живой
+        # след дыры лежит в базе: у задачи 531 двадцать четыре строки
+        # Run(kind="execute") при attempts=0, и ни один потолок не заметил.
+        # Число сессий известно всегда — строка заводится ДО вызова.
+        sessions = await sessions_today()
+        over_sessions = sessions >= cfg.daily_cc_sessions
+        over_budget = over_money or over_cli or over_sessions
         if over_budget and not self.budget_paused:
             log.warning("СУТОЧНЫЙ ПОТОЛОК ИСЧЕРПАН (%s) — пауза build/verify, "
                         "chat работает",
                         f"деньги ${money:.2f} из ${cfg.daily_budget_usd:.2f}"
                         if over_money else
+                        f"сессий {sessions} из {cfg.daily_cc_sessions}"
+                        if over_sessions else
                         f"подписка ~${subscription:.2f} из "
                         f"${cfg.daily_cli_budget_usd:.2f} оценочно")
         elif self.budget_paused and not over_budget:
@@ -179,11 +197,22 @@ class Scheduler:
         for lane in LANES:
             if on_pause:
                 continue
+            free_only = False
             if (self.budget_paused or limited) and lane in PAID_LANES:
-                continue
+                # ПРИЁМКА БЕЗ МОДЕЛИ НЕ ВСТАЁТ ПО ДЕНЬГАМ И ПО КВОТЕ.
+                #
+                # Судья зовётся только из `llm` и `screenshot`; задача с одними
+                # `shell`/`http`/`file_exists`/`dom` проверяется кодом целиком.
+                # Раньше такая приёмка стояла заодно со сборкой, и собранная
+                # работа копилась в очереди до завтра из-за расхода, которого
+                # не будет. Сборку при этом гасим по-прежнему: она к модели
+                # ходит всегда.
+                if lane != "verify":
+                    continue
+                free_only = True
             if lane == "build" and not self.build_allowed():
                 continue
-            await self._dispatch(lane)
+            await self._dispatch(lane, free_only=free_only)
 
         # Пульс — в самом конце тика, когда занятость полос уже настоящая.
         # Без него дашборд не отличает работающий автопилот от незапущенного:
@@ -205,7 +234,7 @@ class Scheduler:
 
     # ---------- выбор задачи ----------
 
-    async def _dispatch(self, lane: str) -> None:
+    async def _dispatch(self, lane: str, free_only: bool = False) -> None:
         exclusive = cfg.lane_exclusive[lane]
         # за один тик занимаем не больше, чем свободно сейчас: иначе на мгновенных
         # задачах цикл вычерпывает всю очередь полосы и другие полосы ждут
@@ -221,11 +250,11 @@ class Scheduler:
             # давали четыре вызова судьи. В бою это значит, что при упоре
             # в квоту мы не встаём, а долбимся в стену столько раз, сколько
             # свободно слотов, сжигая остаток окна на заведомо пустые попытки
-            if lane in PAID_LANES and limits.state.blocked():
+            if lane in PAID_LANES and not free_only and limits.state.blocked():
                 log.debug("окно закрылось посреди тика — полоса %s встаёт", lane)
                 return
             quota -= 1
-            pair = await self._pick(lane, exclusive)
+            pair = await self._pick(lane, exclusive, free_only=free_only)
             if pair is None:
                 return
             task, project = pair
@@ -240,7 +269,7 @@ class Scheduler:
             # случившийся во время `_pick`, всё равно пропускал ещё один вызов
             # в закрытое окно. Задачу возвращаем ровно туда, откуда взяли:
             # работать по ней мы не начали
-            if lane in PAID_LANES and limits.state.blocked():
+            if lane in PAID_LANES and not free_only and limits.state.blocked():
                 await self._release(task.id)
                 log.debug("окно закрылось, пока выбирали задачу %s — вернул "
                           "в очередь", task.id)
@@ -261,8 +290,14 @@ class Scheduler:
             self._workers.add(worker)
             worker.add_done_callback(self._workers.discard)
 
-    async def _pick(self, lane: str, exclusive: bool):
-        """Проект с минимальным served_units/weight, из него — самая ранняя задача."""
+    async def _pick(self, lane: str, exclusive: bool, free_only: bool = False):
+        """Проект с минимальным served_units/weight, из него — самая ранняя задача.
+
+        `free_only` — брать только задачи, приёмка которых не ходит к модели.
+        Так полоса `verify` продолжает работать при исчерпанном бюджете и при
+        упоре в квоту: задача с одними `shell`/`http`/`file_exists`/`dom`
+        проверяется кодом целиком и не стоит ни доллара, ни минуты окна.
+        """
         blocked = await self._projects_without_access() if lane == GATED_LANE else set()
         async with Session() as s:
             q = (
@@ -306,6 +341,8 @@ class Scheduler:
                 continue          # чеклист доступов не закрыт
             if lane == GATED_LANE and not self._deps_done(task, done_titles):
                 continue          # зависимости ещё не сделаны
+            if free_only and checks.needs_model(task.acceptance):
+                continue          # эта приёмка платная, а платить сейчас нечем
             score = decayed_units(project.served_units, project.served_at, now) / weight(project)
             if best_score is None or score < best_score:
                 best, best_score = (task, project), score
@@ -404,19 +441,47 @@ class Scheduler:
                 # сервер объявил бы виновной любую задачу: все http-критерии
                 # проекта красные, а сделала их такими не она
                 before = await regression.snapshot(self.verifier, task, project)
-                await self.executor.run(task, project)
+
+                # Слепок каталога — ПОСЛЕ регрессионного прогона, а не до.
+                # Регрессия гоняет критерии соседних задач, а те создают файлы
+                # (alembic — миграции и базу, pytest — артефакты, flutter —
+                # каталоги сборки). Сними слепок раньше — и чужая работа
+                # припишется агенту, а политика начнёт срабатывать на пустом месте.
+                trace = self._trace_for(project)
+                if trace is not None:
+                    trace.__enter__()
+                try:
+                    await self.executor.run(task, project)
+                finally:
+                    if trace is not None:
+                        trace.__exit__(None, None, None)
+                changed = trace.changed if trace is not None else None
+
+                verdict = await self._policy_review(task, project, changed)
+                if verdict is not None:
+                    return               # нарушение политики: работа остановлена
+
                 broke = await regression.broken(self.verifier, task, project, before)
                 if broke:
                     # Сломала уже принятое — это дефект её работы, а не чужой.
                     # На приёмку не пускаем: там проверяют только её критерии,
                     # и поломка соседней задачи прошла бы незамеченной
-                    await self._on_fail(lane, task, project, broke)
+                    await self._on_fail(lane, task, project, broke,
+                                        changed=changed)
                 else:
                     # собранное уходит на приёмку той же задачей, но в другой полосе
+                    await log_attempt(task.id, project_id=project.id, lane="build",
+                                      outcome="built", counted=False,
+                                      changed=list(changed.paths) if changed else [],
+                                      seconds=(utcnow() - started).total_seconds())
                     await self._set_status(task.id, "ready", lane="verify")
             elif lane == "verify":
                 verdict = await self.verifier.run(task, project)
                 if verdict.confirmed:
+                    await log_attempt(task.id, project_id=project.id, lane="verify",
+                                      outcome="done", counted=False,
+                                      seconds=(utcnow() - started).total_seconds())
+                    await self._save_verdict(task.id, verdict)
                     await self._set_status(task.id, "done")
                     await self.communicator.on_task_done(task, project)
                     await self._maybe_finish(project.id)
@@ -449,11 +514,15 @@ class Scheduler:
             except Exception:
                 log.exception("не смог записать провал task %s", task.id)
         finally:
+            # СИНХРОННАЯ УБОРКА ИДЁТ ПЕРВОЙ, до единого await.
+            #
+            # Раньше здесь сперва стоял `await self._charge_done(...)`. При
+            # отмене воркера этот await немедленно поднимает CancelledError,
+            # а он НЕ подкласс Exception — `except Exception` его не ловит,
+            # и `self.running[lane] -= 1` не выполнялся вовсе. Полоса
+            # оставалась занятой навсегда, до перезапуска процесса, и заметить
+            # это можно было только по тому, что работа перестала браться.
             minutes = (utcnow() - started).total_seconds() / 60
-            try:
-                await self._charge_done(project.id, minutes)
-            except Exception:
-                log.exception("не смог списать время project %s", project.id)
             self.inflight.discard(task.id)
             if exclusive:
                 self.busy_projects[lane][project.id] -= 1
@@ -461,6 +530,141 @@ class Scheduler:
                     del self.busy_projects[lane][project.id]
                 self.busy_paths.pop(task.id, None)
             self.running[lane] -= 1
+            try:
+                await self._charge_done(project.id, minutes)
+            except Exception:
+                log.exception("не смог списать время project %s", project.id)
+
+    @staticmethod
+    async def _stalled(task_id: int):
+        """Стоит ли цикл на месте. Возвращает решение `breaker` или `None`.
+
+        Считается ТОЛЬКО по засчитанным попыткам: упор в квоту и ожидание
+        ключа серию не продолжают — агент в них ничего не чинил, и считать
+        их повтором дефекта значило бы объявить застреванием ожидание клиента.
+        """
+        try:
+            rows = await attempts_of(task_id, counted_only=True)
+        except Exception:                               # noqa: BLE001
+            log.exception("журнал попыток задачи %s не прочитан", task_id)
+            return None
+        log_items = [breaker.Attempt(n=r.n, lane=r.lane, defects=list(r.defects or []),
+                                     sig=r.sig, note=r.note)
+                     for r in rows]
+        decision = breaker.check(log_items, stagnation=cfg.breaker_stagnation,
+                                 frustration=cfg.breaker_frustration)
+        return decision if decision.stop else None
+
+    # ---------- что агент тронул и можно ли это принять ----------
+
+    def _trace_for(self, project: Project):
+        """Слепок рабочего каталога вокруг сессии агента, если он включён.
+
+        Возвращает `None`, когда наблюдение выключено или каталог недоступен:
+        отсутствие слепка не должно мешать работать. Но и «нарушений нет»
+        из этого не следует — см. `Changed.ok`.
+        """
+        if not cfg.worktrace_enabled:
+            return None
+        try:
+            return worktrace.around(projectdir.workspace(project))
+        except Exception:                               # noqa: BLE001
+            log.exception("слепок каталога проекта %s не завёлся", project.id)
+            return None
+
+    async def _policy_review(self, task: Task, project: Project, changed):
+        """Проверить фактически изменённые файлы по политике.
+
+        Возвращает `None`, если всё чисто и работа продолжается; иначе — вердикт,
+        и тогда задача уже отправлена человеку, а работа при `POLICY_HALT`
+        остановлена целиком.
+
+        Останавливаем ВСЁ, а не одну задачу: секрет уже лежит в файле, и
+        следующая сессия разнесёт его дальше. Останавливаем файлом `PAUSED`,
+        потому что снять его должна рука — пауза по квоте отпустила бы сама
+        через пять минут и объяснила бы происходящее на дашборде неправдой
+        про подписку.
+        """
+        if changed is None or not cfg.policy_check:
+            return None
+        try:
+            verdict = policy.review(changed, projectdir.workspace(project))
+        except Exception:                               # noqa: BLE001
+            log.exception("политика по задаче %s не проверена", task.id)
+            return None
+
+        if not verdict.checked:
+            log.warning("задача %s: изменения проверены не полностью — %s",
+                        task.id, verdict.why)
+        if verdict.clean:
+            return None
+
+        lines = verdict.report()
+        log.critical("НАРУШЕНИЕ ПОЛИТИКИ, задача %s «%s»: %s",
+                     task.id, task.title, "; ".join(lines)[:500])
+        await log_attempt(task.id, project_id=project.id, lane="build",
+                          outcome="policy", counted=False, defects=lines,
+                          changed=list(changed.paths))
+        async with Session() as s:
+            t = await s.get(Task, task.id)
+            if t is not None:
+                t.status = NEEDS_HUMAN
+                t.defects = lines
+                t.last_error = f"нарушение политики: {verdict.summary()}"
+                t.updated_at = utcnow()
+                await s.commit()
+
+        if cfg.policy_halt and verdict.halting:
+            try:
+                progress.pause_path().write_text(
+                    f"остановлено политикой: задача {task.id}, "
+                    f"{verdict.summary()}\n", encoding="utf-8")
+                log.critical("работа ОСТАНОВЛЕНА (файл PAUSED). Снять — руками, "
+                             "разобравшись, что произошло")
+            except OSError as e:
+                log.error("не смог поставить паузу по инциденту: %s", e)
+
+        await self._notify(f"⛔ Задача {task.id} «{task.title}»: "
+                           f"{verdict.summary()}.\n" + "\n".join(lines[:5]) +
+                           ("\nРабота остановлена, снять паузу — руками."
+                            if cfg.policy_halt and verdict.halting else ""))
+        return verdict
+
+    @staticmethod
+    async def _save_verdict(task_id: int, verdict) -> None:
+        """Записать СОСТАВ приёмки: чем именно задачу приняли.
+
+        Раньше он жил только в момент вызова и в логе. Через месяц по базе
+        нельзя было отличить задачу, закрытую пройденным тестом, от задачи,
+        закрытой единственной `http 200` на корне сайта, — хотя на этой
+        разнице стоит вся честность приёмки.
+        """
+        try:
+            async with Session() as s:
+                t = await s.get(Task, task_id)
+                if t is None:
+                    return
+                t.verdict = {
+                    "deterministic": int(getattr(verdict, "deterministic", 0) or 0),
+                    "assisted": int(getattr(verdict, "assisted", 0) or 0),
+                    "suspicious": int(getattr(verdict, "suspicious", 0) or 0),
+                    "tainted": int(len(getattr(verdict, "tainted", ()) or ())),
+                    "at": utcnow().isoformat(timespec="seconds"),
+                }
+                await s.commit()
+        except Exception:                               # noqa: BLE001
+            log.exception("состав приёмки задачи %s не записан", task_id)
+
+    async def _notify(self, text: str) -> None:
+        """Сказать владельцу. Молчаливая эскалация — самый дорогой исход цикла
+        и до этого единственный, о котором ему не сообщали."""
+        notify = getattr(self.communicator, "notify_owner", None)
+        if notify is None:
+            return
+        try:
+            await notify(text)
+        except Exception:                               # noqa: BLE001
+            log.exception("уведомление владельцу не ушло")
 
     async def _on_limit(self, task: Task, lane: str, exc) -> None:
         """Квота кончилась: задача возвращается в очередь нетронутой.
@@ -538,14 +742,53 @@ class Scheduler:
                          f"ничего не доказала — {verdict.why_unproven()}.{extra}\n"
                          f"Посмотреть — /show {task.id}, подтвердить — /confirm {task.id}")
 
-    async def _on_fail(self, lane: str, task: Task, project: Project, defects: list[str]) -> None:
-        needs_diagnosis = False
+    async def _on_fail(self, lane: str, task: Task, project: Project,
+                       defects: list[str], changed=None) -> None:
+        # Журнал попыток пишется ДО решения: по нему это решение и принимается.
+        # `Task.defects` затирается каждым заходом, поэтому четыре РАЗНЫХ
+        # дефекта и четыре ОДИНАКОВЫХ выглядели в базе одинаково.
+        note = str((task.diagnosis or {}).get("instruction") or "") \
+            if isinstance(task.diagnosis, dict) else ""
+        await log_attempt(task.id, project_id=project.id, lane=lane,
+                          outcome="failed", counted=True, defects=defects,
+                          sig=breaker.signature(defects), note=note,
+                          changed=list(changed.paths) if changed else [])
+
+        stalled = await self._stalled(task.id)
+
+        needs_diagnosis = escalated = False
         async with Session() as s:
             t = await s.get(Task, task.id)
             if t is None:
                 return
             t.attempts += 1
             t.defects = defects
+            if stalled is not None and t.attempts < cfg.max_attempts:
+                # Цикл стоит на месте, и это видно детерминированно — по
+                # повторяющейся подписи дефекта. Дальше повторять бессмысленно:
+                # задача 531 прошла так четыре круга подряд, каждый раз получая
+                # тот же промпт и тот же дефект, а причина была вообще не в
+                # работе агента — критерий не мог пройти НИКОГДА.
+                #
+                # Сюда попадаем только пока попытки ещё есть: когда они
+                # кончились, ниже отработает обычная эскалация, и заводить
+                # для неё второе имя незачем.
+                t.status = NEEDS_HUMAN
+                t.last_error = stalled.reason
+                t.updated_at = utcnow()
+                await s.commit()
+                log.warning("ЗАСТРЕВАНИЕ -> %s / %s: %s",
+                            project.title, t.title, stalled.reason)
+                await log_attempt(task.id, project_id=project.id, lane=lane,
+                                  outcome="stagnation", counted=False,
+                                  defects=[stalled.reason])
+                await self._notify(
+                    f"🔁 Задача {task.id} «{task.title}» топчется на месте.\n"
+                    f"{stalled.reason}\n"
+                    f"Посмотреть — /show {task.id}. Если критерий верен, верни "
+                    f"задачу агенту; если нет — правь критерий, машина его "
+                    f"не трогает.")
+                return
             if needs_human(defects):
                 # Проверять нечем — агент это не починит, сколько ни повторяй.
                 # Задача уходит человеку сразу, а не после MAX_ATTEMPTS попыток
@@ -553,6 +796,14 @@ class Scheduler:
                 t.updated_at = utcnow()
                 await s.commit()
                 log.warning("задача %s ждёт человека: %s", t.id, "; ".join(defects)[:200])
+                # Сказать вслух. До этой правки самый дорогой исход цикла был
+                # единственным, о котором владельцу НЕ сообщали: обе ветки
+                # («проверять нечем» и эскалация) только писали в лог, при том
+                # что менее срочное «нужно подтверждение» уведомление слало.
+                await self._notify(
+                    f"🔧 Задача {t.id} «{t.title}» ждёт тебя: проверить её "
+                    f"машиной нечем.\n" + "; ".join(defects)[:400] +
+                    f"\nПосмотреть — /show {t.id}")
                 return
             if t.attempts >= cfg.max_attempts:
                 # Эскалация останавливает ЗАДАЧУ, а не весь заказ.
@@ -576,6 +827,7 @@ class Scheduler:
                     p.updated_at = utcnow()
                 log.warning("ЭСКАЛАЦИЯ -> %s / %s (заказ продолжает работу "
                             "по остальным задачам)", project.title, t.title)
+                escalated = True
             else:
                 t.status = "ready"
                 if lane == "verify":
@@ -587,6 +839,15 @@ class Scheduler:
             t.updated_at = utcnow()
             await s.commit()
 
+        if escalated:
+            await log_attempt(task.id, project_id=project.id, lane=lane,
+                              outcome="escalated", counted=False, defects=defects)
+            await self._notify(
+                f"🛑 Задача {task.id} «{task.title}» в эскалации: "
+                f"{cfg.max_attempts} попытки подряд не прошли приёмку.\n" +
+                "; ".join(defects)[:400] +
+                f"\nЗаказ работает дальше по остальным задачам. "
+                f"Посмотреть — /show {task.id}")
         if needs_diagnosis:
             await self._diagnose(task, project, defects)
 

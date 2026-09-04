@@ -125,6 +125,12 @@ class Vault:
         """Только для маскирования логов. Наружу не отдавать."""
         return [v for v in self._read().values() if v]
 
+    def items(self) -> list[tuple[str, str]]:
+        """Пары имя-значение. Только для поиска утечек (`policy.leaked`),
+        которому нужно СКАЗАТЬ ИМЯ, найдя значение. Наружу не отдавать:
+        имя в отчёт попадает, значение — никогда."""
+        return [(k, v) for k, v in self._read().items() if v]
+
     def env_for(self, *texts: str) -> dict[str, str]:
         """Значения, которые надо положить в окружение процесса-исполнителя."""
         env: dict[str, str] = {}

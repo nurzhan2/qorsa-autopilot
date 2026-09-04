@@ -46,6 +46,16 @@ os.environ["LANE_BUILD_PER_PROJECT"] = "1"
 # и от сети. Свои тесты у crew есть, и они зовут заглушку явно
 os.environ["CREW_PROMPTER"] = "0"
 os.environ["CREW_DIAGNOSE"] = "0"
+# Новые пороги — ПИНУЕМ на умолчание по той же причине, что тихие часы и
+# LANE_BUILD_PER_PROJECT выше: иначе тест краснеет от того, что владелец
+# поднял значение у себя в .env. На эти грабли тут наступали уже дважды.
+os.environ["BREAKER_STAGNATION"] = "3"
+os.environ["BREAKER_FRUSTRATION"] = "2"
+os.environ["DAILY_CC_SESSIONS"] = "200"
+os.environ["EVIDENCE_TAINT"] = "1"
+os.environ["POLICY_CHECK"] = "1"
+os.environ["POLICY_HALT"] = "1"
+os.environ["WORKTRACE"] = "1"
 os.environ["OWNER_TG_ID"] = "777"
 # Компании берём из .env, а не из accounts.toml владельца: иначе тесты
 # начинают зависеть от того, какие юрлица он себе завёл
