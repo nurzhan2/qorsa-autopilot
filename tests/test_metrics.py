@@ -202,3 +202,27 @@ def test_missing_git_blocks_autonomy(monkeypatch):
     git = next(i for i in items if i.key == "git")
     assert not git.ok and git.blocking
     assert not readiness.ready(items)
+
+
+async def test_blind_spot_does_not_count_machine_sleep_as_work(db):
+    """`time.monotonic()` на Windows идёт и во сне машины: в живой базе лежат
+    «вызовы» на 6-7 часов, не сделавшие ни одного хода. Считать их работой —
+    та же ошибка, что однажды дала фантомные $33 и остановила потолок
+    на пустом месте.
+
+    Слепая минута считается работой только до самого длинного ИЗМЕРЕННОГО
+    вызова: дольше него настоящая работа не длилась ни разу.
+    """
+    p = await make_project()
+    [t] = await make_tasks(p.id, 1)
+    await add_run(t, cost=6.0, seconds=600)                      # 10 мин, измерено
+    await add_run(t, cost=0.0, seconds=300, estimated=True)      # 5 мин, правдоподобно
+    await add_run(t, cost=0.0, seconds=36000, estimated=True)    # 10 ч — сон машины
+
+    b = await metrics.blind_spot(30)
+    assert b["blind_minutes"] == 605.0            # честно: столько стенных часов
+    assert b["plausible_minutes"] == 15.0         # 5 + обрезанные до 10 мин
+    # Занижение считается по ПРАВДОПОДОБНЫМ минутам, а не по стенным часам:
+    # по стенным вышло бы 605 мин × $0.6 = $363, то есть «занижено в 61 раз».
+    # Такая цифра выглядит измерением и врёт больше, чем отсутствие цифры.
+    assert b["understated_x"] == 2.5

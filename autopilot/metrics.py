@@ -119,15 +119,42 @@ async def blind_spot(days: int = 30) -> dict:
             select(Run.cost_estimated, Run.cost_usd, Run.seconds)
             .where(Run.started_at >= since, Run.kind == "execute"))).all()
 
-    total_min = sum(float(sec or 0) for _, _, sec in rows) / 60
-    blind_min = sum(float(sec or 0) for est, _, sec in rows if est) / 60
-    blind_usd = sum(float(cost or 0) for est, cost, _ in rows if est)
+    def is_blind(est, cost):
+        return bool(est) or not float(cost or 0)
+
+    measured = [(float(c or 0), float(s or 0) / 60) for e, c, s in rows
+                if not is_blind(e, c)]
+    blind = [float(s or 0) / 60 for e, c, s in rows if is_blind(e, c)]
+    total_min = sum(m for _, m in measured) + sum(blind)
+
+    # ПОТОЛОК ПРАВДОПОДОБИЯ. Длительность слепого вызова — это стенные часы,
+    # а `time.monotonic()` на Windows идёт и во сне машины: в базе лежат
+    # «вызовы» на 420, 377 и 276 минут, которые не сделали ни одного хода.
+    # Считать их работой — та же ошибка, что однажды дала фантомные $33
+    # за прогон и остановила суточный потолок на пустом месте.
+    #
+    # Поэтому слепая минута считается работой только до самого длинного
+    # ИЗМЕРЕННОГО вызова: дольше него настоящая работа не длилась ни разу.
+    cap = max((m for _, m in measured), default=0.0)
+    rate = (sum(c for c, _ in measured) / sum(m for _, m in measured)
+            if measured and sum(m for _, m in measured) else 0.0)
+    plausible = sum(min(m, cap) for m in blind) if cap else 0.0
+    hidden_usd = plausible * rate
+    known_usd = sum(c for c, _ in measured)
+
     return {"runs": len(rows),
-            "blind_runs": sum(1 for est, _, _ in rows if est),
+            "blind_runs": len(blind),
             "minutes": round(total_min, 1),
-            "blind_minutes": round(blind_min, 1),
-            "blind_usd": round(blind_usd, 2),
-            "blind_time_pct": _pct(blind_min, total_min)}
+            "blind_minutes": round(sum(blind), 1),
+            # сколько из них правдоподобны как работа, а не как сон машины
+            "plausible_minutes": round(plausible, 1),
+            "blind_usd": round(sum(c for c, m in measured if False), 2),
+            "blind_time_pct": _pct(sum(blind), total_min),
+            # ВО СКОЛЬКО РАЗ занижен денежный счётчик. Оценка снизу-сверху,
+            # а не замер: цену оборванного вызова не знает никто
+            "hidden_usd": round(hidden_usd, 2),
+            "understated_x": round((known_usd + hidden_usd) / known_usd, 1)
+            if known_usd else 0.0}
 
 
 async def cost_per_task() -> dict:

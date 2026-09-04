@@ -655,16 +655,18 @@ async def recover_orphan_tasks() -> int:
         return res.rowcount
 
 
-# Виды вызовов, которые считает третий потолок. ВСЕ, а не только сессии
-# агента: пятичасовое окно подписки едят одинаково и бриф, и план, и судья,
-# и подготовка задания. Первая версия считала один `execute` — и потолок
-# не видел двух третей расхода. Замерено на живой базе: пик за скользящие
-# сутки 58 сессий агента против 116 вызовов всего.
-BILLED_KINDS = ("execute", "plan", "brief", "judge", "prompt", "diagnose")
-
-
-async def sessions_today(kinds: tuple[str, ...] = BILLED_KINDS) -> int:
+async def sessions_today(kinds: tuple[str, ...] | None = None) -> int:
     """Сколько ВЫЗОВОВ модели заведено за последние 24 часа.
+
+    **Без белого списка видов, и это осознанно.** Первая версия считала один
+    `execute` и не видела двух третей расхода; вторая перечисляла шесть видов
+    поимённо — но такой список ОТСТАЁТ: заведут седьмой вид, и потолок молча
+    перестанет его замечать, ровно как случилось с первой версией.
+
+    Считать можно всё, потому что строка `Run` заводится ТОЛЬКО вокруг вызова
+    модели — пять мест на весь проект (`brief`, `plan`, `execute`, `judge`,
+    `crew`). Не-модельных строк в этой таблице не бывает по построению,
+    и фильтровать нечего.
 
     **Третий счётчик, и единственный, который не врёт при `cost_usd=0`.**
     Оба денежных потолка сравнивают СУММЫ СТОИМОСТИ, а у оборванного вызова
@@ -678,9 +680,10 @@ async def sessions_today(kinds: tuple[str, ...] = BILLED_KINDS) -> int:
     """
     since = utcnow() - dt.timedelta(hours=24)
     async with Session() as s:
-        return int((await s.execute(
-            select(func.count()).select_from(Run)
-            .where(Run.started_at >= since, Run.kind.in_(kinds)))).scalar() or 0)
+        q = select(func.count()).select_from(Run).where(Run.started_at >= since)
+        if kinds:
+            q = q.where(Run.kind.in_(kinds))
+        return int((await s.execute(q)).scalar() or 0)
 
 
 # Сколько путей влезает в одну строку журнала. Список нужен человеку и
