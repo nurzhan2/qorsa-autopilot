@@ -304,3 +304,25 @@ def anthropic_key(source: Vault | None = None) -> str | None:
 
 def anthropic_key_source(source: Vault | None = None) -> str:
     return resolve_secret("ANTHROPIC_API_KEY", source)[1]
+
+
+class SecretLeak(RuntimeError):
+    """В промпт попало значение из хранилища. Запрос не отправляется."""
+
+
+def assert_no_secrets(prompt: str, source: Vault | None = None) -> None:
+    """Последний рубеж перед вызовом модели: значения из хранилища наружу
+    не уходят никогда.
+
+    Живёт здесь, а не в brief.py, куда было написано первым: проверка про
+    ХРАНИЛИЩЕ, а не про бриф, и оттуда её не мог позвать верификатор —
+    brief импортирует verifier, и получался круг. Дыра из-за этого была
+    настоящая: диф, уходящий судье, — это фактически весь проект,
+    и он единственный из трёх промптов уходил в модель непроверенным.
+    """
+    v = source or vault
+    if not v.enabled:
+        return
+    for value in v.values():
+        if len(value) >= MIN_MASKABLE_LEN and value in prompt:
+            raise SecretLeak("в промпте оказалось значение из хранилища")

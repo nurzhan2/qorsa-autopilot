@@ -39,6 +39,7 @@ from .config import cfg
 from . import llm
 from .llm import LimitReached
 from .db import Project, Session, Task, close_run, open_run, service_task, utcnow
+from .vault import assert_no_secrets
 from .verifier import parse_judge_json
 
 log = logging.getLogger("crew")
@@ -112,6 +113,12 @@ async def _ask(prompt: str, system: str, project_id: int, kind: str,
     значит потерять их из учёта: суточный потолок перестанет видеть часть
     расхода ровно тогда, когда задача застряла и разборы пошли один за другим.
     """
+    # Тот же рубеж, что у брифа, плана и судьи. Эти два вызова уходят к модели
+    # ЧАЩЕ всех остальных (на живой базе 41 подготовка задания и 18 разборов
+    # против одного вызова судьи), а промпт у них — текст задачи и дефекты,
+    # то есть вывод упавших команд. Закрыть судью и оставить эти два значило бы
+    # закрыть меньшую дыру и не заметить большую.
+    assert_no_secrets(prompt)
     b = backend or _backend()
     task_id = await service_task(project_id, f"служебное: {kind}")
     run_id = await open_run(task_id, kind)

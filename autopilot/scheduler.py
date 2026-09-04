@@ -473,6 +473,7 @@ class Scheduler:
                     await log_attempt(task.id, project_id=project.id, lane="build",
                                       outcome="built", counted=False,
                                       changed=list(changed.paths) if changed else [],
+                                      touched=list(changed.touched) if changed else [],
                                       seconds=(utcnow() - started).total_seconds())
                     await self._set_status(task.id, "ready", lane="verify")
             elif lane == "verify":
@@ -604,7 +605,8 @@ class Scheduler:
                      task.id, task.title, "; ".join(lines)[:500])
         await log_attempt(task.id, project_id=project.id, lane="build",
                           outcome="policy", counted=False, defects=lines,
-                          changed=list(changed.paths))
+                          changed=list(changed.paths),
+                          touched=list(changed.touched))
         async with Session() as s:
             t = await s.get(Task, task.id)
             if t is not None:
@@ -752,7 +754,8 @@ class Scheduler:
         await log_attempt(task.id, project_id=project.id, lane=lane,
                           outcome="failed", counted=True, defects=defects,
                           sig=breaker.signature(defects), note=note,
-                          changed=list(changed.paths) if changed else [])
+                          changed=list(changed.paths) if changed else [],
+                          touched=list(changed.touched) if changed else [])
 
         stalled = await self._stalled(task.id)
 

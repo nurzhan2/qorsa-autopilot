@@ -20,13 +20,16 @@ from .checks import suspicious as suspicious_reason
 from .config import cfg
 from . import appserver
 from . import autonomy
+from . import evidence
 from . import llm
 from . import projectdir
 from . import toolchain
 from .llm import LLMError
 from .textenc import decode_console
-from .db import AccessItem, Project, Session, Task, close_run, open_run
-from .vault import anthropic_key, missing_secret_message, vault
+from .db import (AccessItem, Project, Session, Task, attempts_of, close_run,
+                 open_run)
+from .vault import (SecretLeak, anthropic_key, assert_no_secrets,
+                    missing_secret_message, vault)
 
 log = logging.getLogger("verify")
 
@@ -116,6 +119,12 @@ class Verdict:
     deferred: tuple[str, ...] = ()
     # каких именно ключей не хватило — по ним задача вернётся на приёмку
     deferred_keys: tuple[str, ...] = ()
+    # Проверки, ПОТЕРЯВШИЕ ДОКАЗАТЕЛЬНОСТЬ: их предмет переписал сам агент.
+    # Исполняются как обычно и, если падают, дают нормальный дефект — но
+    # доказательством больше не считаются. Это единственное место приёмки,
+    # где право закрыть задачу фактически было отдано проверяемому: ослабить
+    # собственный тест — законный путь к exit=0, то есть к автозакрытию
+    tainted: tuple[str, ...] = ()
 
     @property
     def confirmed(self) -> bool:
@@ -161,6 +170,9 @@ class Verdict:
         if self.suspicious:
             parts.append(f"критериев, которые пройдут и без этой задачи: "
                          f"{self.suspicious}")
+        if self.tainted:
+            parts.append(f"проверок, чей предмет правил сам агент: "
+                         f"{len(self.tainted)}")
         if not parts:
             parts.append("исполнимых проверок нет")
         return "; ".join(parts)
@@ -553,12 +565,21 @@ class Verifier:
         observations: list[str] = []
         deferred: list[str] = []
         deferred_keys: list[str] = []
+        tainted: list[str] = []
         executed = 0
         deterministic = 0
         assisted = 0
         suspicious = 0
 
-        for check in task.acceptance or []:
+        # Какие критерии перестали быть доказательством, потому что их предмет
+        # переписал проверяемый. Считается НАКОПИТЕЛЬНО по всем сборкам задачи:
+        # цикл идёт build -> verify -> fail -> build -> verify, и если тест
+        # ослаблен на первом круге, а второй его не трогал, то по «последней
+        # сборке» пятна не было бы видно — механизм закрывал бы дыру ровно
+        # один раз, а дальше пропускал
+        spoiled = await self._spoiled(task)
+
+        for index, check in enumerate(task.acceptance or []):
             if not isinstance(check, dict):
                 defects.append(f"кривой критерий приёмки: {check!r}")
                 continue
@@ -627,7 +648,15 @@ class Verifier:
                 # `http 200` на корне сайта проходит и на пустом хостинге:
                 # засчитывать её за доказательство значит закрывать задачу
                 # по критерию, который не заметил бы её невыполнения
-                if suspicious_reason(check):
+                spoil = spoiled.get(id(check)) or spoiled.get(index)
+                if spoil:
+                    # Проверку правил тот, кого она проверяет. Ослабить свой
+                    # тест — законный путь к exit=0, то есть к автозакрытию:
+                    # это единственное место приёмки, где право закрыть задачу
+                    # фактически отдано проверяемому. Задача от этого НЕ
+                    # проваливается — она перестаёт закрываться сама
+                    tainted.append(evidence.note(spoil))
+                elif suspicious_reason(check):
                     suspicious += 1
                 else:
                     deterministic += 1
@@ -649,11 +678,38 @@ class Verifier:
             # приёмки (планировщик и ручная отметка) однажды забудет это
             # сделать, и замечания судьи пропадут ровно там, где их не видно
             await self._save_observations(task, notes)
+        if tainted:
+            log.warning("задача %s: %s проверок потеряли доказательность — "
+                        "их предмет правил агент", task.id, len(tainted))
         return Verdict(ok=not defects, defects=defects,
                        deterministic=deterministic, assisted=assisted,
                        suspicious=suspicious, observations=notes,
                        deferred=tuple(dict.fromkeys(deferred)),
-                       deferred_keys=tuple(dict.fromkeys(deferred_keys)))
+                       deferred_keys=tuple(dict.fromkeys(deferred_keys)),
+                       tainted=tuple(dict.fromkeys(tainted)))
+
+    @staticmethod
+    async def _spoiled(task: Task) -> dict:
+        """Критерии, чей предмет переписал сам агент, — по индексу критерия.
+
+        Файлы берутся из журнала попыток НАКОПИТЕЛЬНО: только `modified`
+        и `deleted`, без `created`. Написать тест — это работа, ради которой
+        задачу и заводили; переписать существующий — потеря доказательства.
+
+        Ошибка чтения журнала не должна ронять приёмку: без него просто
+        не будет пятен, и всё работает как раньше.
+        """
+        if not cfg.evidence_taint:
+            return {}
+        try:
+            rows = await attempts_of(task.id, counted_only=False)
+        except Exception:                               # noqa: BLE001
+            log.exception("журнал попыток задачи %s не прочитан", task.id)
+            return {}
+        touched: set[str] = set()
+        for row in rows:
+            touched.update(str(c) for c in (row.touched or []))
+        return evidence.review(task.acceptance, touched) if touched else {}
 
     async def _save_observations(self, task: Task, notes: tuple[str, ...]) -> None:
         """Замечания вне критерия — владельцу, а не в никуда.
@@ -947,6 +1003,19 @@ class Verifier:
             diff=diff[:60000],
             report=task.last_error or "—",
         )
+        # ПЕРЕД вызовом — та же проверка, что у брифа и плана (`brief.py:355`).
+        # Дыра тут была настоящая и самая большая из оставшихся: диф в
+        # репозитории без коммитов после `git add -N .` — это фактически весь
+        # проект, обрезанный до 60000 символов, и уходил он в модель без
+        # единой проверки. Вход в модель стерегли в двух местах из трёх.
+        try:
+            assert_no_secrets(msg)
+        except SecretLeak:
+            log.critical("в промпте судьи оказалось значение из хранилища — "
+                         "задача %s, вызов НЕ отправлен", task.id)
+            return False, ("судья не вызван: в дифе оказался секрет из хранилища. "
+                           "Убери значение из кода — оно должно приходить "
+                           "переменной окружения"), []
         reply = await self._ask(task, project, prompt=msg, max_tokens=JUDGE_MAX_TOKENS)
         raw = reply.text
         data, extracted = parse_judge_json(raw, require=("verdict",))

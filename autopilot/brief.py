@@ -48,7 +48,8 @@ from . import llm
 from .llm import LimitReached
 from .roles import CLIENT, OWNER
 from .verifier import parse_judge_json
-from .vault import MIN_MASKABLE_LEN, anthropic_key, missing_secret_message, ref, refs_in
+from .vault import (MIN_MASKABLE_LEN, SecretLeak, anthropic_key,  # noqa: F401
+                    assert_no_secrets, missing_secret_message, ref, refs_in)
 from .vault import vault as default_vault
 
 log = logging.getLogger("brief")
@@ -335,10 +336,6 @@ confidence — НАСКОЛЬКО ПОНЯТНА САМА ЗАДАЧА, а не 
 проекта отвечает поле blocking у вопросов, а не эта цифра."""
 
 
-class SecretLeak(RuntimeError):
-    """В промпт попало значение из хранилища. Запрос не отправляется."""
-
-
 class BriefFailed(RuntimeError):
     """Модель дважды не смогла отдать валидный ответ."""
 
@@ -350,15 +347,6 @@ def empty_brief() -> dict:
     for f in REFERENCE_FIELDS:
         data[f] = None
     return data
-
-
-def assert_no_secrets(prompt: str, vault=None) -> None:
-    v = vault or default_vault
-    if not v.enabled:
-        return
-    for value in v.values():
-        if len(value) >= MIN_MASKABLE_LEN and value in prompt:
-            raise SecretLeak("в промпте оказалось значение из хранилища")
 
 
 def _msg_key(m: ChatMessage) -> str:

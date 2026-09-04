@@ -12,12 +12,13 @@ from sqlalchemy import select
 
 from .config import cfg
 from . import autonomy
+from . import breaker
 from . import crew
 from . import guard
 from . import llm
 from . import projectdir
-from .db import (AccessItem, Project, Session, Task, close_run, open_run,
-                 utcnow)
+from .db import (AccessItem, Project, Session, Task, attempts_of, close_run,
+                 open_run, utcnow)
 from .textenc import decode_console
 from .vault import refs_in, to_env_names, vault
 
@@ -46,11 +47,33 @@ SYSTEM_RULES = """Ты работаешь автономно, человека �
   Ставить зависимости ПРОЕКТА (pip install в .venv, pub get) — можно и нужно
 - Доступы лежат в переменных окружения ($ИМЯ). Бери их оттуда и НИКОГДА
   не печатай значения, не пиши их в файлы и не коммить
+- НЕ ОСЛАБЛЯЙ ПРОВЕРКИ, КОТОРЫМИ ТЕБЯ ПРОВЕРЯЮТ. Тест, который назван
+  в критерии приёмки, — это и есть приёмка. Переписать его так, чтобы он
+  проходил, значит подделать результат: код видит, какие файлы ты изменил,
+  и проверка, чей файл ты правил, доказательством считаться перестаёт.
+  Не сходится тест — чини код или напиши в отчёте, что критерий неверен
 - В конце выведи короткий отчёт: что сделано, что не сделано, почему
 """
 
+# Сколько строк дефекта доходит до промпта. Режем СЕРЕДИНУ, а не хвост:
+# у питоновского трейсбэка полезная часть — строка исключения — стоит В КОНЦЕ,
+# и обрезка «первые N строк» срезала бы ровно её. Этот проект уже платил
+# за обрезку входа по неверному признаку: 4 пункта ТЗ вместо 33 на живой
+# переписке, потому что резали по количеству, а не по содержательности.
+DEFECT_HEAD, DEFECT_TAIL = 4, 8
 
-def _raw_prompt(task: Task, project: Project, brief: str | None = None) -> str:
+
+def _short(text: str) -> str:
+    lines = str(text or "").splitlines()
+    if len(lines) <= DEFECT_HEAD + DEFECT_TAIL:
+        return str(text or "")
+    cut = len(lines) - DEFECT_HEAD - DEFECT_TAIL
+    return "\n".join([*lines[:DEFECT_HEAD], f"  … ({cut} строк вырезано) …",
+                      *lines[-DEFECT_TAIL:]])
+
+
+def _raw_prompt(task: Task, project: Project, brief: str | None = None,
+                tried: str = "") -> str:
     parts = [SYSTEM_RULES, f"# Проект\n{project.title} (клиент: {project.client})"]
     if getattr(project, "autonomous_mode", False):
         # Без этого блока агент получает заглушку, видит отказ внешнего
@@ -64,7 +87,18 @@ def _raw_prompt(task: Task, project: Project, brief: str | None = None) -> str:
         parts.append("# Критерии приёмки (должны пройти)\n" +
                      json.dumps(task.acceptance, ensure_ascii=False, indent=2))
     if task.defects:
-        parts.append("# Дефекты предыдущей итерации — ИСПРАВЬ ИХ\n- " + "\n- ".join(task.defects))
+        parts.append("# Дефекты предыдущей итерации — ИСПРАВЬ ИХ\n- " +
+                     "\n- ".join(_short(d) for d in task.defects))
+    # Что уже пробовали. Раньше агент видел дефекты ТОЛЬКО последней итерации
+    # и не знал, что три захода назад ломился ровно туда же. Блок собирается
+    # кодом из журнала попыток и не стоит ни одного вызова модели — в отличие
+    # от разбора ниже, который платит окном подписки.
+    #
+    # Отдельным блоком, а не внутри разбора, намеренно: `instruction_block`
+    # отдаётся только при вердикте `work_wrong`, и при `criterion_wrong`
+    # история попыток до агента не доехала бы вовсе.
+    if tried:
+        parts.append(tried)
     # Выводы разбора застрявшей задачи. Задача 531 четыре раза подряд упала
     # с одним и тем же дефектом, получая каждый раз один и тот же промпт:
     # список дефектов без объяснения, почему предыдущая починка не сработала,
@@ -77,14 +111,15 @@ def _raw_prompt(task: Task, project: Project, brief: str | None = None) -> str:
     return "\n\n".join(parts)
 
 
-def build_prompt(task: Task, project: Project, brief: str | None = None) -> str:
+def build_prompt(task: Task, project: Project, brief: str | None = None,
+                 tried: str = "") -> str:
     """Промпт, который реально уходит агенту.
 
     Значений секретов здесь нет и быть не может: ссылки {{SECRET:NAME}}
     превращаются в имена переменных окружения $NAME, а сами значения
     попадают в процесс через env= у subprocess.
     """
-    return to_env_names(_raw_prompt(task, project, brief))
+    return to_env_names(_raw_prompt(task, project, brief, tried))
 
 
 # Сессия CLI кончилась или её нет. Это состояние УСТАНОВКИ, а не задачи:
@@ -135,7 +170,8 @@ class Executor:
         # не понимает, какого поведения от него хотят. Не собралось — работаем
         # как раньше, без него: это подсказка, а не условие работы
         brief = await crew.Prompter().brief_for(task, project)
-        raw = _raw_prompt(task, project, brief)
+        tried = await self._tried_block(task)
+        raw = _raw_prompt(task, project, brief, tried)
         prompt = to_env_names(raw)
         env = await self._secret_env(raw, project)
 
@@ -298,6 +334,23 @@ class Executor:
 
         log.info("task %s done in %.0fs / $%.3f", task.id, elapsed, cost)
         return data
+
+    @staticmethod
+    async def _tried_block(task: Task) -> str:
+        """«Что уже пробовал — не повторяй», собранное кодом из журнала попыток.
+
+        Подсказка, а не условие работы: не собралось — агент получает обычный
+        промпт, как раньше. Ловим широко намеренно, по образцу `crew.Prompter`:
+        уронить сборку из-за подсказки нельзя.
+        """
+        try:
+            rows = await attempts_of(task.id, counted_only=True)
+            return breaker.tried_block(
+                [breaker.Attempt(n=r.n, lane=r.lane, defects=list(r.defects or []),
+                                 sig=r.sig, note=r.note) for r in rows])
+        except Exception as e:                          # noqa: BLE001
+            log.warning("история попыток задачи %s не собрана: %s", task.id, e)
+            return ""
 
     async def _secret_env(self, raw_prompt: str, project: Project) -> dict[str, str]:
         """Окружение процесса: своё + значения секретов проекта.

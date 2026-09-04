@@ -251,6 +251,13 @@ class TaskAttempt(Base):
     # Пусто — значит слепок снять не удалось, а не «ничего не менял»
     changed: Mapped[list[str]] = mapped_column(JSON, default=list,
                                                server_default=text("'[]'"))
+    # Из них — только ПЕРЕПИСАННОЕ и УДАЛЁННОЕ, без созданного. Отдельно,
+    # потому что смысл разный: создать файл теста — это работа, ради которой
+    # задачу заводили, а переписать существующий — потеря доказательства
+    # (см. evidence.py). Слить их в один список значило бы объявить пятном
+    # любую задачу, которая пишет тесты, то есть почти любую хорошую.
+    touched: Mapped[list[str]] = mapped_column(JSON, default=list,
+                                               server_default=text("'[]'"))
     seconds: Mapped[float] = mapped_column(default=0.0, server_default=text("0"))
     at: Mapped[dt.datetime] = mapped_column(default=utcnow,
                                             server_default=text("CURRENT_TIMESTAMP"))
@@ -672,6 +679,7 @@ async def log_attempt(task_id: int, *, project_id: int = 0, lane: str = "build",
                       outcome: str = "failed", counted: bool = True,
                       defects: list[str] | None = None, sig: str = "",
                       note: str = "", changed: list[str] | None = None,
+                      touched: list[str] | None = None,
                       seconds: float = 0.0) -> int:
     """Дописать заход в журнал попыток. Номер считается по самому журналу.
 
@@ -688,7 +696,8 @@ async def log_attempt(task_id: int, *, project_id: int = 0, lane: str = "build",
                 task_id=task_id, project_id=project_id, n=n, lane=lane,
                 outcome=outcome, counted=counted,
                 defects=[str(d) for d in (defects or [])], sig=sig, note=note,
-                changed=[str(c) for c in (changed or [])], seconds=seconds)
+                changed=[str(c) for c in (changed or [])],
+                touched=[str(c) for c in (touched or [])], seconds=seconds)
             s.add(row)
             await s.commit()
             return row.id
