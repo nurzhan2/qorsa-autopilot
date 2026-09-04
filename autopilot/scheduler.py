@@ -435,6 +435,7 @@ class Scheduler:
 
     async def _work(self, lane: str, task: Task, project: Project, exclusive: bool) -> None:
         started = utcnow()
+        cancelled = False
         try:
             if lane == "build":
                 # База сравнения — ДО работы. Без неё первый же неподнятый
@@ -502,6 +503,7 @@ class Scheduler:
                 await self.communicator.process(task, project)
                 await self._set_status(task.id, "done")
         except asyncio.CancelledError:
+            cancelled = True
             raise
         except LimitReached as e:
             # Упор в квоту — НЕ провал задачи. Попытку не засчитываем и
@@ -531,10 +533,16 @@ class Scheduler:
                     del self.busy_projects[lane][project.id]
                 self.busy_paths.pop(task.id, None)
             self.running[lane] -= 1
-            try:
-                await self._charge_done(project.id, minutes)
-            except Exception:
-                log.exception("не смог списать время project %s", project.id)
+            # Списание — только если нас НЕ отменяют. При отмене процесс
+            # останавливается, база уже может закрываться, а счётчик WFQ
+            # в этот момент не решает ничего: он про очерёдность внутри
+            # работающего цикла. Попытка сходить в базу на выходе оставляла
+            # висящий запрос в потоке aiosqlite.
+            if not cancelled:
+                try:
+                    await self._charge_done(project.id, minutes)
+                except Exception:
+                    log.exception("не смог списать время project %s", project.id)
 
     @staticmethod
     async def _stalled(task_id: int):

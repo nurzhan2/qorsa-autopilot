@@ -4,7 +4,7 @@ import asyncio
 import logging
 import sys
 
-from . import accounts, roles
+from . import accounts, readiness, roles
 from .brief import Brief, BriefRunner
 from .communicator import Communicator
 from .config import cfg
@@ -97,6 +97,16 @@ def build_transports(companies) -> list:
 
 async def main() -> None:
     await init_db()
+
+    # Чего не хватает установке — СРАЗУ, а не после сессии агента.
+    #
+    # Раньше это выяснялось провалом задачи в самой дорогой форме: агент
+    # отработал шесть минут, приёмка упала, задача ушла человеку — и только
+    # тогда стало видно, что на машине нет браузера. А без git приёмка и вовсе
+    # не жаловалась: судья получал пустой диф и честно судил пустоту.
+    for item in readiness.problems():
+        level = log.error if item.blocking else log.warning
+        level("%s: %s → %s", item.title, item.what, item.fix)
 
     # Компании — до всего остального: на них завязаны проекты, транспорты
     # и таблицы. Конфиг источник правды, таблица accounts — его зеркало
