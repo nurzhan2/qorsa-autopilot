@@ -41,6 +41,28 @@ CONFIRM_HINT = "/confirm"
 GROUP_TYPES = ("group", "supergroup", "chat")
 
 
+def _from_owner(msg: InboundMessage, sender_role: str = "") -> bool:
+    """Команду `/bind`, `/done`, `/confirm` прислал именно владелец.
+
+    Раньше здесь стояло `str(msg.chat_id) != str(cfg.tg_owner)`, и это был
+    ОБРАТНЫЙ КОНЕЦ той же поломки, что в `communicator.notify_owner`:
+    глобальный `TG_OWNER_CHAT_ID` пуст, id владельца живёт по компаниям.
+    Значит ни одна команда владельца не срабатывала НИКОГДА — при том что
+    текст уведомления дословно говорит «подтвердить — /confirm 17».
+    Починить только выход значило бы выдать инструкцию, которая не работает.
+
+    Роль уже посчитана парой (компания, отправитель) в `roles.remember`
+    до вызова обработчиков, и это точнее прежней проверки: она сравнивала
+    ЧАТ, а роль сравнивает того, КТО НАПИСАЛ. Отличие видно в группе —
+    владелец может закрыть задачу из рабочего чата, а не только из лички.
+
+    `cfg` остаётся запасным вариантом для установки без `accounts.toml`.
+    """
+    if sender_role == roles.OWNER:
+        return True
+    return bool(cfg.tg_owner) and str(msg.chat_id) == str(cfg.tg_owner)
+
+
 def is_group(msg: InboundMessage) -> bool:
     return (msg.chat_type or "").lower() in GROUP_TYPES
 
@@ -211,11 +233,11 @@ class Ingest:
                           msg.transport, msg.chat_id, msg.message_id)
                 return await self._existing(msg)
 
-        if await self._maybe_bind_command(msg):
+        if await self._maybe_bind_command(msg, sender_role):
             return row
-        if await self._maybe_done_command(msg):
+        if await self._maybe_done_command(msg, sender_role):
             return row
-        if await self._maybe_confirm_command(msg):
+        if await self._maybe_confirm_command(msg, sender_role):
             return row
 
         if project_id is None:
@@ -391,10 +413,11 @@ class Ingest:
         log.info("чат %s:%s привязан к проекту %s вручную", transport, chat_id, project_id)
         return True
 
-    async def _maybe_bind_command(self, msg: InboundMessage) -> bool:
+    async def _maybe_bind_command(self, msg: InboundMessage,
+                                  sender_role: str = "") -> bool:
         """`/bind 7` от владельца привязывает последний неопознанный чат."""
         text = (msg.text or "").strip()
-        if not text.startswith(BIND_HINT) or str(msg.chat_id) != str(cfg.tg_owner):
+        if not text.startswith(BIND_HINT) or not _from_owner(msg, sender_role):
             return False
         parts = text.split()
         if len(parts) < 2 or not parts[1].isdigit():
@@ -408,7 +431,8 @@ class Ingest:
             self._last_unbound = None
         return ok
 
-    async def _maybe_done_command(self, msg: InboundMessage) -> bool:
+    async def _maybe_done_command(self, msg: InboundMessage,
+                                       sender_role: str = "") -> bool:
         """`/done 17` от владельца: отметить ручную задачу и сразу проверить.
 
         Ровно та же схема, что у агента: человек говорит «сделал», критерии
@@ -416,7 +440,7 @@ class Ingest:
         система для них бесполезна.
         """
         text = (msg.text or "").strip()
-        if not text.startswith(DONE_HINT) or str(msg.chat_id) != str(cfg.tg_owner):
+        if not text.startswith(DONE_HINT) or not _from_owner(msg, sender_role):
             return False
         parts = text.split()
         if len(parts) < 2 or not parts[1].isdigit():
@@ -433,7 +457,8 @@ class Ingest:
             await self._warn_owner(f"Задача {parts[1]} НЕ принята:\n{body}")
         return True
 
-    async def _maybe_confirm_command(self, msg: InboundMessage) -> bool:
+    async def _maybe_confirm_command(self, msg: InboundMessage,
+                                          sender_role: str = "") -> bool:
         """`/confirm 17` от владельца: закрыть задачу, которую машина не приняла.
 
         Отдельная команда, а не флаг у `/done`, именно потому, что это другое
@@ -442,7 +467,7 @@ class Ingest:
         Смешать их значит стереть разницу, ради которой всё это заводилось.
         """
         text = (msg.text or "").strip()
-        if not text.startswith(CONFIRM_HINT) or str(msg.chat_id) != str(cfg.tg_owner):
+        if not text.startswith(CONFIRM_HINT) or not _from_owner(msg, sender_role):
             return False
         parts = text.split()
         if len(parts) < 2 or not parts[1].isdigit():

@@ -95,6 +95,51 @@ def build_transports(companies) -> list:
     return transports
 
 
+async def check_owner_reachable(communicator, companies) -> list[str]:
+    """Может ли бот компании ВООБЩЕ написать своему владельцу.
+
+    Проверка не про настройку, а про Telegram: **бот не может написать
+    первым тому, кто не нажал у него Start**. Пока этого не сделано,
+    `sendMessage` возвращает 400 «chat not found», `notify_owner` пишет
+    строку в лог, а очередь считает такой отказ неисправимым и ОТМЕНЯЕТ
+    сообщение (`_permanent_failure`). Снаружи это выглядит как тишина.
+
+    Проверено живьём 05.09: оба бота подняты и отвечают на `getMe`, и
+    ни один из них не имеет чата ни с одним id владельца. То есть шесть
+    дней молчания по проекту 8 объясняются не только пустым `cfg.tg_owner`,
+    но и этим — и второе кодом не чинится вовсе.
+
+    `getChat` только читает. Держим отдельно от `readiness.problems()`
+    намеренно: тот принципиально ничего не запускает и в сеть не ходит,
+    а диагностика, которая роняет то, что диагностирует, хуже отсутствующей.
+    """
+    broken = []
+    for acc in companies:
+        transport = communicator.transport_for(acc.code, "telegram")
+        chat = acc.owner_ids.get("telegram", "")
+        if transport is None:
+            continue
+        if not chat:
+            log.error("у компании %s не задан owner_tg_id — уведомления по её "
+                      "заказам писать некуда", acc.code)
+            broken.append(acc.code)
+            continue
+        try:
+            await transport.call("getChat", chat_id=chat)
+        except Exception as e:                                  # noqa: BLE001
+            # НЕ str(e): у httpx в тексте исключения лежит URL, а в URL — токен
+            resp = getattr(e, "response", None)
+            why = f"{getattr(resp, 'status_code', type(e).__name__)}"
+            log.error("НЕ МОГУ ПИСАТЬ ВЛАДЕЛЬЦУ компании %s (%s): бот %s не имеет "
+                      "чата с %s (%s). Открой этого бота в Telegram с аккаунта "
+                      "владельца и нажми Start — до этого ни одно уведомление "
+                      "не дойдёт", acc.code, acc.title, acc.bot_token_ref, chat, why)
+            broken.append(acc.code)
+        else:
+            log.info("владелец компании %s достижим: чат %s", acc.code, chat)
+    return broken
+
+
 async def main() -> None:
     await init_db()
 
@@ -124,7 +169,11 @@ async def main() -> None:
         log.warning("вернул в очередь %s задач, зависших в running после прошлого запуска", orphans)
 
     transports = build_transports(companies) if cfg.ingest_enabled else []
-    communicator = Communicator(transports=transports)
+    # accounts= обязателен: без него Communicator знает бота компании, но не
+    # знает АДРЕСА её владельца, и все уведомления уходят в лог
+    communicator = Communicator(transports=transports, accounts=companies)
+    if transports:
+        await check_owner_reachable(communicator, companies)
     executor, verifier = build_stack()
     sched = Scheduler(executor, verifier, communicator)
 

@@ -154,11 +154,27 @@ def in_quiet_hours(now_local: dt.datetime | None = None) -> bool:
     return h >= cfg.quiet_start or h < cfg.quiet_end
 
 
-def internal_recipient(msg_route: str) -> str:
-    """Свои живут в Telegram обычным ботом, без бизнес-соединения."""
+def internal_recipient(msg_route: str, owner: str = "", manager: str = "") -> str:
+    """Свои живут в Telegram обычным ботом, без бизнес-соединения.
+
+    Адрес приходит АРГУМЕНТОМ, а не берётся из глобала. Глобальный
+    `TG_OWNER_CHAT_ID` — наследие одноаккаунтной версии, и он пуст: id
+    владельца живёт по компаниям в `accounts.toml`. Пока это читалось
+    из `cfg`, ВСЯ очередь к владельцу — коммерция клиента, техника,
+    эскалации — уходила в литерал «OWNER» и оседала в логе. Шесть дней
+    тишины по проекту 8 никто не заметил именно поэтому.
+
+    `cfg` остаётся запасным вариантом: установка без `accounts.toml`
+    обязана продолжать работать, и там владелец задан именно так.
+    """
     if msg_route == TO_OWNER:
-        return cfg.tg_owner or "OWNER"
-    return cfg.tg_manager or "MANAGER"
+        return owner or cfg.tg_owner or "OWNER"
+    if cfg.manager_separate:
+        return manager or cfg.tg_manager or "MANAGER"
+    # Менеджер и владелец — один человек, пока MANAGER_SEPARATE=0. Это
+    # записано в roles.py и в CLAUDE.md, а здесь не было: «спорное — менеджеру»
+    # уезжало в литерал «MANAGER» даже когда адрес владельца известен
+    return manager or cfg.tg_manager or owner or cfg.tg_owner or "MANAGER"
 
 
 def _permanent_failure(exc: Exception) -> bool:
@@ -191,7 +207,7 @@ class CrossAccountSend(RuntimeError):
 
 
 class Communicator:
-    def __init__(self, send_fn=None, transports=None):
+    def __init__(self, send_fn=None, transports=None, accounts=None):
         # transports задан — шлём по-настоящему; нет — остаётся заглушка фазы 1,
         # на которой держатся DRY_RUN и тесты.
         #
@@ -200,11 +216,52 @@ class Communicator:
         # решал порядок в списке. Ровно так сообщение и ушло бы не с того лица
         self.transports = {(str(getattr(t, "account", DEFAULT_ACCOUNT)), t.name): t
                            for t in (transports or [])}
+        # Компании — чтобы знать АДРЕС владельца, а не только его бота.
+        # Реестр держал только `Ingest` (`self.accounts` там же), и из-за этой
+        # асимметрии Communicator знал про компанию ровно код транспорта.
+        # Зеркало `Ingest.__init__` намеренно: два разных способа хранить
+        # один и тот же список однажды разошлись бы.
+        self.accounts = {str(a.code): a for a in (accounts or [])}
         self.send_fn = send_fn or self._stub_send
 
     def transport_for(self, account: str, name: str):
         """Транспорт компании. Чужой не подставляем никогда — лучше не отправить."""
         return self.transports.get((str(account), str(name)))
+
+    def owner_chat(self, account: str | None = None,
+                   transport: str = "telegram") -> str:
+        """Куда писать владельцу этой компании.
+
+        Тот же аксессор, что у `roles` (`Account.owner_ids`), и это не
+        совпадение: у владельца один Telegram-аккаунт, а в личке с ботом
+        `chat_id` равен `user_id`. Разные понятия («кто говорит» и «куда
+        писать») здесь физически совпадают — но совпадают они только в
+        личке, и если однажды понадобится отдельная диспетчерская группа,
+        заводить надо новое поле, а не растягивать это.
+
+        Компания не названа: единственная настроенная берётся молча,
+        нескольких — берём первую и пишем WARNING. Молча схлопнуть две
+        компании в один чат нельзя, но и промолчать вместо уведомления —
+        тоже: адрес у владельца физически один.
+        """
+        if account is not None:
+            acc = self.accounts.get(str(account))
+            if acc is not None:
+                own = acc.owner_ids.get(transport, "")
+                if own:
+                    return own
+        known = [a for a in self.accounts.values()
+                 if a.owner_ids.get(transport)]
+        if len(known) == 1:
+            return known[0].owner_ids[transport]
+        if known:
+            if account is not None:
+                log.warning("у компании %r нет владельца в %s — пишу владельцу "
+                            "компании %r; уведомление уйдёт без атрибуции",
+                            account, transport, known[0].code)
+            return known[0].owner_ids[transport]
+        # Установка без accounts.toml: там владелец задан глобально
+        return cfg.tg_owner if transport == "telegram" else ""
 
     async def _stub_send(self, chat_id: str, text: str) -> None:
         log.info("[TG -> %s] %s", chat_id, text)
@@ -248,20 +305,35 @@ class Communicator:
                                           ProjectChat.chat_id == str(chat_id)))).scalars().first()
         return bool(row and row.is_group)
 
-    async def notify_owner(self, text: str, account: str | None = None) -> None:
+    async def notify_owner(self, text: str, account: str | None = None,
+                           project: Project | None = None) -> None:
         """Оперативное уведомление владельцу — мимо очереди и тихих часов.
 
-        Владелец у компаний физически один, но бот у каждой свой. Если
-        компания не названа, берём любой поднятый транспорт: уведомление
-        служебное и до клиента не доходит, так что перепутать лица нельзя.
+        Компанию можно назвать кодом или дать проект — код возьмётся из него
+        тем же `account_code`, которым пользуется доставка клиенту. Владелец
+        у компаний физически один, но **бот у каждой свой**, и адрес обязан
+        приходить из ТОЙ ЖЕ компании, что и бот: перекрёстная пара «бот
+        Qorsa → чат владельца Hustle» даёт 403 и является ровно тем классом
+        ошибок, против которого написан `CrossAccountSend`.
+
+        Раньше здесь стоял глобальный `cfg.tg_owner`, и он пуст: id владельца
+        живёт по компаниям. Уведомления не доходили НИ ОДНО — ни эскалации,
+        ни упор в квоту, ни задачи, ждущие человека.
         """
+        if account is None and project is not None:
+            account = await account_code(project.account_id)
+
         transport = None
         if account:
             transport = self.transport_for(account, "telegram")
-        if transport is None:
-            transport = next((t for (_, n), t in self.transports.items()
-                              if n == "telegram"), None)
-        chat = cfg.tg_owner
+        chat = self.owner_chat(account)
+        if transport is None and chat:
+            # Компания не названа или её бот не поднят. Берём того, чей адрес
+            # мы только что вернули, — иначе бот и чат разъедутся
+            for code, acc in self.accounts.items():
+                if acc.owner_ids.get("telegram") == chat:
+                    transport = self.transport_for(code, "telegram")
+                    break
         if not chat:
             # Раньше сюда подставлялся литерал "OWNER", и он честно уезжал
             # в Telegram как chat_id. На первом живом запуске это дало
@@ -276,8 +348,21 @@ class Communicator:
             return
         try:
             await transport.send(chat, text)
-        except Exception:
-            log.exception("не смог уведомить владельца")
+        except Exception as e:                                  # noqa: BLE001
+            # НЕ голый log.exception: уведомление, о недоставке которого мы
+            # знаем только по трейсбэку в логе, — это та же тишина, только
+            # тише. Самый частый отказ здесь чинится не кодом: Telegram-бот
+            # не может написать первым тому, кто не нажал у него Start
+            resp = getattr(e, "response", None)
+            body = getattr(resp, "text", "")
+            if "chat not found" in body or "bot can't initiate" in body:
+                log.error("НЕ МОГУ ПИСАТЬ ВЛАДЕЛЬЦУ: у бота компании %r нет чата "
+                          "с %s. Открой бота в Telegram с этого аккаунта и нажми "
+                          "Start — иначе уведомления не дойдут ни одно",
+                          account or "?", chat)
+            else:
+                log.exception("не смог уведомить владельца (компания %r, чат %s)",
+                              account or "?", chat)
 
     _no_owner_warned = False
 
@@ -543,8 +628,11 @@ class Communicator:
             if not chat:
                 return None
         else:
-            # владелец и менеджер — всегда обычным ботом в Telegram
-            name, chat = "telegram", internal_recipient(m.route)
+            # владелец и менеджер — всегда обычным ботом в Telegram.
+            # Компания уже вычислена выше по проекту, и бот ниже берётся
+            # по ней же — значит и АДРЕС обязан быть её, а не глобальный
+            name = "telegram"
+            chat = internal_recipient(m.route, owner=self.owner_chat(account))
             if chat in ("OWNER", "MANAGER"):
                 # Адресат не настроен. Литерал «OWNER» уезжал в Telegram как
                 # chat_id и возвращался 400-м с трейсбэком на каждое сообщение

@@ -26,7 +26,6 @@ async def _задача(status: str, **kw) -> int:
     return task_id
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["escalated", "needs_human", "awaiting_keys"])
 async def test_requeue_возвращает_из_всех_терминальных(db, status):
     """Все три статуса означают «задача снята с работы» — из любого её
@@ -44,7 +43,6 @@ async def test_requeue_возвращает_из_всех_терминальны
     assert t.defects == []
 
 
-@pytest.mark.asyncio
 async def test_requeue_чистит_разбор(db):
     """РАЗБОР ОПИСЫВАЕТ СОСТОЯНИЕ, КОТОРОГО БОЛЬШЕ НЕТ.
 
@@ -72,7 +70,6 @@ async def test_requeue_чистит_разбор(db):
     assert crew.instruction_block(t.diagnosis) == ""
 
 
-@pytest.mark.asyncio
 async def test_requeue_снимает_журнал_со_счёта(db):
     """Иначе детектор застревания читает старые строки и снимает задачу
     после ПЕРВОГО же провала — кнопка выглядит рабочей и не работает."""
@@ -88,7 +85,6 @@ async def test_requeue_снимает_журнал_со_счёта(db):
     assert len(await attempts_of(task_id, counted_only=False)) == 3   # но не стёрты
 
 
-@pytest.mark.asyncio
 async def test_requeue_записывает_чья_это_рука(db):
     """Сброс счётчика — решение человека, и по базе это должно быть видно:
     иначе через месяц не отличить его от того, что задача просто не падала."""
@@ -102,7 +98,6 @@ async def test_requeue_записывает_чья_это_рука(db):
     assert "escalated" in t.last_error
 
 
-@pytest.mark.asyncio
 async def test_requeue_не_трогает_живую_задачу(db):
     """`ready` и `running` возвращать неоткуда — это был бы не возврат,
     а обнуление счётчика идущей работы."""
@@ -116,7 +111,6 @@ async def test_requeue_не_трогает_живую_задачу(db):
         assert t.attempts == 2, "счётчик живой задачи трогать нельзя"
 
 
-@pytest.mark.asyncio
 async def test_requeue_на_несуществующей(db):
     ok, message = await manual.requeue(10_000_000)
     assert ok is False
