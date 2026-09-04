@@ -60,10 +60,17 @@ def report(data: dict) -> str:
     out: list[str] = []
     add = out.append
 
+    days = max(s["days"], 1)
     add(f"═══ РАСХОД за {s['days']} дн. ═══")
-    add(f"  настоящие деньги   ${s['money_usd']:.2f} из ${data['budgets']['money']:.0f}/сут")
-    add(f"  оценка подписки   ~${s['subscription_usd']:.2f} из "
-        f"${data['budgets']['subscription']:.0f}/сут")
+    # Слева СУММА ЗА ОКНО, справа СУТОЧНЫЙ потолок — связывать их словом «из»
+    # нельзя: на живой базе выходило «~$264 из $150», то есть перерасход 176%
+    # там, где его нет. Сравнивать с потолком можно только среднее за день.
+    add(f"  настоящие деньги   ${s['money_usd']:.2f} за окно, "
+        f"~${s['money_usd'] / days:.2f}/сут при потолке "
+        f"${data['budgets']['money']:.0f}")
+    add(f"  оценка подписки   ~${s['subscription_usd']:.2f} за окно, "
+        f"~${s['subscription_usd'] / days:.2f}/сут при потолке "
+        f"${data['budgets']['subscription']:.0f}")
     add("  (не складываются: это разные ресурсы — кошелёк и пятичасовое окно)")
     add(f"  вызовов всего      {s['runs']}"
         + (f", НЕ ВЕРНУЛОСЬ {s['unfinished']}" if s["unfinished"] else ""))

@@ -156,7 +156,7 @@ class Scheduler:
         # $33 за прогон без единого хода, потому что машина уснула). Живой
         # след дыры лежит в базе: у задачи 531 двадцать четыре строки
         # Run(kind="execute") при attempts=0, и ни один потолок не заметил.
-        # Число сессий известно всегда — строка заводится ДО вызова.
+        # Число вызовов известно всегда — строка заводится ДО вызова.
         sessions = await sessions_today()
         over_sessions = sessions >= cfg.daily_cc_sessions
         over_budget = over_money or over_cli or over_sessions
@@ -165,7 +165,7 @@ class Scheduler:
                         "chat работает",
                         f"деньги ${money:.2f} из ${cfg.daily_budget_usd:.2f}"
                         if over_money else
-                        f"сессий {sessions} из {cfg.daily_cc_sessions}"
+                        f"вызовов модели {sessions} из {cfg.daily_cc_sessions}"
                         if over_sessions else
                         f"подписка ~${subscription:.2f} из "
                         f"${cfg.daily_cli_budget_usd:.2f} оценочно")
@@ -841,8 +841,17 @@ class Scheduler:
                 if p is not None:
                     p.last_action = f"эскалация: {t.title}"
                     p.updated_at = utcnow()
+                # Если детектор всё-таки видел застревание — назвать причину
+                # ЗДЕСЬ. При умолчаниях (`MAX_ATTEMPTS=4`, порог буксования 2)
+                # ветка «разбор повторяется» сама сработать не успевает: советы
+                # появляются в журнале с третьей попытки, а на четвёртой уже
+                # эскалация. Терять её вывод из-за этого незачем — вся ценность
+                # детектора в ИМЕНИ причины, а не в сэкономленной попытке.
+                if stalled is not None:
+                    t.last_error = stalled.reason
                 log.warning("ЭСКАЛАЦИЯ -> %s / %s (заказ продолжает работу "
-                            "по остальным задачам)", project.title, t.title)
+                            "по остальным задачам)%s", project.title, t.title,
+                            f"; {stalled.trigger}" if stalled else "")
                 escalated = True
             else:
                 t.status = "ready"

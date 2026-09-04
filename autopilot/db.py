@@ -655,8 +655,16 @@ async def recover_orphan_tasks() -> int:
         return res.rowcount
 
 
-async def sessions_today(kinds: tuple[str, ...] = ("execute",)) -> int:
-    """Сколько сессий модели заведено за последние 24 часа.
+# Виды вызовов, которые считает третий потолок. ВСЕ, а не только сессии
+# агента: пятичасовое окно подписки едят одинаково и бриф, и план, и судья,
+# и подготовка задания. Первая версия считала один `execute` — и потолок
+# не видел двух третей расхода. Замерено на живой базе: пик за скользящие
+# сутки 58 сессий агента против 116 вызовов всего.
+BILLED_KINDS = ("execute", "plan", "brief", "judge", "prompt", "diagnose")
+
+
+async def sessions_today(kinds: tuple[str, ...] = BILLED_KINDS) -> int:
+    """Сколько ВЫЗОВОВ модели заведено за последние 24 часа.
 
     **Третий счётчик, и единственный, который не врёт при `cost_usd=0`.**
     Оба денежных потолка сравнивают СУММЫ СТОИМОСТИ, а у оборванного вызова
@@ -675,6 +683,12 @@ async def sessions_today(kinds: tuple[str, ...] = ("execute",)) -> int:
             .where(Run.started_at >= since, Run.kind.in_(kinds)))).scalar() or 0)
 
 
+# Сколько путей влезает в одну строку журнала. Список нужен человеку и
+# отчёту, а не для повторного разбора: политика и `evidence` читают полную
+# разницу ДО записи.
+MAX_LOGGED_PATHS = 200
+
+
 async def log_attempt(task_id: int, *, project_id: int = 0, lane: str = "build",
                       outcome: str = "failed", counted: bool = True,
                       defects: list[str] | None = None, sig: str = "",
@@ -687,6 +701,18 @@ async def log_attempt(task_id: int, *, project_id: int = 0, lane: str = "build",
     циклом, а не управляет им. Поэтому исключение здесь ловится и логируется:
     потерять строку журнала дешевле, чем потерять задачу.
     """
+    # Потолок на список путей. Без него одна строка журнала могла весить
+    # мегабайты: задача, тронувшая распакованный SDK, кладёт в `changed`
+    # десятки тысяч путей — и это на КАЖДУЮ попытку, в базу, где живёт
+    # переписка с клиентами. Полный список тут и не нужен: он нужен политике
+    # и `evidence`, а те работают с ним ДО записи.
+    changed = list(changed or [])
+    touched = list(touched or [])
+    extra = max(0, len(changed) - MAX_LOGGED_PATHS)
+    if extra:
+        changed = changed[:MAX_LOGGED_PATHS] + [f"… и ещё {extra} путей"]
+    if len(touched) > MAX_LOGGED_PATHS:
+        touched = touched[:MAX_LOGGED_PATHS]
     try:
         async with Session() as s:
             n = int((await s.execute(

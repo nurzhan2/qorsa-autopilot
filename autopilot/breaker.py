@@ -152,7 +152,8 @@ def similarity(a: str, b: str) -> float:
 
 @dataclass
 class Attempt:
-    """Одна неудачная попытка. Пишется планировщиком в `Task.attempt_log`."""
+    """Один заход. В базе живёт строкой `db.TaskAttempt` (таблица
+    `task_attempts`); здесь — то же самое, но без базы: модуль чистый."""
 
     n: int = 0                       # номер попытки, с единицы
     lane: str = "build"              # где провалилась: сборка или приёмка
