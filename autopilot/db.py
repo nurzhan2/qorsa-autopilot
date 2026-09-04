@@ -706,6 +706,33 @@ async def log_attempt(task_id: int, *, project_id: int = 0, lane: str = "build",
         return 0
 
 
+async def reset_attempts(task_id: int, note: str = "") -> int:
+    """Забыть историю попыток задачи: владелец дал ей новый заход.
+
+    **Без этого кнопка «Пусть агент сделает заново» переставала работать.**
+    Она обнуляет `Task.attempts` — намеренно, потому что решение владельца
+    старый лимит отменять не должен, — но журнал оставался, и детектор
+    застревания снимал задачу с работы после ПЕРВОГО же провала, объясняя
+    это тем, что дефект повторился три раза подряд. То есть кнопка выглядела
+    рабочей и не работала: ровно та поломка, из-за которой в этом проекте
+    заведено правило про паузу, которую планировщик не читал.
+
+    Строки не удаляются, а помечаются `counted=False`: журнал append-only,
+    и стирать из него историю нельзя — по ней считается расход и отчёт.
+    Считать её застреванием после ручного возврата тоже нельзя.
+    """
+    async with Session() as s:
+        rows = (await s.execute(
+            select(TaskAttempt).where(TaskAttempt.task_id == task_id,
+                                      TaskAttempt.counted.is_(True)))).scalars().all()
+        for row in rows:
+            row.counted = False
+            if note:
+                row.note = (row.note + " | " if row.note else "") + note
+        await s.commit()
+        return len(rows)
+
+
 async def attempts_of(task_id: int, counted_only: bool = True) -> list[TaskAttempt]:
     """Журнал попыток задачи, от старых к новым.
 

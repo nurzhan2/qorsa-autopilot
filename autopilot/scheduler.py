@@ -28,6 +28,7 @@ from . import projectdir
 from . import regression
 from . import worktrace
 from .llm import LimitReached
+from . import manual
 from .manual import NEEDS_HUMAN, needs_human, unproven_note
 
 log = logging.getLogger("sched")
@@ -483,7 +484,7 @@ class Scheduler:
                     await log_attempt(task.id, project_id=project.id, lane="verify",
                                       outcome="done", counted=False,
                                       seconds=(utcnow() - started).total_seconds())
-                    await self._save_verdict(task.id, verdict)
+                    await manual.save_verdict(task.id, verdict)
                     await self._set_status(task.id, "done")
                     await self.communicator.on_task_done(task, project)
                     await self._maybe_finish(project.id)
@@ -543,6 +544,26 @@ class Scheduler:
                     await self._charge_done(project.id, minutes)
                 except Exception:
                     log.exception("не смог списать время project %s", project.id)
+
+    def _paid_closed(self) -> bool:
+        """Закрыты ли платные полосы прямо сейчас.
+
+        Нужно там, где к модели ходят МИМО выдачи слота. Такое место одно —
+        разбор застревания: полоса `verify` продолжает работать при
+        исчерпанном бюджете и при упоре в квоту (приёмка без модели ничего
+        не стоит), а провал в ней зовёт `crew.Diagnostician`, и это уже
+        полноценный платный вызов.
+
+        Дыра была настоящая и рушила оба правила сразу: суточный потолок
+        переставал держать расход, а при упоре в квоту каждый провал бил
+        в закрытую дверь — то есть ровно «не встаём, а долбимся в стену»,
+        против чего написаны заслоны в `_dispatch`.
+
+        Спрашиваем СОСТОЯНИЕ, а не флаг `free_only`: между выдачей слота
+        и провалом проходит вся приёмка, и окно за это время могло как
+        закрыться, так и открыться.
+        """
+        return bool(self.budget_paused or limits.state.blocked())
 
     @staticmethod
     async def _stalled(task_id: int):
@@ -640,31 +661,6 @@ class Scheduler:
                             if cfg.policy_halt and verdict.halting else ""))
         return verdict
 
-    @staticmethod
-    async def _save_verdict(task_id: int, verdict) -> None:
-        """Записать СОСТАВ приёмки: чем именно задачу приняли.
-
-        Раньше он жил только в момент вызова и в логе. Через месяц по базе
-        нельзя было отличить задачу, закрытую пройденным тестом, от задачи,
-        закрытой единственной `http 200` на корне сайта, — хотя на этой
-        разнице стоит вся честность приёмки.
-        """
-        try:
-            async with Session() as s:
-                t = await s.get(Task, task_id)
-                if t is None:
-                    return
-                t.verdict = {
-                    "deterministic": int(getattr(verdict, "deterministic", 0) or 0),
-                    "assisted": int(getattr(verdict, "assisted", 0) or 0),
-                    "suspicious": int(getattr(verdict, "suspicious", 0) or 0),
-                    "tainted": int(len(getattr(verdict, "tainted", ()) or ())),
-                    "at": utcnow().isoformat(timespec="seconds"),
-                }
-                await s.commit()
-        except Exception:                               # noqa: BLE001
-            log.exception("состав приёмки задачи %s не записан", task_id)
-
     async def _notify(self, text: str) -> None:
         """Сказать владельцу. Молчаливая эскалация — самый дорогой исход цикла
         и до этого единственный, о котором ему не сообщали."""
@@ -690,6 +686,9 @@ class Scheduler:
                 row.status = "ready"          # вернуть в очередь как есть
                 row.updated_at = utcnow()
                 await s.commit()
+        await log_attempt(task.id, project_id=task.project_id, lane=lane,
+                          outcome="limit", counted=False,
+                          defects=[f"упор в квоту на {wait / 60:.0f} мин"])
         log.warning("задача %s отложена из-за квоты на %.0f минут (полоса %s), "
                     "попытка НЕ засчитана", task.id, wait / 60, lane)
         if limits.state.should_notify():
@@ -719,6 +718,9 @@ class Scheduler:
                             "ждёт настоящий ключ клиента")
             t.updated_at = utcnow()
             await s.commit()
+        await log_attempt(task.id, project_id=project.id, lane="verify",
+                          outcome="awaiting_keys", counted=False,
+                          defects=list(verdict.deferred))
         log.warning("задача %s ждёт ключа: %s (%s проверок не выполнялось, "
                     "попытка НЕ засчитана)", task.id, task.title, len(verdict.deferred))
 
@@ -739,6 +741,9 @@ class Scheduler:
             t.defects = [note]
             t.updated_at = utcnow()
             await s.commit()
+        await manual.save_verdict(task.id, verdict)
+        await log_attempt(task.id, project_id=project.id, lane="verify",
+                          outcome="unproven", counted=False, defects=[note])
         log.warning("задача %s ждёт подтверждения: %s (%s)",
                     task.id, task.title, verdict.summary())
         notify = getattr(self.communicator, "notify_owner", None)
@@ -844,7 +849,8 @@ class Scheduler:
                 if lane == "verify":
                     # не прошло приёмку — обратно на починку, тем же cc_session_id
                     t.lane = "build"
-                needs_diagnosis = crew.Diagnostician.should_run(t)
+                needs_diagnosis = (crew.Diagnostician.should_run(t)
+                                   and not self._paid_closed())
                 # упавшие build/chat остаются в своей полосе: перекидывать
                 # chat-задачу в build — это менять её смысл
             t.updated_at = utcnow()

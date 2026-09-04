@@ -321,7 +321,10 @@ async def test_policy_violation_stops_the_work(db, monkeypatch, tmp_path):
     comm = FakeCommunicator()
     sched = make_sched(communicator=comm)
 
-    dirty = worktrace.Changed(created=(".env",), ok=True)
+    # `secrets.enc`, а не `.env`: файлы вида `.env` внутри каталога заказа —
+    # это РАБОТА агента (он пишет `.env.example` для приложения заказчика),
+    # и денилист их больше не ловит. Ловит он чужое: хранилище установки.
+    dirty = worktrace.Changed(created=("secrets.enc",), ok=True)
     monkeypatch.setattr(sched, "_trace_for", lambda project: None)
 
     async def fake_review(task, project, changed):
@@ -336,3 +339,102 @@ async def test_policy_violation_stops_the_work(db, monkeypatch, tmp_path):
     assert "политики" in row.last_error
     assert pause.exists(), "инцидент не остановил работу"
     assert any("⛔" in n for n in comm.owner_notes)
+
+
+# ---------- правки после состязательной проверки ----------
+
+async def test_retry_button_forgets_the_ledger(db, monkeypatch):
+    """Кнопка «Пусть агент сделает заново» обнуляет `attempts` намеренно:
+    решение владельца старый лимит отменять не должен. Но журнал оставался,
+    и детектор застревания снимал задачу после ПЕРВОГО же провала, объясняя
+    это тем, что дефект повторился три раза подряд.
+
+    Кнопка выглядела рабочей и не работала — ровно та поломка, из-за которой
+    в проекте заведено правило про паузу, которую планировщик не читал.
+    """
+    from autopilot.db import reset_attempts
+
+    monkeypatch.setattr(cfg, "max_attempts", 8)
+    p = await make_project()
+    [task_id] = await make_tasks(p.id, 1, lane="verify")
+    sched = make_sched(verifier=FailingVerifier())
+    await drive(sched)                       # три одинаковых провала -> needs_human
+
+    async with Session() as s:
+        assert (await s.get(Task, task_id)).status == NEEDS_HUMAN
+
+    # владелец возвращает задачу агенту
+    await reset_attempts(task_id, "сброшено владельцем")
+    async with Session() as s:
+        row = await s.get(Task, task_id)
+        row.status, row.lane, row.attempts, row.defects = "ready", "verify", 0, []
+        await s.commit()
+
+    assert await sched._stalled(task_id) is None, (
+        "журнал не сброшен — задача встанет на первом же провале")
+
+    ver = FailingVerifier()
+    sched = make_sched(verifier=ver)
+    await sched.tick()
+    await sched.drain()
+    async with Session() as s:
+        assert (await s.get(Task, task_id)).status != NEEDS_HUMAN
+    assert len(ver.calls) == 1, "новый заход не состоялся"
+
+
+async def test_free_verification_does_not_slip_into_a_paid_diagnosis(db, monkeypatch):
+    """Полоса verify работает при исчерпанном бюджете под тем, что приёмка
+    без модели ничего не стоит. Но ПУТЬ ПРОВАЛА к модели ходит: `_on_fail`
+    зовёт `crew.Diagnostician`, а это полноценный платный вызов.
+
+    Дыра рушила оба правила сразу: суточный потолок переставал держать расход,
+    а при упоре в квоту каждый провал бил в закрытую дверь.
+    """
+    monkeypatch.setattr(cfg, "crew_diagnose", True)
+    monkeypatch.setattr(cfg, "breaker_stagnation", 0)   # чтобы дошло до разбора
+    called: list[int] = []
+
+    async def never(self, task, project, defects):
+        called.append(task.id)
+        return None
+
+    monkeypatch.setattr(Scheduler, "_diagnose", never)
+
+    p = await make_project()
+    [task_id] = await make_tasks(p.id, 1, lane="verify")
+    await set_acceptance(task_id, DETERMINISTIC)
+    async with Session() as s:
+        (await s.get(Task, task_id)).attempts = 1
+        await s.commit()
+
+    monkeypatch.setattr(cfg, "daily_budget_usd", 1.0)
+    async with Session() as s:
+        s.add(Run(task_id=task_id, kind="execute", ok=True, backend="api",
+                  cost_usd=5.0))
+        await s.commit()
+
+    sched = make_sched(verifier=FailingVerifier())
+    await drive(sched, ticks=2)
+
+    assert sched.budget_paused is True
+    assert called == [], "разбор ушёл к модели при исчерпанном бюджете"
+
+
+async def test_verdict_is_saved_on_the_manual_path(db):
+    """87% работы на живом плане — ручная, то есть основная масса задач идёт
+    через `manual.submit`. Не запиши там состав приёмки — и отчёт «чем
+    принимались задачи» вечно показывал бы `unknown` почти для всего."""
+    from autopilot import manual
+
+    p = await make_project()
+    [task_id] = await make_tasks(p.id, 1)
+    await set_acceptance(task_id, DETERMINISTIC)
+
+    class Proof:
+        async def run(self, task, project):
+            return Verdict(ok=True, defects=[], deterministic=2)
+
+    ok, _ = await manual.submit(task_id, Proof())
+    assert ok
+    async with Session() as s:
+        assert (await s.get(Task, task_id)).verdict["deterministic"] == 2

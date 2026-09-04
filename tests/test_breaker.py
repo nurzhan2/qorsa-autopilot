@@ -170,3 +170,60 @@ def test_tried_block_never_offers_to_weaken_the_check():
     """Промпт агенту не должен и намёком разрешать обойти критерий."""
     text = breaker.tried_block([fail(1, "GET /admin/ -> 200, ожидалось 302")])
     assert "не ослабляй критерий" in text
+
+
+# ---------- правки после состязательной проверки ----------
+
+def test_url_path_is_not_collapsed():
+    """Первая версия схлопывала любой путь из двух сегментов — и попадала
+    ВНУТРЬ URL: `/admin/` и `/orders/` давали одну подпись, то есть два
+    разных http-дефекта объявлялись застреванием."""
+    a = breaker.signature(["GET http://localhost:8000/admin/ -> 200, ожидалось 302"])
+    b = breaker.signature(["GET http://localhost:8000/orders/ -> 200, ожидалось 302"])
+    assert not breaker.same_defect(a, b)
+
+
+def test_absolute_path_is_still_collapsed():
+    """А ради чего затевалось — работает: временный каталог pytest не должен
+    делать один и тот же дефект разным."""
+    a = breaker.signature(["FAILED C:/Users/x/tmp/q1/tests/test_cart.py::test_total"])
+    b = breaker.signature(["FAILED D:/other/tmp/q9/tests/test_cart.py::test_total"])
+    assert breaker.same_defect(a, b)
+
+
+LONG_TAIL = ("FAILED tests/test_cart.py::test_total - AssertionError\n"
+             "FAILED tests/test_cart.py::test_sum - AssertionError\n"
+             "FAILED tests/test_cart.py::test_add - AssertionError\n"
+             "=== {n} failed, {ok} passed in 4.21s ===")
+
+
+def test_progress_in_a_long_tail_is_not_stagnation():
+    """САМЫЙ ОПАСНЫЙ ЛОЖНЫЙ ПОЛОЖИТЕЛЬНЫЙ, найденный проверкой.
+
+    Дефект приёмки — это хвост вывода команды, и он длинный. Одна изменившаяся
+    цифра в трёхстах символах даёт похожесть 0.99, то есть «тот же дефект».
+    А 6 → 5 → 4 упавших теста — это агент, который чинит по одному за заход:
+    объявить его застрявшим значит снять с работы то, что как раз работает.
+    """
+    attempts = [fail(i + 1, LONG_TAIL.format(n=n, ok=20 - n))
+                for i, n in enumerate((6, 5, 4))]
+    assert not breaker.check(attempts).stop
+
+
+def test_identical_long_tail_is_still_stagnation():
+    """Обратная сторона: если хвост совпал целиком, цикл правда стоит."""
+    attempts = [fail(i + 1, LONG_TAIL.format(n=6, ok=14)) for i in range(3)]
+    assert breaker.check(attempts).trigger == "stagnation"
+
+
+def test_numbers_must_match_exactly():
+    """Волатильные числа вычищены нормализацией; всё оставшееся — суть
+    дефекта. Изменилось хоть одно — что-то сдвинулось.
+
+    Взят ДЛИННЫЙ дефект: именно на длинных одна цифра тонет в похожести
+    (0.99), и без сверки чисел прогресс читался бы как застревание.
+    """
+    a = breaker.signature([LONG_TAIL.format(n=6, ok=14)])
+    b = breaker.signature([LONG_TAIL.format(n=5, ok=15)])
+    assert breaker.similarity(a, b) >= breaker.SIMILAR   # похожи как строки
+    assert not breaker.same_defect(a, b)                 # но это разные дефекты

@@ -47,6 +47,20 @@ def paused() -> bool:
     return pause_path().exists()
 
 
+def pause_reason() -> str:
+    """Почему стоит пауза, если тот, кто её поставил, это написал.
+
+    Кнопка на дашборде пишет пустой файл, а `_policy_review` — строку про
+    инцидент. Без чтения файла оба состояния выглядели одинаково: «работа
+    на паузе» и кнопка «снять». Остановку по нарушению политики нельзя
+    снимать одним щелчком, не прочитав, что произошло.
+    """
+    try:
+        return pause_path().read_text(encoding="utf-8").strip()[:300]
+    except OSError:
+        return ""
+
+
 def heartbeat_path():
     return cfg.logs / "heartbeat.json"
 
@@ -204,8 +218,13 @@ def global_blockers(*, paused: bool, alive: bool, over_money: bool,
             "fix": "запустить: python -m autopilot.main",
         })
     if paused:
-        out.append({"kind": "paused", "what": "работа на паузе",
-                    "fix": "снять паузу в шапке"})
+        why = pause_reason()
+        out.append({
+            "kind": "incident" if why else "paused",
+            "what": f"работа остановлена: {why}" if why else "работа на паузе",
+            "fix": ("разобраться, что произошло, и только потом снимать паузу"
+                    if why else "снять паузу в шапке"),
+        })
     if over_money:
         out.append({"kind": "budget",
                     "what": f"суточный потолок денег исчерпан "

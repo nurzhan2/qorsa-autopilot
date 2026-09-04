@@ -65,7 +65,18 @@ _VOLATILE = (
 
 # Абсолютный путь схлопываем до имени файла: один и тот же дефект в разных
 # установках и во временных каталогах pytest выглядел бы разными дефектами.
-_PATH = re.compile(r"(?:[A-Za-z]:)?(?:[\\/][^\s\\/:*?\"<>|]+){2,}")
+#
+# **ТОЛЬКО АБСОЛЮТНЫЙ**, и это правка по живому промаху. Первая версия
+# требовала лишь двух сегментов через слэш — и попадала внутрь URL:
+# `http://localhost:8000/admin/` схлопывалось до пустого хвоста, а значит
+# `GET .../admin/ -> 200, ожидалось 302` и `GET .../orders/ -> 200,
+# ожидалось 302` давали ОДНУ подпись. Два разных дефекта объявлялись
+# застреванием — то есть механизм, написанный ради автономности, снимал
+# с работы движущуюся задачу.
+#
+# Теперь путь опознаётся по началу: буква диска или ведущий слэш. Адрес
+# в URL остаётся целиком, потому что он и есть суть http-дефекта.
+_PATH = re.compile(r"(?<![\w:/])(?:[A-Za-z]:[\\/]|[\\/])[^\s:*?\"<>|]{2,}")
 
 
 def signature(defects) -> str:
@@ -199,16 +210,51 @@ class Decision:
         return self.stop
 
 
-def _tail_same(values: list[str], threshold: float = SIMILAR) -> int:
-    """Сколько последних значений подряд похожи на самое последнее."""
+_NUM = re.compile(r"\d+")
+
+
+def same_defect(a: str, b: str, threshold: float = SIMILAR) -> bool:
+    """Один ли это дефект. Похожести МАЛО — числа обязаны совпасть.
+
+    Живой промах, ради которого добавлено второе условие. Дефект приёмки —
+    это хвост вывода команды, и он длинный:
+
+        FAILED tests/test_cart.py::test_total ... 6 failed, 12 passed in 4.2s
+        FAILED tests/test_cart.py::test_total ... 5 failed, 13 passed in 4.4s
+
+    Одна изменившаяся цифра в трёхстах символах даёт похожесть 0.99, то есть
+    «тот же дефект». А это ПРОГРЕСС: агент чинит по одному тесту за заход,
+    и объявить его застрявшим — снять с работы то, что как раз работает.
+
+    Волатильные числа к этому моменту уже вычищены нормализацией (время,
+    длительности, объёмы, номера строк). Всё, что осталось, — суть дефекта:
+    код ответа, число упавших тестов, код возврата. Изменилось хоть одно —
+    что-то сдвинулось.
+    """
+    if not a or not b:
+        return False
+    if _NUM.findall(a) != _NUM.findall(b):
+        return False
+    return similarity(a, b) >= threshold
+
+
+def _tail_same(values: list[str], threshold: float = SIMILAR,
+               strict: bool = True) -> int:
+    """Сколько последних значений подряд совпадают с самым последним.
+
+    `strict` — сверять и числа (для дефектов). Для советов разбора числа
+    несущественны: там сравнивается человеческий текст.
+    """
     if not values:
         return 0
     last = values[-1]
     if not last:
         return 0
+    match = same_defect if strict else (
+        lambda x, y: similarity(x, y) >= threshold)
     same = 0
     for value in reversed(values):
-        if value and similarity(value, last) >= threshold:
+        if value and match(value, last):
             same += 1
         else:
             break
@@ -235,7 +281,7 @@ def check(attempts: list[Attempt], *, stagnation: int = 3,
 
     notes = [a.note for a in attempts if a.note]
     if frustration > 0 and len(notes) >= frustration:
-        repeat = _tail_same(notes)
+        repeat = _tail_same(notes, strict=False)
         if repeat >= frustration:
             return Decision(
                 trigger="frustration", stop=True, repeats=repeat,
@@ -267,7 +313,7 @@ def tried_block(attempts: list[Attempt], limit: int = 5) -> str:
         text = (a.defects or ["—"])[0].strip()
         if not text:
             continue
-        if groups and similarity(signature(text), signature(groups[-1][0])) >= SIMILAR:
+        if groups and same_defect(signature(text), signature(groups[-1][0])):
             groups[-1] = (groups[-1][0], groups[-1][1] + 1)
         else:
             groups.append((text, 1))

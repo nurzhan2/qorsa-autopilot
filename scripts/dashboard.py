@@ -43,7 +43,8 @@ from autopilot.config import cfg                                      # noqa: E4
 from autopilot.db import (Account, AccessItem, ChatMessage, Message,  # noqa: E402
                           Project, ProjectChat, Run, Session, Task,
                           cli_spent_today, consumed_today, init_db,
-                          sessions_today, spent_today, sync_accounts, utcnow)
+                          reset_attempts, sessions_today, spent_today,
+                          sync_accounts, utcnow)
 from autopilot.vault import resolve_secret, vault                     # noqa: E402
 from autopilot.verifier import Verifier                               # noqa: E402
 
@@ -559,8 +560,14 @@ def build_app():
                             f"счётчик попыток сброшен (было {attempts})")
             t.updated_at = utcnow()
             await s.commit()
-        log.warning("задача %s возвращена в очередь вручную (была %s, попыток %s)",
-                    task_id, was, attempts)
+        # Журнал попыток — тоже. Без этого кнопка выглядела рабочей и
+        # не работала: `attempts` обнулялся, а детектор застревания читал
+        # старые строки и снимал задачу с работы после первого же провала,
+        # объясняя это «дефект повторился три раза подряд»
+        forgotten = await reset_attempts(task_id, "сброшено владельцем")
+        log.warning("задача %s возвращена в очередь вручную (была %s, попыток %s, "
+                    "строк журнала снято со счёта %s)",
+                    task_id, was, attempts, forgotten)
         return {"ok": True, "message": "Задача снова в очереди — агент возьмёт её "
                                        "на ближайшем тике."}
 

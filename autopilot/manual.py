@@ -227,6 +227,11 @@ async def submit(task_id: int, verifier) -> tuple[bool, list[str]]:
         return False, (["принять нечем: исполнимых критериев нет"] + reasons)
 
     verdict = await verifier.run(task, project)
+    # Состав приёмки пишется на ВСЕХ путях закрытия, а не только у планировщика.
+    # На живом плане 87% работы — ручная, то есть основная масса задач идёт
+    # именно сюда: не запиши здесь, и отчёт «чем принимались задачи» вечно
+    # показывал бы `unknown` для почти всего.
+    await save_verdict(task_id, verdict)
     if verdict.confirmed:
         await _set_status(task_id, "done", verdict.defects)
         log.info("задача %s принята: все критерии прошли (%s)", task_id, verdict.summary())
@@ -279,6 +284,30 @@ async def confirm(task_id: int) -> tuple[bool, str]:
     log.warning("задача %s закрыта подтверждением владельца, а не проверками: %s",
                 task_id, "; ".join(was)[:200])
     return True, f"задача {task_id} закрыта под твою ответственность"
+
+
+async def save_verdict(task_id: int, verdict) -> None:
+    """Записать СОСТАВ приёмки: чем именно задачу проверяли.
+
+    Одна функция на оба пути закрытия (планировщик и ручная отметка):
+    два места, считающие одно и то же, однажды разойдутся — это правило
+    в проекте уже оплачено паузой, которую планировщик не читал.
+    """
+    try:
+        async with Session() as s:
+            row = await s.get(Task, task_id)
+            if row is None:
+                return
+            row.verdict = {
+                "deterministic": int(getattr(verdict, "deterministic", 0) or 0),
+                "assisted": int(getattr(verdict, "assisted", 0) or 0),
+                "suspicious": int(getattr(verdict, "suspicious", 0) or 0),
+                "tainted": int(len(getattr(verdict, "tainted", ()) or ())),
+                "at": utcnow().isoformat(timespec="seconds"),
+            }
+            await s.commit()
+    except Exception:                                   # noqa: BLE001
+        log.exception("состав приёмки задачи %s не записан", task_id)
 
 
 async def _set_status(task_id: int, status: str, defects: list[str] | None = None) -> None:
