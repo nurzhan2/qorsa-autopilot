@@ -527,7 +527,7 @@ function pulseCard(s) {
           : "выполняться нечему — процесс не запущен"}</div>`}
 
     ${(s.open_runs || []).length ? `<div class="note">вызовов модели в полёте:
-      ${s.open_runs.map(r => `${esc(r.kind)} по задаче ${r.task_id} — ${r.minutes} мин`)
+      ${s.open_runs.map(r => `${esc(r.kind_ru || r.kind)} по задаче ${r.task_id} — ${r.minutes} мин`)
         .join(" · ")}</div>` : ""}
 
     ${feedRows ? `<div class="scroll"><table style="margin-top:24px">
@@ -559,6 +559,10 @@ function attentionCard(t) {
     <div class="tags">
       <span class="tag call">${esc(t.status_ru)}</span>
       <span class="tag">попыток ${t.attempts}</span>
+      ${t.runs ? `<span class="tag">сессий ${t.runs}${t.spent ? ` · $${t.spent}` : ""}</span>` : ""}
+      ${t.waiting_hours !== null && t.waiting_hours !== undefined
+        ? `<span class="tag">ждёт ${waited(t.waiting_hours)}</span>` : ""}
+      ${t.stuck ? `<span class="tag call">топчется на месте</span>` : ""}
     </div>
     <div class="note">${esc(why)}</div>
     ${t.diagnosis ? `<div class="job"><b>${esc(t.diagnosis)}</b></div>` : ""}
@@ -578,6 +582,17 @@ function attentionCard(t) {
       работу сделал ты сам. Если её никто не делал, нужна вторая кнопка:
       она вернёт задачу агенту и обнулит счётчик попыток.</div>`}
   </div>`;
+}
+
+// Сессии и попытки — РАЗНЫЕ числа, и на живых данных они расходятся вшестеро:
+// у задачи 531 двадцать четыре сессии при `attempts=0`, потому что счётчик
+// попыток не видит ни прогонов мимо планировщика, ни ручного сброса.
+// Возраст ожидания: задача, стоящая третьи сутки, выглядела ровно как
+// поставленная десять минут назад — а это разные состояния.
+function waited(hours) {
+  if (hours < 1) return `${Math.round(hours * 60)} мин`;
+  if (hours < 48) return `${hours.toFixed(1)} ч`;
+  return `${Math.round(hours / 24)} сут`;
 }
 
 function installCard(items) {
@@ -931,7 +946,7 @@ function renderSpend(s) {
     `<tr><th>что</th><th>задача</th><th>итог</th><th>чем платили</th>
          <th>минут</th><th>начат</th></tr>` +
     s.runs.map(r => `<tr>
-      <td>${esc(r.kind)}</td>
+      <td>${esc(r.kind_ru || r.kind)}</td>
       <td>${r.task_id}</td>
       <td>${r.finished ? (r.ok ? "ответ" : "обрыв") : "идёт"}</td>
       <td>${r.backend === "cli" ? "подписка" : "деньги"}

@@ -183,9 +183,20 @@ def blockers(project, *, access_waiting: int, blocking_questions: int,
 
 def global_blockers(*, paused: bool, alive: bool, over_money: bool,
                     over_cli: bool, limited_until: float,
-                    build_allowed: bool) -> list[dict]:
-    """Что остановило работу целиком, независимо от заказов."""
+                    build_allowed: bool, over_sessions: bool = False,
+                    install: list | None = None) -> list[dict]:
+    """Что остановило работу целиком, независимо от заказов.
+
+    У каждого пункта обязательна пара «что» и «что с этим делать»: пункт
+    без второго — это жалоба, а не диагностика.
+    """
     out: list[dict] = []
+    # Чего не хватает самой установке. Первым пунктом намеренно: пока нет git,
+    # судья получает ПУСТОЙ диф и честно судит пустоту — молча, без ошибки,
+    # и все остальные объяснения простоя будут про другое
+    for item in (install or []):
+        out.append({"kind": f"install_{item.key}",
+                    "what": item.what, "fix": item.fix})
     if not alive:
         out.append({
             "kind": "not_running",
@@ -205,6 +216,12 @@ def global_blockers(*, paused: bool, alive: bool, over_money: bool,
                     "what": f"суточный потолок подписки исчерпан "
                             f"(~${cfg.daily_cli_budget_usd})",
                     "fix": "поднять DAILY_CLI_BUDGET_USD или подождать сутки"})
+    if over_sessions:
+        out.append({"kind": "budget_sessions",
+                    "what": f"суточный потолок ЧИСЛА СЕССИЙ исчерпан "
+                            f"({cfg.daily_cc_sessions}) — единственный счётчик, "
+                            f"который не врёт при оборванных вызовах",
+                    "fix": "поднять DAILY_CC_SESSIONS или подождать сутки"})
     if limited_until > 0:
         out.append({"kind": "limit",
                     "what": f"упёрлись в квоту подписки, ждём "

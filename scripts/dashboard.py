@@ -38,12 +38,12 @@ from sqlalchemy import func, select                                    # noqa: E
 
 from autopilot import accounts as accounts_cfg                        # noqa: E402
 from autopilot import (autonomy, crew, curate, intake, limits, manual,  # noqa: E402
-                       progress, projectdir, roles, toolchain)
+                       progress, projectdir, readiness, roles, toolchain)
 from autopilot.config import cfg                                      # noqa: E402
 from autopilot.db import (Account, AccessItem, ChatMessage, Message,  # noqa: E402
                           Project, ProjectChat, Run, Session, Task,
                           cli_spent_today, consumed_today, init_db,
-                          spent_today, sync_accounts, utcnow)
+                          sessions_today, spent_today, sync_accounts, utcnow)
 from autopilot.vault import resolve_secret, vault                     # noqa: E402
 from autopilot.verifier import Verifier                               # noqa: E402
 
@@ -65,6 +65,19 @@ TASK_RU = {
     "done": "готово", "escalated": "эскалация", "needs_human": "нужен человек",
     autonomy.AWAITING_KEYS: "ждёт ключа",
 }
+# Вид вызова модели по-русски. В таблице расхода печатался сырой `kind`,
+# и «execute» рядом с «сбор ТЗ» читалось как чужая строка.
+RUN_RU = {
+    "execute": "сессия агента", "judge": "судья", "brief": "сбор ТЗ",
+    "plan": "планирование", "prompt": "задание агенту",
+    "diagnose": "разбор застревания",
+}
+
+# Статусы, в которых задача ЖДЁТ ЧЕЛОВЕКА: для них считаем возраст ожидания.
+# Задача в очереди не ждёт — её работа впереди, и «стоит 40 часов» про неё
+# было бы неправдой.
+WAITING_STATUSES = ("needs_human", "escalated", autonomy.AWAITING_KEYS)
+
 ACCESS_RU = {
     "needed": "нужен", "requested": "запрошен", "received": "получен",
     "verified": "есть", "failed": "не подошёл",
@@ -262,6 +275,18 @@ async def collect() -> dict:
             select(ChatMessage.project_id, func.count())
             .where(ChatMessage.project_id.isnot(None))
             .group_by(ChatMessage.project_id))).all())
+        # Сколько сессий съела задача и во что обошлась — ОДНИМ группированным
+        # запросом, по образцу msg_counts выше. Задача 531 сожгла 24 сессии
+        # и $70, а на карточке было видно только «попыток 4»: attempts
+        # не считает ни повторов из live_run.py, ни ручных прогонов.
+        # `Task.cost_usd` для этого не годится — на живых данных он расходится
+        # с суммой по Run до трёх раз
+        task_runs = dict((await s.execute(
+            select(Run.task_id, func.count()).where(Run.kind == "execute")
+            .group_by(Run.task_id))).all())
+        task_cost = dict((await s.execute(
+            select(Run.task_id, func.sum(Run.cost_usd))
+            .group_by(Run.task_id))).all())
 
     by_project: dict[int, list[Task]] = {}
     for t in tasks:
@@ -279,6 +304,8 @@ async def collect() -> dict:
             "stale": bool(a.stale),
             "note": a.note or "",
         })
+
+    now = utcnow()
 
     def task_row(t: Task) -> dict:
         # «Ждёт окружение» ли задача — считаем только для того, что реально
@@ -304,6 +331,18 @@ async def collect() -> dict:
             "diagnosis": (crew.diagnosis_note(t.diagnosis)
                           if isinstance(t.diagnosis, dict) and t.diagnosis.get("verdict")
                           else ""),
+            # Сколько эта задача уже стоила. `attempts` этого не показывает:
+            # он не считает ни прогонов из live_run.py, ни ручных заходов
+            "runs": int(task_runs.get(t.id) or 0),
+            "spent": round(float(task_cost.get(t.id) or 0), 2),
+            # СКОЛЬКО ЧАСОВ ЖДЁТ. Задача, стоящая третьи сутки, выглядела
+            # ровно как поставленная десять минут назад — а это разные
+            # состояния, и второе требует действия
+            "waiting_hours": (round((now - t.updated_at).total_seconds() / 3600, 1)
+                              if t.status in WAITING_STATUSES else None),
+            # Цикл стоит на месте: дефект повторяется. Пометка, а не приговор —
+            # решение всё равно за человеком
+            "stuck": "один и тот же дефект" in (t.last_error or ""),
         }
 
     rows = []
@@ -377,6 +416,9 @@ async def collect() -> dict:
     both = await consumed_today()
     beat = progress.read_heartbeat()
     money, subscription = await spent_today(), await cli_spent_today()
+    # Третий потолок — по ЧИСЛУ СЕССИЙ. Единственный, который не врёт
+    # при оборванных вызовах: у них цена ноль, а квота сожжена
+    sessions = await sessions_today()
 
     # Задачи, которые ПРЯМО СЕЙЧАС в работе, и сколько уже идут.
     # `updated_at` для running — это момент захвата задачи планировщиком
@@ -390,6 +432,7 @@ async def collect() -> dict:
     # (или процесс убили на середине, см. db.open_run)
     open_runs = [{
         "id": r.id, "task_id": r.task_id, "kind": r.kind,
+        "kind_ru": RUN_RU.get(r.kind, r.kind),
         "minutes": round((now - r.started_at).total_seconds() / 60, 1),
     } for r in runs if r.finished_at is None]
 
@@ -413,14 +456,20 @@ async def collect() -> dict:
             # самом однажды разойдётся с первым. Автопилот не запущен — про
             # тихие часы говорить нечего, о нём и так сказано отдельно
             build_allowed=bool(beat.get("build_allowed", True))
-            if beat.get("alive") else True),
+            if beat.get("alive") else True,
+            over_sessions=sessions >= cfg.daily_cc_sessions,
+            # Чего не хватает установке. Считается ЗДЕСЬ, а не берётся
+            # из пульса: это состояние машины, а не цикла, и знать о нём
+            # надо даже когда автопилот не запущен — тем более тогда
+            install=readiness.problems()),
         "attention": {"environment": attention_env, "review": attention_review},
         "install_list": install_list,
         "companies": [{"code": a.code, "title": a.title, "transport": a.transport}
                       for a in accounts.values() if a.active],
         "secrets": await secret_state(),
         "runs": [{
-            "id": r.id, "task_id": r.task_id, "kind": r.kind, "ok": bool(r.ok),
+            "id": r.id, "task_id": r.task_id, "kind": r.kind,
+            "kind_ru": RUN_RU.get(r.kind, r.kind), "ok": bool(r.ok),
             "backend": r.backend, "cost": round(r.cost_usd or 0, 3),
             "estimated": bool(r.cost_estimated),
             "minutes": round((r.seconds or 0) / 60, 1),
