@@ -20,13 +20,19 @@ import logging
 
 from sqlalchemy import select
 
+from .autonomy import AWAITING_KEYS
 from .checks import is_runnable, spec
-from .db import Project, Session, Task, utcnow
+from .db import Project, Session, Task, reset_attempts, utcnow
 
 log = logging.getLogger("manual")
 
 # статус задачи, которую машина принять не может и не притворяется
 NEEDS_HUMAN = "needs_human"
+
+# Из чего задачу вообще имеет смысл возвращать в очередь: работа не сделана,
+# а задача уже снята с работы. `awaiting_keys` сюда же — там ждут ЗНАЧЕНИЯ
+# от клиента, и когда оно появилось, задаче надо дать ход.
+REQUEUABLE = ("escalated", NEEDS_HUMAN, AWAITING_KEYS)
 
 # Задача прошла, но доказательства нет: либо вердикт вынесла модель, либо
 # все детерминированные критерии оказались пустышками. Это не дефект работы —
@@ -284,6 +290,60 @@ async def confirm(task_id: int) -> tuple[bool, str]:
     log.warning("задача %s закрыта подтверждением владельца, а не проверками: %s",
                 task_id, "; ".join(was)[:200])
     return True, f"задача {task_id} закрыта под твою ответственность"
+
+
+async def requeue(task_id: int, who: str = "владельцем") -> tuple[bool, str]:
+    """Вернуть задачу агенту: работы не было вообще, чинить нечего.
+
+    Отвечает на другой вопрос, чем `submit`. «Я сделал, проверь» проверяет
+    результат человека; если работы не было, приёмка снова провалится — она
+    проверяет то, чего нет. Живой случай: задача 523 стояла в эскалации,
+    а её критерий падал с `exit=4`, потому что файла `tests/test_orders.py`
+    не существует вовсе. Она не «зависла», её не делали.
+
+    Три вещи чистятся, и третья появилась не сразу:
+
+    * `attempts` — владелец дал новый заход, старый лимит его решение
+      отменять не должен. Но сброс пишется в `last_error`: по базе должно
+      быть видно, что счётчик обнулила рука;
+    * журнал попыток (`counted=False`) — иначе детектор застревания читает
+      старые строки и снимает задачу после ПЕРВОГО же провала, объясняя это
+      тем, что дефект повторился трижды. Кнопка выглядела бы рабочей;
+    * **`diagnosis`** — разбор описывает состояние, которого больше нет.
+      На задаче 547 в нём лежало «команда падает из-за отсутствия tail»,
+      а `tail` с тех пор нашли: `crew.instruction_block()` подставил бы
+      агенту в промпт починку несуществующей поломки. Устаревшая подсказка
+      хуже отсутствующей — она уводит от настоящей причины.
+
+    Одна функция на дашборд и на CLI намеренно: два места, делающие одно
+    и то же, однажды разойдутся, и это правило здесь уже оплачено паузой,
+    которую планировщик не читал.
+    """
+    async with Session() as s:
+        task = await s.get(Task, task_id)
+        if task is None:
+            return False, f"нет задачи {task_id}"
+        if task.status not in REQUEUABLE:
+            return False, (f"задача {task_id} в статусе {task.status!r} — "
+                           f"возвращать в очередь нечего")
+        was, attempts = task.status, task.attempts
+        had_diag = bool(task.diagnosis)
+        task.status = "ready"
+        task.lane = "build"
+        task.defects = []
+        task.attempts = 0
+        task.diagnosis = None
+        task.last_error = (f"возвращена в работу {who} из «{was}»; "
+                           f"счётчик попыток сброшен (было {attempts})")
+        task.updated_at = utcnow()
+        await s.commit()
+    forgotten = await reset_attempts(task_id, f"сброшено {who}")
+    log.warning("задача %s возвращена в очередь вручную (была %s, попыток %s, "
+                "строк журнала снято со счёта %s, разбор %s)",
+                task_id, was, attempts, forgotten,
+                "очищен" if had_diag else "был пуст")
+    return True, (f"задача {task_id} снова в очереди — агент возьмёт её "
+                  f"на ближайшем тике")
 
 
 async def save_verdict(task_id: int, verdict) -> None:

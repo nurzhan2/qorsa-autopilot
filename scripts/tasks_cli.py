@@ -75,6 +75,22 @@ async def cmd_confirm(task_id: int) -> int:
     return 0 if ok else 2
 
 
+async def cmd_retry(task_id: int) -> int:
+    """«Работы не было — пусть агент сделает заново».
+
+    Отличается от `done` тем же, чем на дашборде отличаются две кнопки:
+    `done` проверяет сделанное человеком, а сюда попадает задача, которую
+    никто не делал. Проверять там нечего, её надо вернуть в очередь.
+    """
+    await init_db()
+    ok, message = await manual.requeue(task_id)
+    print(message)
+    if ok:
+        print("счётчик попыток обнулён, разбор очищен — это записано "
+              "в last_error, чтобы по базе было видно чью это руку")
+    return 0 if ok else 2
+
+
 async def cmd_prune(project_id: int, apply: bool) -> int:
     """Выбросить осиротевшие задачи, по которым ничего не происходило.
 
@@ -127,6 +143,9 @@ def main() -> int:
     p_conf = sub.add_parser(
         "confirm", help="закрыть задачу под свою ответственность (assisted-приёмка)")
     p_conf.add_argument("task_id", type=int)
+    p_retry = sub.add_parser(
+        "retry", help="вернуть задачу агенту: работы не было, проверять нечего")
+    p_retry.add_argument("task_id", type=int)
     p_prune = sub.add_parser("prune", help="выбросить осиротевшие задачи без истории")
     p_prune.add_argument("--project", type=int, required=True)
     p_prune.add_argument("--apply", action="store_true",
@@ -139,6 +158,8 @@ def main() -> int:
         return asyncio.run(cmd_show(args.task_id))
     if args.cmd == "confirm":
         return asyncio.run(cmd_confirm(args.task_id))
+    if args.cmd == "retry":
+        return asyncio.run(cmd_retry(args.task_id))
     if args.cmd == "prune":
         return asyncio.run(cmd_prune(args.project, args.apply))
     return asyncio.run(cmd_done(args.task_id))
